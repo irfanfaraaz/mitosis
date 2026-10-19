@@ -51,7 +51,7 @@ cleanup() {
     echo "warning: a clone Postgres is still running; left $BENCH_HOME in place (delete it by hand)" >&2
   # Delete for real (not trash): trash would keep the ~10 GB template on disk in ~/.Trash.
   elif [ -n "$BENCH_HOME" ] && [ "$MITOSIS_HOME" = "$BENCH_HOME" ]; then
-    trash -- "$BENCH_HOME" || true
+    rm -rf -- "$BENCH_HOME" || true
   fi
 }
 trap cleanup EXIT

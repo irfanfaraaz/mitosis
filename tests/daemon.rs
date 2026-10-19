@@ -221,8 +221,25 @@ async fn shutdown_waits_for_running_request() {
         busy.send(Request::TemplateInit(template_args("main", seed(SEED))))
             .await
     });
-    // Let the build get past the connection and into its first steps.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait until the build's side folder exists, so the request is surely in flight.
+    let building = || {
+        std::fs::read_dir(root.join("templates"))
+            .map(|d| {
+                d.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".main.building-")
+                })
+            })
+            .unwrap_or(false)
+    };
+    for _ in 0..200 {
+        if building() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(building(), "the template build never started");
     assert!(
         !build.is_finished(),
         "the template build finished too early to test"
