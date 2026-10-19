@@ -18,6 +18,7 @@ use crate::templates::{
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -168,10 +169,10 @@ async fn run(
     {
         ts += 2;
     }
-    let leased = ctx.store().leased_ports()?;
-    let range = ctx.config().port_range;
-    let old_port = pick_port(range.clone(), &leased, &HashSet::new(), &HashSet::new())?;
-    let new_port = pick_port(range, &leased, &HashSet::from([old_port]), &HashSet::new())?;
+    // Held until `run` ends: the servers listen on a socket only, so without the listeners a
+    // concurrent build could pick the same port and share `sockets/build-<port>`.
+    let (old_port, _old_hold) = hold_port(ctx, &HashSet::new())?;
+    let (new_port, _new_hold) = hold_port(ctx, &HashSet::from([old_port]))?;
     let work = Work {
         a: dir.join(build_dir_name(name, ts)),
         b: dir.join(build_dir_name(name, ts + 1)),
@@ -223,6 +224,26 @@ async fn run(
         store.update_template_settings(&t)?;
     }
     template_info(ctx, name)
+}
+
+/// A free port from the configured range, bound on 127.0.0.1 so no other build or clone takes it
+/// while the listener lives. Retries when another process binds the picked port first.
+fn hold_port(ctx: &Ctx, skip: &HashSet<u16>) -> Result<(u16, TcpListener)> {
+    let (leased, reserved) = {
+        let store = ctx.store();
+        (store.leased_ports()?, store.reserved_ports()?)
+    };
+    let mut skip = skip.clone();
+    loop {
+        let port = pick_port(ctx.config().port_range, &leased, &skip, &reserved)?;
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => return Ok((port, l)),
+            // Lost the race for it; pick_port fails with ports_exhausted once none is left.
+            Err(_) => {
+                skip.insert(port);
+            }
+        }
+    }
 }
 
 type StepResult<T> = std::result::Result<T, (&'static str, MitosisError)>;
@@ -358,8 +379,7 @@ async fn read_settings(
         durable: false,
         log_file: work.log.clone(),
     };
-    // shortcut: no retry on a port taken meanwhile (no TCP listener, so only the socket name
-    // counts); add start_build_server's retry if that shows up.
+    // No PortInUse retry: the port is held by `hold_port` and the server opens no TCP listener.
     let pg = start(old, &work.a, &opts)?;
     let ready = wait_ready(old, &pg, &opts, ctx.config().ready_timeout).await;
     let read = match ready {
