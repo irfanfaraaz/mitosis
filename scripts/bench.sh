@@ -46,7 +46,13 @@ cleanup() {
 trap cleanup EXIT
 
 now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }
-free_bytes() { echo $(( $(df -k "$MITOSIS_HOME" | awk 'NR==2{print $4}') * 1024 )); }
+# Called inside $(...): a non-zero return trips errexit in the caller.
+free_bytes() {
+  local kb
+  kb=$(df -k "$MITOSIS_HOME" | awk 'NR==2{print $4}')
+  [[ $kb =~ ^[0-9]+$ ]] || { echo "error: could not read free space for $MITOSIS_HOME (got '$kb')" >&2; return 1; }
+  echo $(( kb * 1024 ))
+}
 median() { sort -g | awk '{a[NR]=$1} END{print (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2)}'; }
 
 echo "| Template | Median clone time | Median extra disk | Median idle RAM |"
@@ -71,7 +77,10 @@ for entry in "${SIZES[@]}"; do
     "$MITOSIS" destroy "$id" >/dev/null
     disk=$(( free_before - free_after ))
     [[ $rss =~ ^[0-9]+$ ]] || { echo "error: clone $id: rss_bytes is '$rss', not a non-negative integer" >&2; exit 1; }
-    [[ $disk =~ ^[0-9]+$ ]] || { echo "error: clone $id: free-space delta is '$disk' (free space grew during the run?)" >&2; exit 1; }
+    if [ "$disk" -lt 0 ]; then
+      echo "warning: free space grew during clone $id; counted as 0" >&2
+      disk=0
+    fi
 
     times+=("$(awk -v a="$t0" -v b="$t1" 'BEGIN{print (b-a)*1000}')")
     disks+=("$disk")
