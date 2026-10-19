@@ -117,6 +117,35 @@ async fn scheduled_refresh_runs_when_overdue() {
 }
 
 #[tokio::test]
+async fn max_age_set_during_a_refresh_is_kept() {
+    let Some(env) = TestEnv::new() else { return };
+    let TemplateSource::Seed { command, .. } = seed("create table t(v int)") else {
+        unreachable!()
+    };
+    let source = TemplateSource::Seed {
+        command: format!("sleep 2 && {command}"),
+        cwd: None,
+        path: None,
+    };
+    templates::init(&env.ctx, template_args("main", source))
+        .await
+        .unwrap();
+    set(&env.ctx, None, every_minute());
+    backdate(&env.ctx, 120);
+    // One tick starts a background full refresh (generation 2), which sleeps 2 s in its seed.
+    scheduler::tick(&env.ctx, now()).await;
+    wait_for(10, "the build to start", || row(&env.ctx).next_gen == 3).await;
+    set(&env.ctx, Some(123), TemplateSettings::default());
+    wait_for(30, "the attempt", || {
+        row(&env.ctx).last_attempt_at.is_some()
+    })
+    .await;
+    let t = row(&env.ctx);
+    assert_eq!((t.current_gen, t.last_error.as_deref()), (2, None));
+    assert_eq!(t.max_age_secs, 123, "the refresh kept the new max age");
+}
+
+#[tokio::test]
 async fn rollback_is_not_undone_by_schedule() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", "create table t(v int)").await;

@@ -133,7 +133,8 @@ fn refresh_args(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateI
         source,
         database: Some(row.database),
         migrations: row.migrations,
-        max_age_secs: Some(row.max_age_secs),
+        // None: a `template set --max-age` made during the build must survive it.
+        max_age_secs: None,
         pg_major: Some(cur.pg_major),
         settings: TemplateSettings::default(),
     })
@@ -1173,9 +1174,6 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
         _ => None,
     };
-    let max_age_secs = args
-        .max_age_secs
-        .unwrap_or(ctx.config().default_max_age_secs);
     // The commit expects the pointer read here; a new template starts at 0 (no generation).
     let (created, expected, gen) = {
         let store = ctx.store();
@@ -1187,7 +1185,8 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
                     &database,
                     args.source.clone(),
                     args.migrations.clone(),
-                    max_age_secs,
+                    args.max_age_secs
+                        .unwrap_or(ctx.config().default_max_age_secs),
                 ))?;
                 (true, 0)
             }
@@ -1212,11 +1211,15 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         }
         return Err(e);
     }
+    // Re-read under the store lock; only what this build owns is written. `template set` may
+    // have changed any setting meanwhile; the max age changes here only when the caller gave one.
     let mut t = store.get_template(&name)?.ok_or_else(|| not_found(&name))?;
     t.database = database;
     t.source = args.source;
     t.migrations = args.migrations;
-    t.max_age_secs = max_age_secs;
+    if let Some(m) = args.max_age_secs {
+        t.max_age_secs = m;
+    }
     apply_settings(&mut t, None, &args.settings)?;
     if manual {
         resume_if_current(&mut t, gen);
