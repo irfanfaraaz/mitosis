@@ -189,7 +189,7 @@ async fn clones(conn: &mut Conn) -> usize {
 async fn clone_roundtrip_over_socket() {
     let Some(env) = TestEnv::new() else { return };
     let root = env.tmp.path();
-    let handle = start(root, env.ctx.config.clone()).await;
+    let handle = start(root, env.ctx.config()).await;
     let mut conn = Conn::open(root).await;
 
     assert!(matches!(
@@ -220,7 +220,7 @@ async fn clone_roundtrip_over_socket() {
 async fn shutdown_keeps_clones() {
     let Some(env) = TestEnv::new() else { return };
     let root = env.tmp.path();
-    let handle = start(root, env.ctx.config.clone()).await;
+    let handle = start(root, env.ctx.config()).await;
     let mut conn = Conn::open(root).await;
     conn.ok(Request::TemplateInit(template_args("main", seed(SEED))))
         .await;
@@ -233,7 +233,7 @@ async fn shutdown_keeps_clones() {
     shutdown(root, handle).await;
     assert_eq!(psql_url(&env, &info.url, "select count(*) from t"), "1");
 
-    let handle = start(root, env.ctx.config.clone()).await;
+    let handle = start(root, env.ctx.config()).await;
     let mut conn = Conn::open(root).await;
     match conn.ok(Request::Gc).await {
         Response::Gc(report) => {
@@ -244,5 +244,31 @@ async fn shutdown_keeps_clones() {
     }
     assert_eq!(clones(&mut conn).await, 1);
     assert_eq!(psql_url(&env, &info.url, "select count(*) from t"), "1");
+    shutdown(root, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_reload_applies_new_cap() {
+    let Some(env) = TestEnv::new() else { return };
+    let root = env.tmp.path();
+    let config = Config {
+        max_clones: 1,
+        ..env.ctx.config()
+    };
+    let handle = start(root, config).await;
+    let mut conn = Conn::open(root).await;
+    conn.ok(Request::TemplateInit(template_args("main", seed(SEED))))
+        .await;
+    conn.ok(Request::CloneCreate(clone_args())).await;
+    let full = conn.send(Request::CloneCreate(clone_args())).await;
+    assert_eq!(full.result.unwrap_err().code, ErrorCode::CapReached);
+
+    std::fs::write(root.join("config.toml"), "max_clones = 2\n").unwrap();
+    assert!(matches!(conn.ok(Request::ConfigReload).await, Response::Ok));
+    assert!(matches!(
+        conn.ok(Request::CloneCreate(clone_args())).await,
+        Response::CloneCreated(_)
+    ));
+    assert_eq!(clones(&mut conn).await, 2);
     shutdown(root, handle).await;
 }

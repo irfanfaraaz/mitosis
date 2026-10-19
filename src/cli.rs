@@ -1,5 +1,5 @@
 use crate::client;
-use crate::ctx::Config;
+use crate::config::{Config, ConfigEntry};
 use crate::daemon;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::mcp;
@@ -62,6 +62,24 @@ enum Cmd {
     },
     /// Serve the MCP tools over stdio.
     Mcp,
+    /// Show the settings and where each value comes from, or change one.
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCmd>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Write a setting to config.toml and tell a running daemon to reload.
+    Set {
+        /// max_clones, min_free_disk, ram_budget, disk_budget, queue_wait or clone_disk_warn.
+        key: String,
+        /// A number, a size like 4GB, a duration like 60s, or off.
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -148,8 +166,31 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::from_env()?;
     match cli.command {
-        Cmd::Daemon { command: None } => daemon::run(home, Config::from_env()?).await?,
+        Cmd::Daemon { command: None } => {
+            let config = Config::load(&home)?;
+            daemon::run(home, config).await?
+        }
         Cmd::Mcp => mcp::serve_stdio(home).await?,
+        Cmd::Config {
+            command: None,
+            json,
+        } => {
+            let entries = Config::describe(&home)?;
+            if json {
+                print_json(&entries)?;
+            } else {
+                print_config(&entries);
+            }
+        }
+        Cmd::Config {
+            command: Some(ConfigCmd::Set { key, value }),
+            ..
+        } => {
+            Config::set_in_file(&home, &key, &value)?;
+            // No daemon start: a stopped daemon reads the file when it next starts.
+            client::request_if_running(&home, Request::ConfigReload).await?;
+            println!("{key} = {}", value.trim());
+        }
         Cmd::Template { command } => template(&home, command).await?,
         Cmd::Clone {
             template,
@@ -265,6 +306,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_config(entries: &[ConfigEntry]) {
+    let width = entries.iter().map(|e| e.key.len()).max().unwrap_or(0);
+    let vwidth = entries.iter().map(|e| e.value.len()).max().unwrap_or(0);
+    for e in entries {
+        println!(
+            "{:<width$} = {:<vwidth$}  ({})",
+            e.key,
+            e.value,
+            e.source.label()
+        );
+    }
 }
 
 async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {

@@ -23,7 +23,7 @@ fn args(template: &str) -> CloneCreateArgs {
 
 /// A second Ctx on the env's home (same store and templates) with a changed config.
 fn ctx_with(env: &TestEnv, f: impl FnOnce(&mut Config)) -> Ctx {
-    let mut config = env.ctx.config.clone();
+    let mut config = env.ctx.config();
     f(&mut config);
     Ctx::open(Home::at(env.tmp.path().to_path_buf()), config).unwrap()
 }
@@ -120,7 +120,7 @@ async fn low_disk() {
 async fn port_in_use_is_skipped() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
-    let first = *env.ctx.config.port_range.start();
+    let first = *env.ctx.config().port_range.start();
     let Ok(_busy) = TcpListener::bind(("127.0.0.1", first)) else {
         println!("skipping: port {first} already taken by something else");
         return;

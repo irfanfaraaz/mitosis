@@ -26,6 +26,7 @@ fn is_own_root_entry(name: &str) -> bool {
         MARKER | "templates" | "clones" | "sockets" | "logs" | ".DS_Store"
     ) || name.starts_with("state.db")
         || name.starts_with("daemon.")
+        || name.starts_with("config.toml")
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +73,10 @@ impl Home {
 
     pub fn daemon_lock(&self) -> PathBuf {
         self.root.join("daemon.lock")
+    }
+
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join("config.toml")
     }
 
     /// Marks a folder as a Mitosis home; gc and chmod only ever touch a marked root.

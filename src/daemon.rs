@@ -133,7 +133,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     drop(work_tx);
     // recv() yields None once every running request has dropped its sender.
-    if tokio::time::timeout(ctx.config.ready_timeout, work_rx.recv())
+    if tokio::time::timeout(ctx.config().ready_timeout, work_rx.recv())
         .await
         .is_err()
     {
@@ -326,6 +326,11 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
                 templates,
                 uptime_secs: ctx.started_at.elapsed().as_secs(),
             })
+        }
+        Request::ConfigReload => {
+            let new = ctx.config().reloaded(&ctx.home)?;
+            ctx.set_config(new);
+            Response::Ok
         }
         Request::Shutdown => Response::Ok,
     })

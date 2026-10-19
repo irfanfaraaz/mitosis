@@ -2,7 +2,7 @@ use crate::error::MitosisError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -59,6 +59,8 @@ pub enum Request {
     },
     Gc,
     Status,
+    /// Re-read `config.toml` and the environment; later requests use the new settings.
+    ConfigReload,
     Shutdown,
 }
 
@@ -171,7 +173,8 @@ mod tests {
         let line = serde_json::to_string(&env).unwrap();
         assert!(!line.contains('\n'));
         let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
-        assert_eq!(back.v, 1);
+        assert_eq!(back.v, PROTOCOL_VERSION);
+        assert_eq!(PROTOCOL_VERSION, 2);
         match back.request {
             Request::CloneCreate(a) => {
                 assert_eq!(a.template, "main");

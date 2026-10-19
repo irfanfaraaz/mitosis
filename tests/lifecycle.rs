@@ -34,13 +34,7 @@ fn now() -> i64 {
 
 /// A second Ctx on the env's home: what the daemon sees after a restart.
 fn restarted(env: &TestEnv) -> Arc<Ctx> {
-    Arc::new(
-        Ctx::open(
-            Home::at(env.tmp.path().to_path_buf()),
-            env.ctx.config.clone(),
-        )
-        .unwrap(),
-    )
+    Arc::new(Ctx::open(Home::at(env.tmp.path().to_path_buf()), env.ctx.config()).unwrap())
 }
 
 fn sleeper() -> Child {
@@ -246,7 +240,7 @@ async fn reconcile_undoes_half_created() {
         name: None,
         template: tpl.name.clone(),
         dir: dir.clone(),
-        port: *env.ctx.config.port_range.start(),
+        port: *env.ctx.config().port_range.start(),
         socket_dir: env.ctx.home.sockets_dir().join(&id),
         password: "x".repeat(32),
         database: tpl.database.clone(),

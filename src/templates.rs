@@ -702,14 +702,14 @@ async fn run_steps(
     let mut tried = HashSet::new();
     let pg: RunningPg = loop {
         let pg = start(install, data_dir, opts).map_err(at("start"))?;
-        match wait_ready(install, &pg, opts, ctx.config.ready_timeout).await {
+        match wait_ready(install, &pg, opts, ctx.config().ready_timeout).await {
             Ok(()) => break pg,
             // Another process can take the picked port before postgres binds it.
             Err(e) if e.code == ErrorCode::PortInUse && tried.len() + 1 < START_TRIES => {
                 let (i, d, t) = (
                     install.clone(),
                     data_dir.to_path_buf(),
-                    ctx.config.stop_timeout,
+                    ctx.config().stop_timeout,
                 );
                 blocking(move || stop(&i, &d, Some(pg), t))
                     .await
@@ -717,8 +717,8 @@ async fn run_steps(
                 let _ = std::fs::remove_dir(&opts.socket_dir);
                 tried.insert(opts.port);
                 let leased = ctx.store().leased_ports().map_err(at("start"))?;
-                opts.port = pick_port(ctx.config.port_range.clone(), &leased, &tried)
-                    .map_err(at("start"))?;
+                opts.port =
+                    pick_port(ctx.config().port_range, &leased, &tried).map_err(at("start"))?;
                 opts.socket_dir = build_socket_dir(ctx, opts.port);
             }
             Err(e) => return Err(("start", e)),
@@ -778,7 +778,7 @@ async fn run_steps(
     let (i, d, t) = (
         install.clone(),
         data_dir.to_path_buf(),
-        ctx.config.stop_timeout,
+        ctx.config().stop_timeout,
     );
     blocking(move || stop(&i, &d, Some(pg), t))
         .await
@@ -805,7 +805,7 @@ async fn fail(
     let (i, d, t) = (
         install.clone(),
         build_dir.to_path_buf(),
-        ctx.config.stop_timeout,
+        ctx.config().stop_timeout,
     );
     let cleanup = blocking(move || {
         // A server that would not stop keeps its folder; gc deals with it later.
@@ -868,7 +868,9 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
         _ => None,
     };
-    let max_age_secs = args.max_age_secs.unwrap_or(ctx.config.default_max_age_secs);
+    let max_age_secs = args
+        .max_age_secs
+        .unwrap_or(ctx.config().default_max_age_secs);
     let secrets = source_secrets(&args.source);
 
     let ts = now();
@@ -877,7 +879,7 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
     std::fs::File::create(&log)?; // truncate, so the error tail belongs to this build
     let leased = ctx.store().leased_ports()?;
-    let port = pick_port(ctx.config.port_range.clone(), &leased, &HashSet::new())?;
+    let port = pick_port(ctx.config().port_range, &leased, &HashSet::new())?;
     let mut opts = StartOptions {
         port,
         socket_dir: build_socket_dir(ctx, port),

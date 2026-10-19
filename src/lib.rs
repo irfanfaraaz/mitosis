@@ -2,6 +2,7 @@ pub mod cli;
 pub mod client;
 pub mod clone_backend;
 pub mod clones;
+pub mod config;
 pub mod ctx;
 pub mod daemon;
 pub mod error;

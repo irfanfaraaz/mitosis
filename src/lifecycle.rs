@@ -358,7 +358,7 @@ fn remove_path(path: &Path) -> Result<()> {
 /// Stops the Postgres serving `dir`, if any, then deletes the folder.
 async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     let install = install_for(ctx, &dir);
-    let timeout = ctx.config.stop_timeout;
+    let timeout = ctx.config().stop_timeout;
     tokio::task::spawn_blocking(move || {
         // No row, so the server (if any) is the process whose cwd is this folder.
         if running_server(&dir, None)?.is_some() {

@@ -148,6 +148,7 @@ fn reserve<'a>(
     args: &CloneCreateArgs,
     parent_start_time: Option<u64>,
 ) -> Result<(CloneRow, InFlight<'a>)> {
+    let cfg = ctx.config();
     let store = ctx.store();
     let active: Vec<String> = store
         .list_clones()?
@@ -155,28 +156,28 @@ fn reserve<'a>(
         .filter(|c| c.status != CloneStatus::Stopping)
         .map(|c| c.id)
         .collect();
-    if active.len() >= ctx.config.max_clones {
+    if active.len() >= cfg.max_clones {
         return Err(MitosisError::new(
             ErrorCode::CapReached,
             format!(
                 "clone limit of {} reached: {}",
-                ctx.config.max_clones,
+                cfg.max_clones,
                 active.join(", ")
             ),
         )
         .with_hint(
-            "destroy one with `mitosis destroy <id-or-name>` (or the clone_destroy tool), or raise MITOSIS_MAX_CLONES",
+            "destroy one with `mitosis destroy <id-or-name>` (or the clone_destroy tool), or raise max_clones (mitosis config set max_clones <n>)",
         ));
     }
     let clones_dir = ctx.home.clones_dir();
     let free = free_space(&clones_dir)?;
-    if free < ctx.config.min_free_bytes {
+    if free < cfg.min_free_bytes {
         return Err(MitosisError::new(
             ErrorCode::LowDisk,
             format!(
                 "only {free} bytes free on the volume of {}; need at least {}",
                 clones_dir.display(),
-                ctx.config.min_free_bytes
+                cfg.min_free_bytes
             ),
         )
         .with_hint("free disk space, or destroy unused clones"));
@@ -192,11 +193,7 @@ fn reserve<'a>(
             break id;
         }
     };
-    let port = pick_port(
-        ctx.config.port_range.clone(),
-        &store.leased_ports()?,
-        &HashSet::new(),
-    )?;
+    let port = pick_port(cfg.port_range, &store.leased_ports()?, &HashSet::new())?;
     let created_at = now();
     let row = CloneRow {
         id: id.clone(),
@@ -258,19 +255,15 @@ async fn bring_up(
         // Recorded at once, so a failed create stops exactly this server.
         row.pg_pid = Some(pg.pid);
         row.pg_start_time = Some(pg.start_time);
-        match wait_ready(install, &pg, &opts, ctx.config.ready_timeout).await {
+        match wait_ready(install, &pg, &opts, ctx.config().ready_timeout).await {
             Ok(()) => break pg,
             // Template builds use ports the store does not know about, so a pick can still collide.
             Err(e) if e.code == ErrorCode::PortInUse && tries < START_TRIES => {
-                let (i, d, t) = (install.clone(), row.dir.clone(), ctx.config.stop_timeout);
+                let (i, d, t) = (install.clone(), row.dir.clone(), ctx.config().stop_timeout);
                 blocking(move || stop(&i, &d, Some(pg), t)).await?;
                 tried.insert(row.port);
                 let store = ctx.store();
-                row.port = pick_port(
-                    ctx.config.port_range.clone(),
-                    &store.leased_ports()?,
-                    &tried,
-                )?;
+                row.port = pick_port(ctx.config().port_range, &store.leased_ports()?, &tried)?;
                 store.update_clone(row)?;
             }
             Err(e) => return Err(e),
@@ -359,7 +352,7 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
     let sock = ctx.home.sockets_dir().join(&row.id);
     let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
     let install = install_for(ctx, &dir);
-    let timeout = ctx.config.stop_timeout;
+    let timeout = ctx.config().stop_timeout;
     let expected = row
         .pg_pid
         .zip(row.pg_start_time)

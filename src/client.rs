@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
 use crate::protocol::{Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION};
@@ -118,6 +119,8 @@ async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
 /// Starts `current_exe() daemon` in its own session and waits until its socket accepts connections.
 pub async fn ensure_daemon(home: &Home) -> Result<()> {
     home.ensure_dirs()?;
+    // A bad config value surfaces here as invalid_request, not as a daemon that fails to start.
+    Config::load(home)?;
     let log_path = home.logs_dir().join("daemon.log");
     let log = OpenOptions::new()
         .create(true)
