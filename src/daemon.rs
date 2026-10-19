@@ -3,6 +3,7 @@ use crate::ctx::{Config, Ctx};
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::lifecycle;
 use crate::paths::Home;
+use crate::promote;
 use crate::protocol::{
     DaemonStatus, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
 };
@@ -333,6 +334,12 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         Request::CloneDestroy { id_or_name } => Response::Destroyed {
             id: clones::destroy(&ctx, &id_or_name).await?,
         },
+        Request::ClonePromote {
+            id_or_name,
+            template,
+        } => {
+            Response::TemplateBuilt(promote::promote(&ctx, &id_or_name, template.as_deref()).await?)
+        }
         Request::Gc => Response::Gc(lifecycle::reconcile(ctx.clone(), now()).await?),
         Request::Status => {
             let (clones, templates) = {

@@ -126,7 +126,7 @@ fn stale_while_refresh(ctx: &Arc<Ctx>, tpl: &TemplateRow, gen: &GenerationRow) -
     if age_secs(gen.built_at, now) <= tpl.max_age_secs {
         return (false, false);
     }
-    if tpl.on_stale == OnStale::Warn {
+    if tpl.on_stale == OnStale::Warn || scheduler::full_refresh_refused(tpl) {
         return (true, false);
     }
     if !tpl.paused && scheduler::may_retry(tpl, now) {

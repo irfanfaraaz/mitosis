@@ -20,6 +20,10 @@ pub enum TemplateSource {
         #[serde(default)]
         path: Option<String>,
     },
+    /// Made by `promote` from a running clone; there is no source to rebuild it from.
+    Promoted {
+        clone_id: String,
+    },
 }
 
 /// How a template generation was made.
@@ -155,6 +159,12 @@ pub enum Request {
     CloneList,
     CloneDestroy {
         id_or_name: String,
+    },
+    /// Makes a running clone the newest generation of its template, or of `template`.
+    ClonePromote {
+        id_or_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<String>,
     },
     Gc,
     Status,

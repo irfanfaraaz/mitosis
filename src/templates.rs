@@ -64,6 +64,12 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
         }
         split_password(url)?;
     }
+    if matches!(args.source, TemplateSource::Promoted { .. }) {
+        return Err(
+            invalid("a template cannot be created from a promoted source")
+                .with_hint("make one with: mitosis promote <clone> --template <name>"),
+        );
+    }
     if let Some(m) = &args.migrations {
         if !m.is_dir() {
             return Err(invalid(format!(
@@ -94,11 +100,12 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
     let mut preview =
         existing.unwrap_or_else(|| TemplateRow::new(&args.name, "", args.source.clone(), None, 0));
     preview.migrations = args.migrations.clone();
+    preview.source = args.source.clone();
     apply_settings(&mut preview, None, &args.settings)?;
     build(ctx, args).await
 }
 
-fn not_found(name: &str) -> MitosisError {
+pub(crate) fn not_found(name: &str) -> MitosisError {
     MitosisError::new(
         ErrorCode::TemplateNotFound,
         format!("template {name} not found"),
@@ -116,6 +123,12 @@ pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<Temp
 /// The build arguments that rebuild `name` from its recorded source on the current major.
 fn refresh_args(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInitArgs> {
     let (row, cur) = ctx.store().current(name)?.ok_or_else(|| not_found(name))?;
+    if matches!(row.source, TemplateSource::Promoted { .. }) {
+        return Err(invalid(format!(
+            "template {name} was promoted from a clone and has no source to rebuild"
+        ))
+        .with_hint("use --layered or promote again"));
+    }
     let source = match row.source {
         TemplateSource::Seed {
             command,
@@ -206,6 +219,16 @@ fn apply_settings(
     if let Some(o) = s.on_stale {
         t.on_stale = o;
     }
+    // A full refresh of a promoted template is refused, so a schedule must be layered.
+    if matches!(t.source, TemplateSource::Promoted { .. })
+        && t.every_secs.is_some()
+        && t.every_mode == RefreshMode::Full
+    {
+        return Err(invalid(
+            "--every with --mode full needs a source, and a promoted template has none",
+        )
+        .with_hint("use --mode layered"));
+    }
     if t.auto_migrate && t.migrations.is_none() {
         return Err(
             invalid("--auto-migrate on needs --migrations").with_hint(format!(
@@ -236,7 +259,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<TemplateInfo>> {
 }
 
 /// The template with its current generation `cur`, out of `generations` kept.
-fn template_info(ctx: &Ctx, name: &str) -> Result<TemplateInfo> {
+pub(crate) fn template_info(ctx: &Ctx, name: &str) -> Result<TemplateInfo> {
     let store = ctx.store();
     let (t, cur) = store.current(name)?.ok_or_else(|| not_found(name))?;
     let n = store.list_generations(name)?.len() as u32;
@@ -274,6 +297,7 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
             cwd: cwd.clone(),
             path: path.clone(),
         },
+        promoted @ TemplateSource::Promoted { .. } => promoted.clone(),
     };
     TemplateInfo {
         name: row.name.clone(),
@@ -575,7 +599,7 @@ fn db_from_url(url: &str) -> String {
 fn database_for(args: &TemplateInitArgs) -> Result<String> {
     let db = match &args.source {
         TemplateSource::Url { url } => db_from_url(url),
-        TemplateSource::Seed { .. } => args
+        TemplateSource::Seed { .. } | TemplateSource::Promoted { .. } => args
             .database
             .clone()
             .unwrap_or_else(|| DEFAULT_SEED_DATABASE.into()),
@@ -618,13 +642,13 @@ fn log_tail(log: &Path, n: usize) -> String {
 }
 
 /// One build per template name at a time; released on drop.
-struct BuildGuard<'a> {
+pub(crate) struct BuildGuard<'a> {
     ctx: &'a Ctx,
     name: String,
 }
 
 impl<'a> BuildGuard<'a> {
-    fn take(ctx: &'a Ctx, name: &str) -> Result<BuildGuard<'a>> {
+    pub(crate) fn take(ctx: &'a Ctx, name: &str) -> Result<BuildGuard<'a>> {
         if !ctx
             .building
             .lock()
@@ -949,7 +973,7 @@ pub(crate) enum Leftover {
     Old(String, i64),
 }
 
-fn build_dir_name(name: &str, ts: i64) -> String {
+pub(crate) fn build_dir_name(name: &str, ts: i64) -> String {
     format!(".{name}.building-{ts}")
 }
 
@@ -1036,6 +1060,12 @@ async fn run_steps(
             )
             .await
             .map_err(at("seed"))?;
+        }
+        TemplateSource::Promoted { .. } => {
+            return Err((
+                "seed",
+                invalid("a promoted template has no source to rebuild"),
+            ));
         }
     }
     extensions_and_stop(ctx, install, data_dir, opts, database, pg).await
@@ -1231,7 +1261,7 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
 
 /// A successful build that is still current clears `paused` and `last_error`. One that a
 /// rollback overtook leaves them, so the rollback sticks.
-fn resume_if_current(t: &mut TemplateRow, gen: u32) {
+pub(crate) fn resume_if_current(t: &mut TemplateRow, gen: u32) {
     if t.current_gen == gen {
         t.paused = false;
         t.last_error = None;
@@ -1405,7 +1435,7 @@ async fn build_gen(
 
 /// Step 7: measures the built side folder `row.dir` (filling `pg_major` and `size_bytes`), then
 /// commits it. On failure the folder is removed and the error has the build-failure shape.
-async fn commit_built(
+pub(crate) async fn commit_built(
     ctx: &Ctx,
     install: &PgInstall,
     log: &Path,

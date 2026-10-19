@@ -13,6 +13,7 @@ pub mod paths;
 pub mod pg;
 pub mod ports;
 pub mod proc_util;
+pub mod promote;
 pub mod protocol;
 pub mod scheduler;
 pub mod state;

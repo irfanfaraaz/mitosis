@@ -54,6 +54,13 @@ enum Cmd {
     },
     /// Destroy a clone by id or name.
     Destroy { id_or_name: String },
+    /// Make a running clone the newest generation of its template (or of --template).
+    Promote {
+        clone: String,
+        /// Promote into this template instead of the clone's own; created when it does not exist.
+        #[arg(long)]
+        template: Option<String>,
+    },
     /// Remove expired clones and leftovers.
     Gc,
     /// Run the daemon in the foreground, or manage it.
@@ -355,6 +362,22 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 other => return Err(unexpected(other)),
             }
         }
+        Cmd::Promote { clone, template } => {
+            let req = Request::ClonePromote {
+                id_or_name: clone.clone(),
+                template,
+            };
+            match client::request(&home, req).await? {
+                Response::TemplateBuilt(t) => println!(
+                    "promoted {clone} to template {} generation {} (Postgres {}, {})",
+                    t.name,
+                    t.current_gen,
+                    t.pg_major,
+                    human_bytes(t.size_bytes)
+                ),
+                other => return Err(unexpected(other)),
+            }
+        }
         Cmd::Gc => match client::request(&home, Request::Gc).await? {
             Response::Gc(r) => {
                 println!(
@@ -615,6 +638,7 @@ fn source_cell(source: &TemplateSource) -> String {
                 command.split_whitespace().collect::<Vec<_>>().join(" ")
             )
         }
+        TemplateSource::Promoted { clone_id } => format!("promoted from {clone_id}"),
     };
     if text.chars().count() <= MAX {
         return text;

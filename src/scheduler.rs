@@ -4,7 +4,7 @@
 
 use crate::ctx::Ctx;
 use crate::error::Result;
-use crate::protocol::RefreshMode;
+use crate::protocol::{RefreshMode, TemplateSource};
 use crate::state::TemplateRow;
 use crate::templates::{self, hash_dir, now};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ fn secs(s: u64) -> i64 {
 /// The mode of the interval refresh `row` needs at `now`, if any. Counts from `newest_built_at`
 /// (the newest generation, current or not); after an attempt, waits a whole interval again.
 pub fn due(row: &TemplateRow, newest_built_at: i64, now: i64) -> Option<RefreshMode> {
-    if row.paused {
+    if row.paused || full_refresh_refused(row) {
         return None;
     }
     let every = secs(row.every_secs?);
@@ -30,6 +30,12 @@ pub fn due(row: &TemplateRow, newest_built_at: i64, now: i64) -> Option<RefreshM
             .last_attempt_at
             .is_none_or(|a| now >= a.saturating_add(every));
     ready.then_some(row.every_mode)
+}
+
+/// A promoted template has no source, so its interval refresh and its stale refresh must be
+/// layered; a full one would fail at every interval.
+pub(crate) fn full_refresh_refused(row: &TemplateRow) -> bool {
+    matches!(row.source, TemplateSource::Promoted { .. }) && row.every_mode == RefreshMode::Full
 }
 
 /// True when auto-migrate should run a layered refresh: the migrations folder no longer matches
