@@ -1,6 +1,7 @@
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::pg::binaries::PgInstall;
 use crate::proc_util::{has_exited, is_alive, process_start_time};
+use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use std::io::{Read, Seek, SeekFrom};
@@ -29,6 +30,8 @@ pub struct PostmasterInfo {
     pub pid: i32,
     pub data_dir: PathBuf,
     pub port: u16,
+    /// Postmaster start time (line 3), unix seconds.
+    pub start_time: u64,
 }
 
 fn internal(msg: impl Into<String>) -> MitosisError {
@@ -103,6 +106,7 @@ fn start_failure(log_tail: &str, port: u16) -> MitosisError {
     }
 }
 
+/// On timeout the process is left running; the caller must `stop` it.
 pub async fn wait_ready(
     install: &PgInstall,
     pg: &RunningPg,
@@ -153,15 +157,20 @@ pub fn psql(install: &PgInstall, socket_dir: &Path, port: u16, db: &str, sql: &s
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Polls `has_exited` (which also reaps our own child) for up to `wait`.
-fn wait_exited(pid: i32, wait: Duration) {
+/// Polls `has_exited` (which also reaps our own child) for up to `wait`; true once gone.
+fn wait_exited(pid: i32, wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
-    while !has_exited(pid) && Instant::now() < deadline {
+    while !has_exited(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    true
 }
 
 /// Stops the cluster; a cluster with no `postmaster.pid` is already stopped.
+/// Blocks (up to the timeout plus a few seconds): callers in async code use `spawn_blocking`.
 pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<()> {
     let Some(info) = read_postmaster_pid(data_dir)? else { return Ok(()) };
     let secs = timeout.as_secs().max(1);
@@ -172,16 +181,37 @@ pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<(
         .args(["-m", "fast", "-t", &secs.to_string()])
         .output()?;
     if out.status.success() {
-        wait_exited(info.pid, Duration::from_secs(5));
+        wait_exited(info.pid, Duration::from_secs(5)); // reap our child; pg_ctl already confirmed shutdown
         return Ok(());
     }
-    if is_alive(info.pid) {
-        let pid = Pid::from_raw(info.pid);
-        // The postmaster leads its own group when we started it; otherwise hit just the pid.
-        if killpg(pid, Signal::SIGKILL).is_err() {
-            let _ = kill(pid, Signal::SIGKILL);
-        }
-        wait_exited(info.pid, Duration::from_secs(5));
+    if !is_alive(info.pid) {
+        return Ok(()); // stale pid file
+    }
+    // Never signal a pid that is not this cluster's postmaster (stale file + reused pid).
+    let ours = process_start_time(info.pid).is_some_and(|t| t.abs_diff(info.start_time) <= 2);
+    if !ours {
+        return Err(internal(format!(
+            "postmaster.pid at {} points to pid {} which is not this cluster's postgres",
+            data_dir.display(),
+            info.pid
+        )));
+    }
+    let pid = Pid::from_raw(info.pid);
+    // The postmaster leads its own group when we started it; otherwise hit just the pid.
+    let mut res = killpg(pid, Signal::SIGKILL);
+    if res == Err(Errno::ESRCH) {
+        res = kill(pid, Signal::SIGKILL);
+    }
+    match res {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(e) => return Err(internal(format!("could not kill postgres pid {}: {e}", info.pid))),
+    }
+    if !wait_exited(info.pid, Duration::from_secs(5)) {
+        return Err(internal(format!(
+            "postgres pid {} for {} is still alive after SIGKILL",
+            info.pid,
+            data_dir.display()
+        )));
     }
     Ok(())
 }
@@ -195,10 +225,11 @@ pub fn read_postmaster_pid(data_dir: &Path) -> Result<Option<PostmasterInfo>> {
     };
     let lines: Vec<&str> = text.lines().collect();
     let bad = || internal(format!("malformed postmaster.pid in {}", data_dir.display()));
-    let pid = lines.first().and_then(|l| l.trim().parse().ok()).ok_or_else(bad)?;
+    let pid: i32 = lines.first().and_then(|l| l.trim().parse().ok()).filter(|p| *p > 1).ok_or_else(bad)?;
     let dir = lines.get(1).map(|l| l.trim()).filter(|l| !l.is_empty()).ok_or_else(bad)?;
+    let start_time = lines.get(2).and_then(|l| l.trim().parse().ok()).ok_or_else(bad)?;
     let port = lines.get(3).and_then(|l| l.trim().parse().ok()).ok_or_else(bad)?;
-    Ok(Some(PostmasterInfo { pid, data_dir: PathBuf::from(dir), port }))
+    Ok(Some(PostmasterInfo { pid, data_dir: PathBuf::from(dir), port, start_time }))
 }
 
 #[cfg(test)]
@@ -214,7 +245,15 @@ mod tests {
         )
         .unwrap();
         let info = read_postmaster_pid(dir.path()).unwrap().unwrap();
-        assert_eq!(info, PostmasterInfo { pid: 4242, data_dir: PathBuf::from("/tmp/data"), port: 54321 });
+        assert_eq!(
+            info,
+            PostmasterInfo {
+                pid: 4242,
+                data_dir: PathBuf::from("/tmp/data"),
+                port: 54321,
+                start_time: 1_700_000_000
+            }
+        );
     }
 
     #[test]
@@ -222,6 +261,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_postmaster_pid(dir.path()).unwrap().is_none());
         std::fs::write(dir.path().join("postmaster.pid"), "oops\n").unwrap();
+        assert!(read_postmaster_pid(dir.path()).is_err());
+        for pid in ["0", "1", "-1"] {
+            std::fs::write(dir.path().join("postmaster.pid"), format!("{pid}\n/tmp/data\n1700000000\n54321\n")).unwrap();
+            assert!(read_postmaster_pid(dir.path()).is_err(), "pid {pid} must be rejected");
+        }
+        std::fs::write(dir.path().join("postmaster.pid"), "4242\n/tmp/data\nnotatime\n54321\n").unwrap();
         assert!(read_postmaster_pid(dir.path()).is_err());
     }
 

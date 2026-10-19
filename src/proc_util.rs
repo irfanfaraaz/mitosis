@@ -6,6 +6,9 @@ use std::process::Command;
 
 /// True when a process with this pid exists (zombies count as alive).
 pub fn is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false; // 0 and negatives would signal whole groups
+    }
     match kill(Pid::from_raw(pid), None) {
         Ok(()) => true,
         Err(e) => e == Errno::EPERM, // exists, but owned by someone else
@@ -15,6 +18,9 @@ pub fn is_alive(pid: i32) -> bool {
 /// True once the process is gone. If it is our own child, this reaps it (so no zombie
 /// stays behind); for a process that is not our child it falls back to `!is_alive`.
 pub fn has_exited(pid: i32) -> bool {
+    if pid <= 0 {
+        return true; // waitpid(0/-1) would reap unrelated children
+    }
     match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::StillAlive) => false,
         Ok(_) => true,
@@ -58,6 +64,12 @@ mod tests {
         let me = std::process::id() as i32;
         assert!(is_alive(me));
         assert!(process_start_time(me).unwrap() > 1_600_000_000);
+    }
+
+    #[test]
+    fn non_positive_pids_are_never_alive() {
+        assert!(!is_alive(0) && !is_alive(-1));
+        assert!(has_exited(0) && has_exited(-1));
     }
 
     #[test]
