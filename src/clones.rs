@@ -12,7 +12,8 @@ use crate::protocol::{CloneCreateArgs, CloneInfo};
 use crate::state::{CloneRow, CloneStatus, TemplateRow};
 use crate::templates::{info, now};
 use std::collections::{HashMap, HashSet};
-use std::io::ErrorKind;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 /// Start attempts when the chosen port turns out to be taken.
@@ -76,11 +77,17 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
     };
 
     let mut row = reserve(ctx, &tpl, &args, parent_start_time)?;
+    // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, &tpl, &mut row).await {
         Ok(info) => Ok(info),
         Err(e) => {
             // A failed cleanup leaves the row in Stopping for gc; the caller still gets the cause.
-            let _ = stop_and_remove(ctx, &row).await;
+            if let Err(ce) = stop_and_remove(ctx, &row).await {
+                let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log) {
+                    let _ = writeln!(f, "mitosis: cleanup after failed create failed: {ce}");
+                }
+            }
             Err(e)
         }
     }
@@ -205,6 +212,10 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
         MitosisError::new(ErrorCode::CloneNotFound, format!("clone {id_or_name} not found"))
             .with_hint("see existing clones with: mitosis clone list")
     })?;
+    // An in-flight create owns these; removing them under it would orphan its server.
+    if matches!(row.status, CloneStatus::Creating | CloneStatus::Starting) {
+        return Err(invalid(format!("clone {} is still starting; try again in a moment", row.id)));
+    }
     stop_and_remove(ctx, &row).await?;
     Ok(row.id)
 }
@@ -230,9 +241,9 @@ fn remove_if_present(path: &Path, dir: bool) -> Result<()> {
 
 /// Marks the clone Stopping, stops its Postgres, removes its folders and log, then drops the row.
 /// If Postgres may still be running, nothing is removed and the error is returned.
+/// A missing row is fine: the folders are still cleaned up.
 pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
-    let mut stopping = row.clone();
-    set_status(ctx, &mut stopping, CloneStatus::Stopping)?;
+    ctx.store().set_clone_status(&row.id, CloneStatus::Stopping)?;
     let dir = ctx.home.clones_dir().join(&row.id);
     let sock = ctx.home.sockets_dir().join(&row.id);
     let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
@@ -263,7 +274,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
         .iter()
         .map(|r| {
             let mut ci = to_info(r, ages.get(r.template.as_str()).copied().unwrap_or(0));
-            // Postgres leads its own process group; skip a pid that was reused by another process.
+            // Postmaster plus its backends; skip a pid that was reused by another process.
             ci.rss_bytes =
                 r.pg_pid.filter(|pid| process_start_time(*pid) == r.pg_start_time).and_then(rss_bytes);
             ci.own_disk_bytes = private_size(&r.dir);

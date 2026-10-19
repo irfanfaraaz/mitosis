@@ -4,7 +4,7 @@ use crate::proc_util::{has_exited, is_alive, process_start_time};
 use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -161,17 +161,29 @@ pub async fn wait_ready(
     }
 }
 
+/// Runs `sql` with psql over the socket. The SQL goes on stdin, never in argv, so `ps` cannot show
+/// secrets in it (e.g. `ALTER ROLE ... PASSWORD`).
 pub fn psql(install: &PgInstall, socket_dir: &Path, port: u16, db: &str, sql: &str) -> Result<String> {
-    let out = Command::new(install.bin("psql"))
+    let mut child = Command::new(install.bin("psql"))
         .arg("-h")
         .arg(socket_dir)
         .args(["-p", &port.to_string(), "-U", "postgres", "-d", db])
-        .args(["-v", "ON_ERROR_STOP=1", "-X", "-Atc", sql])
+        .args(["-v", "ON_ERROR_STOP=1", "-X", "-A", "-t", "-q", "-f", "-"])
         .env("PGCONNECT_TIMEOUT", "5")
-        .output()?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("psql stdin is piped");
+    let input = sql.to_owned();
+    // Written from a thread so a large output cannot deadlock against a large input.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes())); // stdin closes on drop
+    let out = child.wait_with_output()?;
+    let written = writer.join().unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")));
     if !out.status.success() {
         return Err(internal(format!("psql failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
+    written.map_err(|e| internal(format!("could not send SQL to psql: {e}")))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 

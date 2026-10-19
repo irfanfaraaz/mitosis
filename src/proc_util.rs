@@ -44,15 +44,33 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
     (n == size).then_some(info.pbi_start_tvsec)
 }
 
-/// Total resident memory in bytes of every process in process group `pgid`.
-pub fn rss_bytes(pgid: i32) -> Option<u64> {
-    let out = Command::new("ps").args(["-o", "rss=", "-g", &pgid.to_string()]).output().ok()?;
+/// Resident memory in bytes of `pid` plus its direct children. Postgres backends call
+/// `setsid()`, so the process group holds only the postmaster; its children are found by ppid.
+pub fn rss_bytes(pid: i32) -> Option<u64> {
+    let out = Command::new("ps").args(["-axo", "pid=,ppid=,rss="]).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let kb: Vec<u64> =
-        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
-    (!kb.is_empty()).then(|| kb.iter().sum::<u64>() * 1024)
+    sum_rss(&String::from_utf8_lossy(&out.stdout), pid)
+}
+
+/// Sums the `rss` (KiB) of `pid` and every process whose ppid is `pid`, from `pid ppid rss` lines.
+/// `None` when `pid` itself is not listed.
+fn sum_rss(ps: &str, pid: i32) -> Option<u64> {
+    let mut found = false;
+    let mut kb = 0u64;
+    for line in ps.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [p, pp, rss] = f[..] else { continue };
+        let (Ok(p), Ok(pp), Ok(rss)) = (p.parse::<i32>(), pp.parse::<i32>(), rss.parse::<u64>()) else { continue };
+        if p == pid {
+            found = true;
+        }
+        if p == pid || pp == pid {
+            kb += rss;
+        }
+    }
+    found.then_some(kb * 1024)
 }
 
 #[cfg(test)]
@@ -70,6 +88,15 @@ mod tests {
     fn non_positive_pids_are_never_alive() {
         assert!(!is_alive(0) && !is_alive(-1));
         assert!(has_exited(0) && has_exited(-1));
+    }
+
+    #[test]
+    fn rss_sums_pid_and_children() {
+        let ps = "    1     0   100\n  500     1  2000\n  501   500   300\n  502   500    40\n  600   501     7\n  bad\n";
+        assert_eq!(sum_rss(ps, 500), Some((2000 + 300 + 40) * 1024)); // grandchild 600 not counted
+        assert_eq!(sum_rss(ps, 502), Some(40 * 1024));
+        assert_eq!(sum_rss(ps, 999), None);
+        assert!(rss_bytes(std::process::id() as i32).unwrap() > 0);
     }
 
     #[test]

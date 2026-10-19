@@ -258,14 +258,23 @@ impl Store {
         Ok(())
     }
 
+    /// `CloneNotFound` when the row is gone (for example destroyed meanwhile).
     pub fn update_clone(&self, c: &CloneRow) -> Result<()> {
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE clones SET name=?2, template=?3, dir=?4, port=?5, socket_dir=?6, password=?7, database=?8, \
              pg_pid=?9, pg_start_time=?10, parent_pid=?11, parent_start_time=?12, created_at=?13, expires_at=?14, \
              durable=?15, status=?16 WHERE id=?1",
             clone_params!(c),
         )?;
+        if n == 0 {
+            return Err(MitosisError::new(ErrorCode::CloneNotFound, format!("clone {} no longer exists", c.id)));
+        }
         Ok(())
+    }
+
+    /// Changes only the status column; false when no row has this id.
+    pub fn set_clone_status(&self, id: &str, status: CloneStatus) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE clones SET status = ?2 WHERE id = ?1", params![id, status.as_str()])? > 0)
     }
 
     /// Matches id first, then name.
@@ -383,8 +392,14 @@ mod tests {
         store.update_clone(&c).unwrap();
         assert_eq!(store.get_clone("c1").unwrap().unwrap(), c);
 
+        assert!(store.set_clone_status("c3", CloneStatus::Stopping).unwrap());
+        let c3 = store.get_clone("c3").unwrap().unwrap();
+        assert_eq!(c3, CloneRow { status: CloneStatus::Stopping, ..clone_row("c3", None, 54322) });
+
         store.delete_clone("c1").unwrap();
         assert!(store.get_clone("c1").unwrap().is_none());
+        assert_eq!(store.update_clone(&c).unwrap_err().code, ErrorCode::CloneNotFound);
+        assert!(!store.set_clone_status("c1", CloneStatus::Ready).unwrap());
         assert!(!store.leased_ports().unwrap().contains(&54320));
     }
 
