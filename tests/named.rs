@@ -26,6 +26,7 @@ fn args(name: Option<&str>) -> CloneCreateArgs {
         parent_pid: None,
         fresh: false,
         protect: false,
+        env: None,
     }
 }
 
@@ -167,6 +168,7 @@ async fn protected_survives_ttl_and_needs_force() {
         &env.ctx,
         CloneCreateArgs {
             protect: true,
+            env: None,
             ..args(None)
         },
     )
@@ -177,6 +179,7 @@ async fn protected_survives_ttl_and_needs_force() {
         &env.ctx,
         CloneCreateArgs {
             protect: true,
+            env: None,
             parent_pid: Some(std::process::id() as i32),
             ttl_secs: 1,
             ..named("keep")

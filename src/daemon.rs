@@ -347,6 +347,13 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         } => {
             Response::TemplateBuilt(promote::promote(&ctx, &id_or_name, template.as_deref()).await?)
         }
+        Request::PendingRestores => Response::PendingRestores {
+            items: ctx.store().list_pending_restores()?,
+        },
+        Request::PendingRestoreDone { id } => {
+            ctx.store().delete_pending_restore(id)?;
+            Response::Ok
+        }
         Request::Gc => Response::Gc(lifecycle::reconcile(ctx.clone(), now()).await?),
         Request::Status => {
             let (clones, templates) = {
@@ -359,6 +366,8 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
                 clones,
                 templates,
                 uptime_secs: ctx.started_at.elapsed().as_secs(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                service: std::env::var_os("MITOSIS_SERVICE").is_some_and(|v| v == "1"),
             })
         }
         Request::ConfigReload => {

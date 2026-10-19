@@ -181,6 +181,7 @@ async fn from_url_copies_data_without_leaking_the_password() {
         parent_pid: None,
         fresh: false,
         protect: false,
+        env: None,
     };
     let src = create(&env.ctx, args("a")).await.unwrap();
     let password = src

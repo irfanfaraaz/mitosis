@@ -1,6 +1,8 @@
 use crate::clone_backend::{free_space, private_size};
 use crate::ctx::{Ctx, InFlightOp};
+use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::lifecycle::log;
 use crate::names::{new_clone_id, random_hex, validate_name};
 use crate::pg::{
     check_extensions, find_major, newest, psql, read_pg_version, running_server, start, stop,
@@ -8,7 +10,7 @@ use crate::pg::{
 };
 use crate::ports::pick_port;
 use crate::proc_util::{is_alive, process_start_time, rss_bytes};
-use crate::protocol::{CloneCreateArgs, CloneInfo, OnStale};
+use crate::protocol::{CloneCreateArgs, CloneInfo, OnStale, PendingRestore};
 use crate::scheduler;
 use crate::state::{CloneRow, CloneStatus, GenerationRow, ReservationRow, TemplateRow};
 use crate::templates::{age_secs, now};
@@ -72,9 +74,25 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
     }
 }
 
-pub async fn create(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> {
+pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneInfo> {
     let started = Instant::now();
-    let mut info = create_inner(ctx, args).await?;
+    let mut info = create_inner(ctx, &mut args).await?;
+    // Also for a reused or `--fresh` clone: the client writes its URL into the file either way.
+    if let Some(t) = &args.env {
+        let rec = PendingRestore {
+            id: 0,
+            file: t.file.clone(),
+            var: t.var.clone(),
+            previous: t.previous.clone(),
+            url: info.url.clone(),
+        };
+        if let Err(e) = ctx.store().add_env_record(&info.id, &rec) {
+            info.warnings.push(format!(
+                "could not remember the .env entry, so it will not be restored: {}",
+                e.message
+            ));
+        }
+    }
     info.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(info)
 }
@@ -84,7 +102,7 @@ pub async fn create(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> 
 async fn reuse_named(
     ctx: &Arc<Ctx>,
     name: &str,
-    args: &CloneCreateArgs,
+    args: &mut CloneCreateArgs,
 ) -> Result<Option<CloneInfo>> {
     let found = ctx
         .store()
@@ -110,7 +128,32 @@ async fn reuse_named(
             return Err(invalid(format!("clone {name} is protected"))
                 .with_hint(format!("mitosis destroy {name} --force")));
         }
-        destroy(ctx, &row.id).await?;
+        // The new clone takes over the .env entry, so the old one must not restore it: its
+        // `previous` is the user's value, the one to put back when the new clone goes.
+        let taken = match &mut args.env {
+            Some(t) => {
+                let prev = ctx.store().take_env_record(&row.id, &t.file, &t.var)?;
+                if let Some(p) = &prev {
+                    t.previous = p.clone();
+                }
+                prev.map(|p| (t.clone(), p))
+            }
+            None => None,
+        };
+        if let Err(e) = destroy(ctx, &row.id).await {
+            if let Some((t, previous)) = taken {
+                let url = to_info(&row, 0).url;
+                let rec = PendingRestore {
+                    id: 0,
+                    file: t.file,
+                    var: t.var,
+                    previous,
+                    url,
+                };
+                let _ = ctx.store().add_env_record(&row.id, &rec);
+            }
+            return Err(e);
+        }
         return Ok(None);
     }
     if row.template != args.template {
@@ -159,7 +202,7 @@ async fn reuse_named(
     Ok(Some(info))
 }
 
-async fn create_inner(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> {
+async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
         validate_name("clone", name)?;
     }
@@ -170,8 +213,8 @@ async fn create_inner(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo
     if args.ttl_secs == 0 && !args.protect {
         return Err(invalid("ttl must be greater than zero"));
     }
-    if let Some(name) = &args.name {
-        if let Some(info) = reuse_named(ctx, name, &args).await? {
+    if let Some(name) = args.name.clone() {
+        if let Some(info) = reuse_named(ctx, &name, args).await? {
             return Ok(info);
         }
     }
@@ -201,7 +244,7 @@ async fn create_inner(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo
         None => None,
     };
 
-    let (mut row, _in_flight, mut warnings) = reserve(ctx, &tpl, &gen, &args, parent_start_time)?;
+    let (mut row, _in_flight, mut warnings) = reserve(ctx, &tpl, &gen, args, parent_start_time)?;
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, swap, &gen, &mut row).await {
         Ok(mut info) => {
@@ -611,7 +654,39 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
         remove_if_present(&log, false)
     })
     .await?;
+    restore_env(ctx, &row.id);
     ctx.store().delete_clone(&row.id)
+}
+
+/// Puts back the `.env` values the clone replaced. A restore that fails (a read-only file, say)
+/// is kept as a pending restore for a client to finish; it never fails the destroy.
+fn restore_env(ctx: &Ctx, clone_id: &str) {
+    let recs = match ctx.store().env_records(clone_id) {
+        Ok(r) => r,
+        Err(e) => {
+            log(ctx, &format!("env records of {clone_id}: {e}"));
+            return;
+        }
+    };
+    for rec in recs {
+        if let Err(e) = envfile::restore(&rec) {
+            log(
+                ctx,
+                &format!(
+                    "restore of {} in {} deferred: {}",
+                    rec.var,
+                    rec.file.display(),
+                    e.message
+                ),
+            );
+            if let Err(e) = ctx.store().add_pending_restore(&rec) {
+                log(ctx, &format!("pending restore of {}: {e}", rec.var));
+            }
+        }
+    }
+    if let Err(e) = ctx.store().delete_env_records(clone_id) {
+        log(ctx, &format!("env records of {clone_id}: {e}"));
+    }
 }
 
 pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {

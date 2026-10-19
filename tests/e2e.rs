@@ -277,3 +277,43 @@ async fn mcp_tools_roundtrip() {
         "the CLI clone is not tied to the session"
     );
 }
+
+/// A daemon from release 0.1: answers every v2 request with the v1 `protocol_mismatch` error and
+/// exits when it gets a v1 shutdown.
+fn fake_v1_daemon(home: &Path) -> std::thread::JoinHandle<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let sock = home.join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind fake daemon");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            if line.contains(r#""v":1"#) && line.contains("shutdown") {
+                let _ = stream.write_all(b"{\"v\":1,\"result\":{\"Ok\":{\"type\":\"ok\"}}}\n");
+                let _ = std::fs::remove_file(&sock);
+                return; // dropping the listener refuses new connections
+            }
+            let reply = r#"{"v":1,"result":{"Err":{"code":"protocol_mismatch","message":"client speaks protocol 2, daemon speaks protocol 1","hint":"run the same mitosis version for the client and the daemon"}}}"#;
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+        }
+    })
+}
+
+#[test]
+fn older_daemon_is_replaced() {
+    let tmp = tmp_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let fake = fake_v1_daemon(home);
+
+    let out = ok(home, &["list", "--json"]);
+    assert_eq!(out.trim(), "[]");
+    fake.join().expect("fake daemon exited on shutdown");
+    assert!(
+        home.join("daemon.sock").exists(),
+        "a new daemon owns the socket"
+    );
+}

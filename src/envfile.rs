@@ -1,0 +1,434 @@
+//! `.env` injection: put a clone's URL in a project's `.env` file and put the old value back when
+//! the clone is destroyed.
+//!
+//! The editing functions are pure and touch only the one line they are asked about: everything
+//! else in the file (comments, order, line endings, a missing final newline) stays as it was.
+
+use crate::client;
+use crate::error::{ErrorCode, MitosisError, Result};
+use crate::names::random_hex;
+use crate::paths::Home;
+use crate::protocol::{CloneCreateArgs, CloneInfo, EnvTarget, PendingRestore, Request, Response};
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+pub const DEFAULT_VAR: &str = "DATABASE_URL";
+
+fn invalid(msg: impl Into<String>) -> MitosisError {
+    MitosisError::new(ErrorCode::InvalidRequest, msg)
+}
+
+/// Where a variable's line sits in the text (all byte offsets).
+struct Found {
+    /// Start of the line.
+    start: usize,
+    /// Start of the variable name (after indent and `export `).
+    var_pos: usize,
+    /// Just after the `=`.
+    value_start: usize,
+    /// End of the line's text, before `\r\n` / `\n`.
+    content_end: usize,
+    /// After the line break (or the end of the text).
+    end: usize,
+}
+
+/// `^\s*(export\s+)?VAR\s*=` on one line; returns `(var_pos, value_start)`.
+fn match_line(text: &str, start: usize, content_end: usize, var: &str) -> Option<(usize, usize)> {
+    let line = &text[start..content_end];
+    let mut rest = line.trim_start();
+    let mut pos = start + (line.len() - rest.len());
+    if let Some(r) = rest.strip_prefix("export") {
+        if r.starts_with(char::is_whitespace) {
+            let r = r.trim_start();
+            pos += rest.len() - r.len();
+            rest = r;
+        }
+    }
+    let after = rest.strip_prefix(var)?.trim_start().strip_prefix('=')?;
+    Some((pos, content_end - after.len()))
+}
+
+fn find(text: &str, var: &str) -> Option<Found> {
+    let mut start = 0;
+    while start < text.len() {
+        let nl = text[start..].find('\n');
+        let end = nl.map_or(text.len(), |i| start + i + 1);
+        let mut content_end = if nl.is_some() { end - 1 } else { end };
+        if text[start..content_end].ends_with('\r') {
+            content_end -= 1;
+        }
+        if let Some((var_pos, value_start)) = match_line(text, start, content_end, var) {
+            return Some(Found {
+                start,
+                var_pos,
+                value_start,
+                content_end,
+                end,
+            });
+        }
+        start = end;
+    }
+    None
+}
+
+/// The value of the first `VAR=` line: bare, `"…"` or `'…'`.
+pub fn get_var(text: &str, var: &str) -> Option<String> {
+    let f = find(text, var)?;
+    let raw = text[f.value_start..f.content_end].trim();
+    for q in ['"', '\''] {
+        if let Some(inner) = raw.strip_prefix(q).and_then(|r| r.split_once(q)) {
+            return Some(inner.0.to_string());
+        }
+    }
+    // A bare value ends at a ` #` comment.
+    Some(raw.split(" #").next().unwrap_or(raw).trim().to_string())
+}
+
+/// Sets the first `VAR=` line (keeping indent and `export `), or appends one. The value is
+/// written as it is: a clone URL needs no quoting.
+pub fn set_var(text: &str, var: &str, value: &str) -> String {
+    if let Some(f) = find(text, var) {
+        return format!(
+            "{}{var}={value}{}",
+            &text[..f.var_pos],
+            &text[f.content_end..]
+        );
+    }
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(eol);
+    }
+    out.push_str(&format!("{var}={value}{eol}"));
+    out
+}
+
+/// Removes the first `VAR=` line, line break included.
+pub fn remove_var(text: &str, var: &str) -> String {
+    match find(text, var) {
+        Some(f) => format!("{}{}", &text[..f.start], &text[f.end..]),
+        None => text.to_string(),
+    }
+}
+
+/// The file's text, or `None` when it does not exist.
+pub fn read_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(MitosisError::new(
+            ErrorCode::Internal,
+            format!("read {}: {e}", path.display()),
+        )),
+    }
+}
+
+/// Replaces the file atomically (temp file in the same folder, then rename). An existing file keeps
+/// its mode, a new one gets 0600. A file the owner cannot write is refused, as a plain write would.
+pub fn write_file(path: &Path, text: &str) -> Result<()> {
+    let io = |e: std::io::Error| {
+        MitosisError::new(
+            ErrorCode::Internal,
+            format!("write {}: {e}", path.display()),
+        )
+    };
+    // A symlinked .env is replaced through the link, not turned into a plain file.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mode = match std::fs::metadata(&target) {
+        Ok(m) if m.mode() & 0o200 == 0 => {
+            return Err(io(std::io::Error::from(ErrorKind::PermissionDenied)))
+        }
+        Ok(m) => m.mode() & 0o7777,
+        Err(e) if e.kind() == ErrorKind::NotFound => 0o600,
+        Err(e) => return Err(io(e)),
+    };
+    let name = target
+        .file_name()
+        .map_or_else(|| ".env".into(), |n| n.to_string_lossy().into_owned());
+    let tmp = target.with_file_name(format!(".{name}.mitosis-{}", random_hex(4)));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io(e));
+    }
+    Ok(())
+}
+
+/// The file name must start with `.env` (`.env`, `.env.local`, …): other files are not ours to edit.
+pub fn check_name(path: &Path) -> Result<()> {
+    let ok = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(".env"));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "{} is not an .env file: its name must start with .env",
+            path.display()
+        ))
+        .with_hint("mitosis clone --env-file .env.local"))
+    }
+}
+
+/// True when the file is in a git work tree and git does not ignore it (so a commit could pick up
+/// the password). False when git or a repository is missing.
+pub fn git_unignored(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["check-ignore", "-q"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.code() == Some(1))
+}
+
+/// Puts the previous value back, but only while the file still holds `rec.url`: a value the user
+/// changed since is theirs. `false` (nothing touched) when the value differs or the file is gone.
+pub fn restore(rec: &PendingRestore) -> Result<bool> {
+    let Some(text) = read_file(&rec.file)? else {
+        return Ok(false);
+    };
+    if get_var(&text, &rec.var).as_deref() != Some(rec.url.as_str()) {
+        return Ok(false);
+    }
+    let new = match &rec.previous {
+        Some(prev) => set_var(&text, &rec.var, prev),
+        None => remove_var(&text, &rec.var),
+    };
+    write_file(&rec.file, &new)?;
+    Ok(true)
+}
+
+/// Points `var` at `new_url` when the file still holds `old_url` (the clone's URL changed).
+/// `false` (nothing touched) when the value differs or the file is gone.
+pub fn rewrite(path: &Path, var: &str, old_url: &str, new_url: &str) -> Result<bool> {
+    let Some(text) = read_file(path)? else {
+        return Ok(false);
+    };
+    if get_var(&text, var).as_deref() != Some(old_url) {
+        return Ok(false);
+    }
+    write_file(path, &set_var(&text, var, new_url))?;
+    Ok(true)
+}
+
+fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
+    let var = var.unwrap_or_else(|| DEFAULT_VAR.to_string());
+    let mut chars = var.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(invalid(format!("{var} is not a valid variable name")));
+    }
+    let file = std::env::current_dir()?.join(file);
+    check_name(&file)?;
+    let previous = read_file(&file)?.and_then(|t| get_var(&t, &var));
+    Ok(EnvTarget {
+        file,
+        var,
+        previous,
+    })
+}
+
+/// Creates a clone through the daemon and, with `env_file`, writes its URL into that file
+/// (`env_var`, default `DATABASE_URL`). A file that cannot be written is a warning on the returned
+/// info: the clone exists and its URL is in the result.
+pub async fn create_clone(
+    home: &Home,
+    mut args: CloneCreateArgs,
+    env_file: Option<PathBuf>,
+    env_var: Option<String>,
+) -> Result<CloneInfo> {
+    args.env = match (env_file, env_var) {
+        (Some(f), v) => Some(env_target(f, v)?),
+        (None, Some(_)) => return Err(invalid("an env variable needs an env file")),
+        (None, None) => None,
+    };
+    let env = args.env.clone();
+    let mut info = match client::request(home, Request::CloneCreate(args)).await? {
+        Response::CloneCreated(info) => info,
+        // Not the reply itself: it holds a password-bearing URL.
+        _ => {
+            return Err(
+                MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
+                    .with_hint("restart the daemon: mitosis daemon stop"),
+            )
+        }
+    };
+    if let Some(t) = env {
+        let written = read_file(&t.file).and_then(|text| {
+            write_file(
+                &t.file,
+                &set_var(&text.unwrap_or_default(), &t.var, &info.url),
+            )
+        });
+        match written {
+            Ok(()) => {
+                if git_unignored(&t.file) {
+                    info.warnings
+                        .push(format!("{} is not ignored by git", t.file.display()));
+                }
+            }
+            Err(e) => info.warnings.push(format!(
+                "could not write {} to {}: {}",
+                t.var,
+                t.file.display(),
+                e.message
+            )),
+        }
+    }
+    Ok(info)
+}
+
+/// Finishes the `.env` restores the daemon could not do. Returns warnings, never fails.
+pub async fn finish_pending(home: &Home) -> Vec<String> {
+    let items = match client::request(home, Request::PendingRestores).await {
+        Ok(Response::PendingRestores { items }) => items,
+        Ok(_) => return vec!["unexpected daemon reply to a pending .env restore request".into()],
+        Err(e) => return vec![format!("pending .env restores: {}", e.message)],
+    };
+    let mut warnings = Vec::new();
+    for item in items {
+        match restore(&item) {
+            // Restored, or the user changed the value or removed the file: either way it is done.
+            Ok(_) => {
+                if let Err(e) =
+                    client::request(home, Request::PendingRestoreDone { id: item.id }).await
+                {
+                    warnings.push(format!("pending .env restore: {}", e.message));
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "could not restore {} in {}: {}",
+                item.var,
+                item.file.display(),
+                e.message
+            )),
+        }
+    }
+    warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_edit_replaces_first_only() {
+        let t = "A=1\nDATABASE_URL=old\nB=2\nDATABASE_URL=again\n";
+        assert_eq!(
+            set_var(t, "DATABASE_URL", "new"),
+            "A=1\nDATABASE_URL=new\nB=2\nDATABASE_URL=again\n"
+        );
+        assert_eq!(get_var(t, "DATABASE_URL").as_deref(), Some("old"));
+        // A longer name is not the variable.
+        assert_eq!(get_var("DATABASE_URL_X=1\n", "DATABASE_URL"), None);
+    }
+
+    #[test]
+    fn env_edit_keeps_crlf() {
+        let t = "A=1\r\nDATABASE_URL=old\r\nB=2\r\n";
+        assert_eq!(
+            set_var(t, "DATABASE_URL", "new"),
+            "A=1\r\nDATABASE_URL=new\r\nB=2\r\n"
+        );
+        assert_eq!(get_var(t, "DATABASE_URL").as_deref(), Some("old"));
+        assert_eq!(
+            set_var("A=1\r\n", "X", "y"),
+            "A=1\r\nX=y\r\n",
+            "an appended line uses the file's line ending"
+        );
+    }
+
+    #[test]
+    fn env_edit_no_trailing_newline() {
+        assert_eq!(
+            set_var("A=1\nDATABASE_URL=old", "DATABASE_URL", "new"),
+            "A=1\nDATABASE_URL=new"
+        );
+        assert_eq!(set_var("A=1", "X", "y"), "A=1\nX=y\n");
+    }
+
+    #[test]
+    fn env_edit_export_prefix() {
+        let t = "  export DATABASE_URL = old\n";
+        assert_eq!(get_var(t, "DATABASE_URL").as_deref(), Some("old"));
+        assert_eq!(
+            set_var(t, "DATABASE_URL", "new"),
+            "  export DATABASE_URL=new\n"
+        );
+    }
+
+    #[test]
+    fn env_edit_quoted_values_read() {
+        assert_eq!(get_var("V=\"a b\"\n", "V").as_deref(), Some("a b"));
+        assert_eq!(get_var("V='a#b' # note\n", "V").as_deref(), Some("a#b"));
+        assert_eq!(get_var("V=bare # note\n", "V").as_deref(), Some("bare"));
+        assert_eq!(get_var("V=\n", "V").as_deref(), Some(""));
+        assert_eq!(get_var("# V=1\n", "V"), None);
+    }
+
+    #[test]
+    fn env_edit_appends_when_absent() {
+        assert_eq!(set_var("A=1\n", "V", "x"), "A=1\nV=x\n");
+    }
+
+    #[test]
+    fn env_edit_empty_file() {
+        assert_eq!(set_var("", "V", "x"), "V=x\n");
+        assert_eq!(remove_var("", "V"), "");
+        assert_eq!(get_var("", "V"), None);
+    }
+
+    #[test]
+    fn env_remove_keeps_rest() {
+        assert_eq!(remove_var("A=1\nV=x\nB=2\n", "V"), "A=1\nB=2\n");
+        assert_eq!(remove_var("A=1\r\nV=x\r\n", "V"), "A=1\r\n");
+        assert_eq!(remove_var("A=1\n", "V"), "A=1\n");
+    }
+
+    #[test]
+    fn check_name_rejects_other_files() {
+        assert!(check_name(Path::new("/p/.env")).is_ok());
+        assert!(check_name(Path::new("/p/.env.local")).is_ok());
+        for bad in ["/p/config.toml", "/p/env", "/p/my.env", "/p/"] {
+            let e = check_name(Path::new(bad)).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidRequest, "{bad}");
+        }
+    }
+
+    #[test]
+    fn write_file_keeps_mode_and_creates_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        write_file(&p, "A=1\n").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_file(&p, "A=2\n").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "A=2\n");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(write_file(&p, "A=3\n").is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "A=2\n");
+    }
+}

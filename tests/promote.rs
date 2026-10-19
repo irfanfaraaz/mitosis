@@ -23,6 +23,7 @@ fn clone_args(template: &str) -> CloneCreateArgs {
         parent_pid: None,
         fresh: false,
         protect: false,
+        env: None,
     }
 }
 

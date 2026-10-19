@@ -135,6 +135,33 @@ pub struct CloneCreateArgs {
     /// Needs a name; no parent, no TTL, and `destroy` needs `force`.
     #[serde(default)]
     pub protect: bool,
+    /// A `.env` entry the client will point at the clone; the daemon records it so a destroy can
+    /// put `previous` back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<EnvTarget>,
+}
+
+/// One variable in one `.env` file that holds a clone's URL.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct EnvTarget {
+    /// Absolute path.
+    pub file: PathBuf,
+    pub var: String,
+    /// The value the variable had before (`None`: the line did not exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+/// A `.env` restore the daemon could not do (e.g. a read-only file); a client finishes it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PendingRestore {
+    pub id: i64,
+    pub file: PathBuf,
+    pub var: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// The clone URL the file must still hold for the restore to apply.
+    pub url: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -185,6 +212,11 @@ pub enum Request {
         id_or_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         template: Option<String>,
+    },
+    /// `.env` restores the daemon could not finish.
+    PendingRestores,
+    PendingRestoreDone {
+        id: i64,
     },
     Gc,
     Status,
@@ -289,6 +321,12 @@ pub struct DaemonStatus {
     pub clones: usize,
     pub templates: usize,
     pub uptime_secs: u64,
+    /// Crate version of the daemon binary.
+    #[serde(default)]
+    pub version: String,
+    /// Started by the launchd login service.
+    #[serde(default)]
+    pub service: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -311,6 +349,9 @@ pub enum Response {
     },
     Destroyed {
         id: String,
+    },
+    PendingRestores {
+        items: Vec<PendingRestore>,
     },
     Gc(GcReport),
     Status(DaemonStatus),
@@ -354,6 +395,7 @@ mod tests {
                 parent_pid: Some(42),
                 fresh: false,
                 protect: false,
+                env: None,
             }),
         };
         let line = serde_json::to_string(&env).unwrap();

@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
 use crate::protocol::{Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION};
+use crate::service;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::os::unix::process::CommandExt;
@@ -35,9 +36,7 @@ pub async fn request(home: &Home, req: Request) -> Result<Response> {
         Ok(s) => s,
         Err(e) if not_listening(&e) => {
             ensure_daemon(home).await?;
-            UnixStream::connect(home.daemon_sock()).await.map_err(|e| {
-                unavailable(format!("connect to {}: {e}", home.daemon_sock().display()))
-            })?
+            connect_started(home).await?
         }
         Err(e) => {
             return Err(unavailable(format!(
@@ -46,13 +45,90 @@ pub async fn request(home: &Home, req: Request) -> Result<Response> {
             )))
         }
     };
-    exchange(stream, req).await
+    match exchange(stream, &req).await? {
+        Reply::Done(r) => Ok(r),
+        Reply::Older(v) => {
+            // A daemon from an older release: stop it (clones keep running), start ours, retry once.
+            replace_old(home, v).await?;
+            ensure_daemon(home).await?;
+            match exchange(connect_started(home).await?, &req).await? {
+                Reply::Done(r) => Ok(r),
+                Reply::Older(v) => Err(mismatch(v)),
+            }
+        }
+    }
+}
+
+async fn connect_started(home: &Home) -> Result<UnixStream> {
+    UnixStream::connect(home.daemon_sock())
+        .await
+        .map_err(|e| unavailable(format!("connect to {}: {e}", home.daemon_sock().display())))
+}
+
+fn mismatch(theirs: u64) -> MitosisError {
+    mismatch_text(Some(theirs))
+}
+
+fn mismatch_text(theirs: Option<u64>) -> MitosisError {
+    let theirs = theirs.map_or("unknown".to_string(), |v| v.to_string());
+    MitosisError::new(
+        ErrorCode::ProtocolMismatch,
+        format!("daemon speaks protocol {theirs}, this client speaks protocol {PROTOCOL_VERSION}"),
+    )
+    .with_hint("restart the daemon: mitosis daemon stop")
+}
+
+/// Sends a raw line to a daemon speaking protocol `v` and returns its parsed reply, if any.
+async fn raw_exchange(home: &Home, line: &str) -> Option<serde_json::Value> {
+    let stream = UnixStream::connect(home.daemon_sock()).await.ok()?;
+    let (rd, mut wr) = stream.into_split();
+    wr.write_all(format!("{line}\n").as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    BufReader::new(rd)
+        .take(MAX_REPLY)
+        .read_until(b'\n', &mut buf)
+        .await
+        .ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Shuts down a daemon that speaks the older protocol `v` and waits until its socket is gone.
+async fn replace_old(home: &Home, v: u64) -> Result<()> {
+    // The shutdown request is the one message every version understands.
+    raw_exchange(
+        home,
+        &format!(r#"{{"v":{v},"request":{{"type":"shutdown"}}}}"#),
+    )
+    .await;
+    let deadline = Instant::now() + START_TIMEOUT;
+    while UnixStream::connect(home.daemon_sock()).await.is_ok() {
+        if Instant::now() >= deadline {
+            let pid = raw_exchange(
+                home,
+                &format!(r#"{{"v":{v},"request":{{"type":"status"}}}}"#),
+            )
+            .await
+            .and_then(|r| r["result"]["Ok"]["pid"].as_u64());
+            let kill = pid.map_or("kill <pid>".to_string(), |p| format!("kill {p}"));
+            return Err(unavailable(format!(
+                "an older mitosis daemon (protocol {v}) is running and did not stop within 30 s"
+            ))
+            .with_hint(format!(
+                "stop the old daemon: mitosis daemon stop (old binary) or {kill}"
+            )));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    Ok(())
 }
 
 /// Sends `req` only if a daemon is already listening; `None` when none is.
 pub async fn request_if_running(home: &Home, req: Request) -> Result<Option<Response>> {
     match UnixStream::connect(home.daemon_sock()).await {
-        Ok(s) => exchange(s, req).await.map(Some),
+        Ok(s) => match exchange(s, &req).await? {
+            Reply::Done(r) => Ok(Some(r)),
+            Reply::Older(v) => Err(mismatch(v)),
+        },
         Err(e) if not_listening(&e) => Ok(None),
         Err(e) => Err(unavailable(format!(
             "connect to {}: {e}",
@@ -61,11 +137,17 @@ pub async fn request_if_running(home: &Home, req: Request) -> Result<Option<Resp
     }
 }
 
-async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
+/// A daemon's answer: the response, or the lower protocol version it speaks.
+enum Reply {
+    Done(Response),
+    Older(u64),
+}
+
+async fn exchange(stream: UnixStream, req: &Request) -> Result<Reply> {
     let (rd, mut wr) = stream.into_split();
     let mut line = serde_json::to_vec(&RequestEnvelope {
         v: PROTOCOL_VERSION,
-        request: req,
+        request: req.clone(),
     })?;
     line.push(b'\n');
     wr.write_all(&line)
@@ -98,14 +180,10 @@ async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
     })?;
     let v = value.get("v").and_then(|v| v.as_u64());
     if v != Some(u64::from(PROTOCOL_VERSION)) {
-        let theirs = v.map_or("unknown".to_string(), |v| v.to_string());
-        return Err(MitosisError::new(
-            ErrorCode::ProtocolMismatch,
-            format!(
-                "daemon speaks protocol {theirs}, this client speaks protocol {PROTOCOL_VERSION}"
-            ),
-        )
-        .with_hint("restart the daemon: mitosis daemon stop"));
+        return match v {
+            Some(v) if v < u64::from(PROTOCOL_VERSION) => Ok(Reply::Older(v)),
+            _ => Err(mismatch_text(v)),
+        };
     }
     let env: ResponseEnvelope = serde_json::from_value(value).map_err(|e| {
         MitosisError::new(
@@ -113,7 +191,7 @@ async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
             format!("unreadable daemon reply: {e}"),
         )
     })?;
-    env.result
+    env.result.map(Reply::Done)
 }
 
 /// Starts `current_exe() daemon` in its own session and waits until its socket accepts connections.
@@ -122,26 +200,35 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
     // A bad config value surfaces here as invalid_request, not as a daemon that fails to start.
     Config::load(home)?;
     let log_path = home.logs_dir().join("daemon.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("daemon")
-        .current_dir("/")
-        .env("MITOSIS_HOME", &home.root)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(std::io::Error::from)
-        });
-    }
-    let mut child = cmd.spawn()?;
+    // With the login service loaded for this home, launchd starts the daemon, not us.
+    let h = home.clone();
+    let kicked = tokio::task::spawn_blocking(move || service::manages(&h) && service::kickstart())
+        .await
+        .unwrap_or(false);
+    let mut child = if kicked {
+        None
+    } else {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("daemon")
+            .current_dir("/")
+            .env("MITOSIS_HOME", &home.root)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(std::io::Error::from)
+            });
+        }
+        Some(cmd.spawn()?)
+    };
 
     let mut deadline = Instant::now() + START_TIMEOUT;
     let mut exited = false;
@@ -150,7 +237,7 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
             return Ok(());
         }
         if !exited {
-            if let Ok(Some(status)) = child.try_wait() {
+            if let Some(Ok(Some(status))) = child.as_mut().map(|c| c.try_wait()) {
                 exited = true;
                 // Lost the lock to another daemon, which may still be reconciling before it binds:
                 // keep the long wait. Any other exit is a failed start: give a racer a moment only.

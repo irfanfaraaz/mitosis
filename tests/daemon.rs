@@ -177,6 +177,7 @@ fn clone_args() -> CloneCreateArgs {
         parent_pid: None,
         fresh: false,
         protect: false,
+        env: None,
     }
 }
 

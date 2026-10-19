@@ -157,6 +157,7 @@ impl Mitosis {
             durable: p.durable.unwrap_or(false),
             fresh: false,
             protect: false,
+            env: None,
             // This process is the parent: when the MCP session ends, the daemon destroys the clone.
             parent_pid: Some(std::process::id() as i32),
         };

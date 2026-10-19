@@ -1,6 +1,7 @@
 use crate::client;
 use crate::config::{Config, ConfigEntry};
 use crate::daemon;
+use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::mcp;
 use crate::names::{format_duration, parse_duration, validate_name};
@@ -9,6 +10,7 @@ use crate::protocol::{
     CloneCreateArgs, CloneInfo, MigrateCmd, Request, Response, TemplateInfo, TemplateInitArgs,
     TemplateSetArgs, TemplateSettings, TemplateSource,
 };
+use crate::service;
 use crate::templates::now;
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -50,8 +52,20 @@ enum Cmd {
         /// Never expire; needs --name. Destroy it with `mitosis destroy <name> --force`.
         #[arg(long)]
         protect: bool,
+        /// Write the URL into this .env file (restored when the clone is destroyed).
+        #[arg(long)]
+        env_file: Option<std::path::PathBuf>,
+        /// The variable to set in --env-file.
+        #[arg(long, requires = "env_file")]
+        env_var: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Print `DATABASE_URL=<url>` (or --var) for a running clone.
+    Env {
+        id_or_name: String,
+        #[arg(long, default_value = "DATABASE_URL")]
+        var: String,
     },
     /// List clones.
     List {
@@ -84,6 +98,11 @@ enum Cmd {
     },
     /// Serve the MCP tools over stdio.
     Mcp,
+    /// Keep the daemon running from login (launchd user agent).
+    Service {
+        #[command(subcommand)]
+        command: ServiceCmd,
+    },
     /// Show the settings and where each value comes from, or change one.
     Config {
         #[command(subcommand)]
@@ -252,6 +271,19 @@ impl SettingsFlags {
 }
 
 #[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install and start the login service for this binary and home.
+    Install,
+    /// Stop and remove the login service.
+    Uninstall,
+    /// Show whether the login service is installed and running.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DaemonCmd {
     /// Show whether the daemon is running.
     Status,
@@ -305,6 +337,37 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             daemon::run(home, config).await?
         }
         Cmd::Mcp => mcp::serve_stdio(home).await?,
+        Cmd::Service { command } => match command {
+            ServiceCmd::Install => {
+                service::install()?;
+                let exe = std::env::current_exe()?;
+                println!("service installed: the daemon starts at login");
+                println!("binary    {}", exe.display());
+                if exe.components().any(|c| c.as_os_str() == "target") {
+                    eprintln!(
+                        "warning: the service points at a build folder; it breaks if you run cargo clean (use cargo install for a stable path)"
+                    );
+                }
+            }
+            ServiceCmd::Uninstall => {
+                service::uninstall()?;
+                println!("service removed");
+            }
+            ServiceCmd::Status { json } => {
+                let s = service::status()?;
+                if json {
+                    print_json(&s)?;
+                } else {
+                    println!("installed {}", s.installed);
+                    println!("loaded    {}", s.loaded);
+                    println!("running   {}", s.running);
+                    if let Some(b) = &s.binary {
+                        let gone = if s.binary_exists { "" } else { "  (missing)" };
+                        println!("binary    {}{gone}", b.display());
+                    }
+                }
+            }
+        },
         Cmd::Config {
             command: None,
             json,
@@ -333,6 +396,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             durable,
             fresh,
             protect,
+            env_file,
+            env_var,
             json,
         } => {
             validate_name("template", &template)?;
@@ -350,12 +415,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 // The CLI exits right after printing the URL, so watching it would destroy the
                 // clone at once: CLI clones live until their TTL or `mitosis destroy`.
                 parent_pid: None,
+                env: None,
             };
-            let info = match client::request(&home, Request::CloneCreate(args)).await? {
-                Response::CloneCreated(info) => info,
-                other => return Err(unexpected(other)),
-            };
-            for w in &info.warnings {
+            let info = envfile::create_clone(&home, args, env_file, env_var).await?;
+            for w in info
+                .warnings
+                .iter()
+                .chain(&envfile::finish_pending(&home).await)
+            {
                 eprintln!("warning: {w}");
             }
             if info.existing {
@@ -379,11 +446,31 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{}", info.url);
             }
         }
+        Cmd::Env { id_or_name, var } => {
+            let clones = match client::request(&home, Request::CloneList).await? {
+                Response::Clones { clones } => clones,
+                other => return Err(unexpected(other)),
+            };
+            let c = clones
+                .iter()
+                .find(|c| c.id == id_or_name || c.name.as_deref() == Some(id_or_name.as_str()))
+                .ok_or_else(|| {
+                    MitosisError::new(
+                        ErrorCode::CloneNotFound,
+                        format!("clone {id_or_name} not found"),
+                    )
+                    .with_hint("see running clones with `mitosis list`")
+                })?;
+            println!("{var}={}", c.url);
+        }
         Cmd::List { json } => {
             let clones = match client::request(&home, Request::CloneList).await? {
                 Response::Clones { clones } => clones,
                 other => return Err(unexpected(other)),
             };
+            for w in envfile::finish_pending(&home).await {
+                eprintln!("warning: {w}");
+            }
             if json {
                 print_json(&clones)?;
             } else {
@@ -403,6 +490,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             match client::request(&home, req).await? {
                 Response::Destroyed { id } => println!("{id}"),
                 other => return Err(unexpected(other)),
+            }
+            for w in envfile::finish_pending(&home).await {
+                eprintln!("warning: {w}");
             }
         }
         Cmd::Promote { clone, template } => {
@@ -447,6 +537,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Some(Response::Status(s)) => {
                 println!("daemon is running");
                 println!("pid       {}", s.pid);
+                println!("version   {}", s.version);
+                println!("service   {}", s.service);
                 println!("home      {}", s.home.display());
                 println!("clones    {}", s.clones);
                 println!("templates {}", s.templates);

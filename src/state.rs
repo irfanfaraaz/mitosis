@@ -1,5 +1,5 @@
 use crate::error::{ErrorCode, MitosisError, Result};
-use crate::protocol::{GenKind, MigrateCmd, OnStale, RefreshMode, TemplateSource};
+use crate::protocol::{GenKind, MigrateCmd, OnStale, PendingRestore, RefreshMode, TemplateSource};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -229,6 +229,25 @@ CREATE TABLE IF NOT EXISTS reservations (
 );
 ";
 
+/// Runs on every open, like `RESERVATIONS`.
+const ENV_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS env_records (
+    clone_id TEXT NOT NULL,
+    file TEXT NOT NULL,
+    var TEXT NOT NULL,
+    previous TEXT,
+    url TEXT NOT NULL,
+    PRIMARY KEY (clone_id, file, var)
+);
+CREATE TABLE IF NOT EXISTS pending_restores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file TEXT NOT NULL,
+    var TEXT NOT NULL,
+    previous TEXT,
+    url TEXT NOT NULL
+);
+";
+
 const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at";
 const GEN_COLS: &str = "template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes, from_clone, from_gen";
 const CLONE_COLS: &str = "id, name, template, dir, port, socket_dir, password, database, pg_pid, pg_start_time, parent_pid, parent_start_time, created_at, expires_at, durable, status, generation, protected, suspect";
@@ -394,6 +413,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         .with_hint("run a newer mitosis"));
     }
     conn.execute_batch(RESERVATIONS)?;
+    conn.execute_batch(ENV_TABLES)?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
@@ -643,6 +663,98 @@ impl Store {
     pub fn delete_clone(&self, id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM clones WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Remembers a `.env` entry that holds the clone's URL. A second record for the same file and
+    /// variable keeps the first `previous` (the user's own value) and only updates the URL.
+    pub fn add_env_record(&self, clone_id: &str, rec: &PendingRestore) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO env_records (clone_id, file, var, previous, url) VALUES (?1,?2,?3,?4,?5) \
+             ON CONFLICT(clone_id, file, var) DO UPDATE SET url = excluded.url",
+            params![
+                clone_id,
+                rec.file.to_string_lossy(),
+                rec.var,
+                rec.previous,
+                rec.url
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The clone's `.env` records as restores (`id` is 0).
+    pub fn env_records(&self, clone_id: &str) -> Result<Vec<PendingRestore>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file, var, previous, url FROM env_records WHERE clone_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map([clone_id], |r| {
+                Ok(PendingRestore {
+                    id: 0,
+                    file: PathBuf::from(r.get::<_, String>(0)?),
+                    var: r.get(1)?,
+                    previous: r.get(2)?,
+                    url: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_env_records(&self, clone_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM env_records WHERE clone_id = ?1", [clone_id])?;
+        Ok(())
+    }
+
+    /// Drops the one record for `file` and `var` and returns its `previous`: a `--fresh` create
+    /// takes over the entry, so the destroy of the old clone must not restore it.
+    pub fn take_env_record(
+        &self,
+        clone_id: &str,
+        file: &Path,
+        var: &str,
+    ) -> Result<Option<Option<String>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "DELETE FROM env_records WHERE clone_id = ?1 AND file = ?2 AND var = ?3 RETURNING previous",
+                params![clone_id, file.to_string_lossy(), var],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn add_pending_restore(&self, rec: &PendingRestore) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_restores (file, var, previous, url) VALUES (?1,?2,?3,?4)",
+            params![rec.file.to_string_lossy(), rec.var, rec.previous, rec.url],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending_restores(&self) -> Result<Vec<PendingRestore>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, file, var, previous, url FROM pending_restores ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PendingRestore {
+                    id: r.get(0)?,
+                    file: PathBuf::from(r.get::<_, String>(1)?),
+                    var: r.get(2)?,
+                    previous: r.get(3)?,
+                    url: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_pending_restore(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_restores WHERE id = ?1", [id])?;
         Ok(())
     }
 

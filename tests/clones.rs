@@ -21,6 +21,7 @@ fn args(template: &str) -> CloneCreateArgs {
         parent_pid: None,
         fresh: false,
         protect: false,
+        env: None,
     }
 }
 
