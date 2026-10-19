@@ -94,9 +94,9 @@ pub struct DaemonStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     TemplateBuilt(TemplateInfo),
-    Templates(Vec<TemplateInfo>),
+    Templates { templates: Vec<TemplateInfo> },
     CloneCreated(CloneInfo),
-    Clones(Vec<CloneInfo>),
+    Clones { clones: Vec<CloneInfo> },
     Destroyed { id: String },
     Gc(GcReport),
     Status(DaemonStatus),
@@ -163,6 +163,52 @@ mod tests {
         let e = back.result.unwrap_err();
         assert_eq!(e.code, ErrorCode::CapReached);
         assert_eq!(e.hint.as_deref(), Some("destroy one"));
+    }
+
+    fn template_info() -> TemplateInfo {
+        TemplateInfo {
+            name: "main".into(),
+            pg_major: 16,
+            source: TemplateSource::Url { url: "postgres://x".into() },
+            database: "app".into(),
+            size_bytes: 1024,
+            built_at: 1_700_000_000,
+            age_secs: 5,
+            warnings: vec!["w".into()],
+        }
+    }
+
+    fn clone_info() -> CloneInfo {
+        CloneInfo {
+            id: "abc123".into(),
+            name: Some("feat".into()),
+            template: "main".into(),
+            url: "postgres://localhost:5500/app".into(),
+            port: 5500,
+            socket_dir: "/tmp/s".into(),
+            template_age_secs: 5,
+            created_at: 1,
+            expires_at: 2,
+            durable: false,
+            parent_pid: Some(7),
+            rss_bytes: None,
+            own_disk_bytes: Some(9),
+        }
+    }
+
+    fn round_trip(r: Response) {
+        let env = ResponseEnvelope { v: PROTOCOL_VERSION, result: Ok(r) };
+        let line = serde_json::to_string(&env).unwrap();
+        let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(serde_json::to_value(&env).unwrap(), serde_json::to_value(&back).unwrap());
+    }
+
+    #[test]
+    fn list_and_newtype_responses_round_trip() {
+        round_trip(Response::Templates { templates: vec![template_info()] });
+        round_trip(Response::Clones { clones: vec![clone_info()] });
+        round_trip(Response::TemplateBuilt(template_info()));
+        round_trip(Response::CloneCreated(clone_info()));
     }
 
     #[test]
