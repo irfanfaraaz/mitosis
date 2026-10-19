@@ -2,6 +2,7 @@ use crate::client;
 use crate::ctx::Config;
 use crate::daemon;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::mcp;
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
 use crate::protocol::{CloneCreateArgs, CloneInfo, Request, Response, TemplateInfo, TemplateInitArgs, TemplateSource};
@@ -134,7 +135,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::from_env()?;
     match cli.command {
         Cmd::Daemon { command: None } => daemon::run(home, Config::default()).await?,
-        Cmd::Mcp => return Err(MitosisError::new(ErrorCode::Internal, "mcp is not built yet")),
+        Cmd::Mcp => mcp::serve_stdio(home).await?,
         Cmd::Template { command } => template(&home, command).await?,
         Cmd::Clone { template, name, ttl, durable, json } => {
             validate_name("template", &template)?;
