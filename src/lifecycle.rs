@@ -410,7 +410,7 @@ async fn recover_after_reboot(
             ctx.store().update_clone(&row)?;
         }
     }
-    let (old_pid, old_start) = (row.pg_pid, row.pg_start_time);
+    let (old_pid, old_start, old_port) = (row.pg_pid, row.pg_start_time, row.port);
     match restart(ctx, &mut row).await {
         Ok(warnings) => {
             report.adopted.push(row.id.clone());
@@ -439,6 +439,9 @@ async fn recover_after_reboot(
             }
             row.pg_pid = old_pid;
             row.pg_start_time = old_start;
+            // A port move already saved must be undone too, or the retry would think the URL never
+            // changed and leave the reservation and .env records on the old port.
+            row.port = old_port;
             let _ = ctx.store().update_clone(&row);
             Err(e)
         }
