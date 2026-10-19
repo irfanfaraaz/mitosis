@@ -216,7 +216,7 @@ async fn connection(shared: Shared, stream: UnixStream) {
             match parse(&line) {
                 Ok(req) => {
                     let shutdown = matches!(req, Request::Shutdown);
-                    (dispatch(&shared, req).await, shutdown)
+                    (dispatch_watching(&shared, req, &mut rd).await, shutdown)
                 }
                 Err(e) => (Err(e), false),
             }
@@ -266,8 +266,37 @@ fn parse(line: &str) -> Result<Request> {
         .request)
 }
 
+/// `dispatch`, while watching the connection: if the client hangs up before the reply (EOF or a
+/// read error), the request is told so and a queued create leaves the queue.
+async fn dispatch_watching(
+    shared: &Shared,
+    req: Request,
+    rd: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Result<Response> {
+    let (gone_tx, gone_rx) = watch::channel(false);
+    let work = dispatch(shared, req, gone_rx);
+    tokio::pin!(work);
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            res = &mut work => return res,
+            // Pipelined bytes mean the client is still there: stop watching, keep them unread.
+            filled = rd.fill_buf(), if watching => {
+                watching = false;
+                let hung_up = match filled {
+                    Ok(b) => b.is_empty(),
+                    Err(_) => true,
+                };
+                if hung_up {
+                    gone_tx.send_replace(true);
+                }
+            }
+        }
+    }
+}
+
 /// Runs `req` on its own task so a dropped connection never cancels a half-done create or destroy.
-async fn dispatch(shared: &Shared, req: Request) -> Result<Response> {
+async fn dispatch(shared: &Shared, req: Request, gone: watch::Receiver<bool>) -> Result<Response> {
     let token = shared.work.upgrade();
     if token.is_none() && !matches!(req, Request::Status | Request::Shutdown) {
         return Err(MitosisError::new(
@@ -283,7 +312,9 @@ async fn dispatch(shared: &Shared, req: Request) -> Result<Response> {
     let ctx = shared.ctx.clone();
     let res = tokio::spawn(async move {
         let _token = token;
-        serve_one(ctx, req).await
+        crate::budget::CLIENT_GONE
+            .scope(gone, serve_one(ctx, req))
+            .await
     })
     .await
     .unwrap_or_else(|e| Err(internal(format!("request task failed: {e}"))));

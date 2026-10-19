@@ -237,9 +237,35 @@ pub struct Admission {
     pub waited: Duration,
 }
 
+tokio::task_local! {
+    /// Turns true when the client that sent the running request has hung up.
+    pub(crate) static CLIENT_GONE: tokio::sync::watch::Receiver<bool>;
+}
+
+/// Resolves when the client of the current request hangs up; never, outside a daemon request.
+async fn client_gone() {
+    if let Ok(mut rx) = CLIENT_GONE.try_with(|r| r.clone()) {
+        if rx.wait_for(|gone| *gone).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// Waits in line (first come, first served) until a new clone fits the limits, at most `wait`.
-/// Wakes on `ctx.room`, and looks again every second as a fallback.
+/// Wakes on `ctx.room`, and looks again every second as a fallback. If the client hangs up while
+/// it waits, it leaves the line (dropping its place); once admitted it is not cancelled.
 pub async fn admit(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
+    tokio::select! {
+        r = admit_in_line(ctx, wait) => r,
+        () = client_gone() => Err(MitosisError::new(
+            ErrorCode::InvalidRequest,
+            "the client disconnected while the create was queued",
+        )),
+    }
+}
+
+async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
     let start = Instant::now();
     let _counted = InQueue::new(&ctx.queued);
     // tokio's mutex is fair: creates get their turn in the order they asked.

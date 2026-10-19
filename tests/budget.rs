@@ -120,3 +120,67 @@ async fn existing_named_clone_does_not_queue() {
     assert!(again.existing);
     assert_eq!(again.waited_ms, 0);
 }
+
+#[tokio::test]
+async fn disconnected_waiter_leaves_the_queue() {
+    use mitosis::client::request;
+    use mitosis::protocol::{Request, RequestEnvelope, Response, PROTOCOL_VERSION};
+    use tokio::io::AsyncWriteExt;
+
+    let Some(env) = TestEnv::new() else { return };
+    let home = mitosis::paths::Home::at(env.tmp.path().to_path_buf());
+    let config = Config {
+        max_clones: 1,
+        ..env.ctx.config()
+    };
+    let daemon = tokio::spawn(mitosis::daemon::run(home.clone(), config));
+    let sock = home.daemon_sock();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while tokio::net::UnixStream::connect(&sock).await.is_err() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let built = request(
+        &home,
+        Request::TemplateInit(template_args("main", seed(SEED))),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(built, Response::TemplateBuilt(_)));
+    let make = |wait| request(&home, Request::CloneCreate(args(None, Some(wait))));
+    let Response::CloneCreated(a) = make(0).await.unwrap() else {
+        panic!("not created")
+    };
+
+    // A client queues for room, then hangs up.
+    let mut raw = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    let line = serde_json::to_string(&RequestEnvelope {
+        v: PROTOCOL_VERSION,
+        request: Request::CloneCreate(args(None, Some(10))),
+    })
+    .unwrap();
+    raw.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(raw);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    request(
+        &home,
+        Request::CloneDestroy {
+            id_or_name: a.id,
+            force: false,
+            forget: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(make(5).await.unwrap(), Response::CloneCreated(_)));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let Response::Clones { clones } = request(&home, Request::CloneList).await.unwrap() else {
+        panic!("not a list")
+    };
+    assert_eq!(clones.len(), 1, "the abandoned create made a clone");
+
+    request(&home, Request::Shutdown).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), daemon).await;
+}
