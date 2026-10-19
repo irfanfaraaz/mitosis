@@ -256,3 +256,43 @@ async fn mcp_refuses_other_sessions_name() {
     let _ = b.kill();
     let _ = (a.wait(), b.wait());
 }
+
+#[tokio::test]
+async fn losing_same_name_create_keeps_the_reservation() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let a = create(&env.ctx, named("x")).await.unwrap();
+    // A create that reaches the reservation step while `x` runs fails on the unique name.
+    let held: Vec<TcpListener> = vec![TcpListener::bind(("127.0.0.1", 0)).unwrap()];
+    drop(held);
+    let before = env.ctx.store().get_reservation("x").unwrap().unwrap();
+    let mut row = env.ctx.store().get_clone("x").unwrap().unwrap();
+    row.id = "ffffff".into();
+    row.port = before.port + 1;
+    assert!(env.ctx.store().insert_clone(&row).is_err());
+    assert_eq!(
+        env.ctx.store().get_reservation("x").unwrap().unwrap(),
+        before
+    );
+    assert_eq!(before.port, a.port);
+}
+
+#[tokio::test]
+async fn gc_keeps_reservation_of_running_clone() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let a = create(&env.ctx, named("x")).await.unwrap();
+    let mut r = env.ctx.store().get_reservation("x").unwrap().unwrap();
+    r.last_used = now() - 31 * 86_400;
+    env.ctx.store().upsert_reservation(&r).unwrap();
+    mitosis::lifecycle::reconcile(env.ctx.clone(), now())
+        .await
+        .unwrap();
+    assert!(env.ctx.store().get_reservation("x").unwrap().is_some());
+    destroy(&env.ctx, "x").await.unwrap();
+    mitosis::lifecycle::reconcile(env.ctx.clone(), now())
+        .await
+        .unwrap();
+    assert!(env.ctx.store().get_reservation("x").unwrap().is_none());
+    let _ = a;
+}

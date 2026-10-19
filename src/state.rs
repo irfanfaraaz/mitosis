@@ -800,11 +800,12 @@ impl Store {
         Ok(ports)
     }
 
-    /// Deletes reservations last used before `before`; returns their names.
+    /// Deletes reservations last used before `before` whose name has no clone; returns their names.
     pub fn drop_stale_reservations(&self, before: i64) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("DELETE FROM reservations WHERE last_used < ?1 RETURNING name")?;
+        let mut stmt = self.conn.prepare(
+            "DELETE FROM reservations WHERE last_used < ?1 \
+                 AND name NOT IN (SELECT name FROM clones WHERE name IS NOT NULL) RETURNING name",
+        )?;
         let names = stmt
             .query_map([before], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;

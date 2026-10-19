@@ -388,6 +388,7 @@ fn reserve<'a>(
     let leased = store.leased_ports()?;
     let mut reserved = store.reserved_ports()?;
     let mut warnings = Vec::new();
+    let mut new_res = None;
     // A named clone keeps the port and password of its reservation while that port is free.
     let (port, password) = match &args.name {
         None => (
@@ -416,13 +417,14 @@ fn reserve<'a>(
                     (port, other.map_or_else(|| random_hex(16), |r| r.password))
                 }
             };
-            store.upsert_reservation(&ReservationRow {
+            // Written after the clone row, so a create that loses on the unique name leaves it be.
+            new_res = Some(ReservationRow {
                 name: name.clone(),
                 port,
                 password: password.clone(),
                 template: tpl.name.clone(),
                 last_used: created_at,
-            })?;
+            });
             (port, password)
         }
     };
@@ -452,6 +454,9 @@ fn reserve<'a>(
         suspect: false,
     };
     store.insert_clone(&row)?;
+    if let Some(r) = &new_res {
+        store.upsert_reservation(r)?;
+    }
     let mark = mark(ctx, &id, InFlightOp::Create)
         .map_err(|_| internal(format!("clone {id} is already in use")))?;
     Ok((row, mark, warnings))
