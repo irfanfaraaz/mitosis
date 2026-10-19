@@ -43,6 +43,7 @@ pub async fn init(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
         if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
             return Err(invalid("source URL must start with postgres:// or postgresql://"));
         }
+        split_password(url)?;
     }
     if let Some(m) = &args.migrations {
         if !m.is_dir() {
@@ -129,6 +130,69 @@ pub fn redact_url(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// A source URL with its password taken out, so the password can travel in `PGPASSWORD`.
+#[derive(Debug, PartialEq)]
+struct SplitUrl {
+    /// The URL without the password (`postgres://u@h/db`).
+    url: String,
+    /// Percent-decoded password, as libpq would read it.
+    password: Option<String>,
+    /// The password exactly as written in the URL.
+    raw_password: Option<String>,
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit))?;
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Splits the password out of `url`. Bad percent-encoding is an error that never echoes the password.
+fn split_password(url: &str) -> Result<SplitUrl> {
+    let plain = || SplitUrl { url: url.to_string(), password: None, raw_password: None };
+    let Some(i) = url.find("://") else { return Ok(plain()) };
+    let (head, tail) = url.split_at(i + 3);
+    let end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+    let authority = &tail[..end];
+    let Some(at) = authority.rfind('@') else { return Ok(plain()) };
+    let Some(colon) = authority[..at].find(':') else { return Ok(plain()) };
+    let raw = &authority[colon + 1..at];
+    let password = percent_decode(raw)
+        .ok_or_else(|| invalid("the password in the source URL has invalid percent-encoding"))?;
+    Ok(SplitUrl {
+        url: format!("{head}{}{}", &authority[..colon], &tail[at..]),
+        password: Some(password),
+        raw_password: Some(raw.to_string()),
+    })
+}
+
+/// Literal secrets of a source (the URL password, decoded and raw), longest first.
+fn source_secrets(source: &TemplateSource) -> Vec<String> {
+    let TemplateSource::Url { url } = source else { return Vec::new() };
+    let Ok(split) = split_password(url) else { return Vec::new() };
+    let mut s: Vec<String> =
+        [split.password, split.raw_password].into_iter().flatten().filter(|p| !p.is_empty()).collect();
+    s.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    s.dedup();
+    s
+}
+
+/// `redact_url` plus removal of the literal secrets, for anything shown to the user.
+fn scrub(text: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(redact_url(text), |t, s| t.replace(s.as_str(), "***"))
 }
 
 fn fnv1a(h: &mut u64, bytes: &[u8]) {
@@ -253,12 +317,18 @@ async fn run_psql(install: &PgInstall, opts: &StartOptions, db: &str, sql: Strin
 }
 
 /// `pg_dump -Fc <url> | pg_restore` into the build server, both stderrs to the log.
+/// The password goes in `PGPASSWORD`, never in argv, so neither `ps` nor libpq errors show it.
 fn dump_restore(install: &PgInstall, url: &str, opts: &StartOptions, db: &str) -> Result<()> {
+    let split = split_password(url)?;
     let log = || OpenOptions::new().append(true).open(&opts.log_file);
     let (dump_err, restore_out, restore_err) = (log()?, log()?, log()?);
-    let mut dump = Command::new(install.bin("pg_dump"))
+    let mut dump = Command::new(install.bin("pg_dump"));
+    if let Some(pw) = &split.password {
+        dump.env("PGPASSWORD", pw);
+    }
+    let mut dump = dump
         .args(["-Fc", "--no-owner", "--no-acl"])
-        .arg(url)
+        .arg(&split.url)
         .env("PGCONNECT_TIMEOUT", "10")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -358,8 +428,18 @@ async fn run_steps(
 }
 
 /// Stops the build server, deletes the build folder, and turns `e` into `TemplateBuildFailed`.
-async fn fail(ctx: &Ctx, install: &PgInstall, build_dir: &Path, log: &Path, step: &str, e: MitosisError) -> MitosisError {
-    append_log(log, &format!("mitosis: {step} failed: {e}"));
+async fn fail(
+    ctx: &Ctx,
+    install: &PgInstall,
+    build_dir: &Path,
+    log: &Path,
+    secrets: &[String],
+    step: &str,
+    e: MitosisError,
+) -> MitosisError {
+    append_log(log, &scrub(&format!("mitosis: {step} failed: {e}"), secrets));
+    // Read the tail before stopping, so shutdown lines cannot push the cause out of it.
+    let tail = scrub(&log_tail(log, 20), secrets);
     let (i, d, t) = (install.clone(), build_dir.to_path_buf(), ctx.config.stop_timeout);
     let cleanup = blocking(move || {
         // A server that would not stop keeps its folder; gc deals with it later.
@@ -371,24 +451,30 @@ async fn fail(ctx: &Ctx, install: &PgInstall, build_dir: &Path, log: &Path, step
     })
     .await;
     if let Err(ce) = cleanup {
-        append_log(log, &format!("mitosis: cleanup of {} failed: {ce}", build_dir.display()));
+        append_log(log, &scrub(&format!("mitosis: cleanup of {} failed: {ce}", build_dir.display()), secrets));
     }
-    MitosisError::new(
-        ErrorCode::TemplateBuildFailed,
-        format!("template build failed at {step}\n{}", redact_url(&log_tail(log, 20))),
-    )
-    .with_hint(format!("full log: {}", log.display()))
+    MitosisError::new(ErrorCode::TemplateBuildFailed, format!("template build failed at {step}\n{tail}"))
+        .with_hint(format!("full log: {}", log.display()))
 }
 
 /// Puts `build_dir` at `final_dir`, keeping the previous template if the rename fails.
-fn swap(build_dir: &Path, final_dir: &Path, old_dir: &Path) -> Result<()> {
+fn swap(build_dir: &Path, final_dir: &Path, old_dir: &Path, log: &Path) -> Result<()> {
     let had_old = final_dir.exists();
     if had_old {
         std::fs::rename(final_dir, old_dir)?;
     }
     if let Err(e) = std::fs::rename(build_dir, final_dir) {
         if had_old {
-            let _ = std::fs::rename(old_dir, final_dir);
+            if let Err(re) = std::fs::rename(old_dir, final_dir) {
+                append_log(
+                    log,
+                    &format!(
+                        "mitosis: could not move the previous template back from {} to {}: {re}",
+                        old_dir.display(),
+                        final_dir.display()
+                    ),
+                );
+            }
         }
         return Err(e.into());
     }
@@ -412,6 +498,7 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
         _ => None,
     };
     let max_age_secs = args.max_age_secs.unwrap_or(ctx.config.default_max_age_secs);
+    let secrets = source_secrets(&args.source);
 
     let ts = now();
     let templates_dir = ctx.home.templates_dir();
@@ -422,7 +509,8 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let port = pick_port(ctx.config.port_range.clone(), &leased, &HashSet::new())?;
     let opts = StartOptions {
         port,
-        socket_dir: ctx.home.sockets_dir().join(format!("build-{name}")),
+        // Named by port, not template name, to stay under the Unix socket path limit.
+        socket_dir: ctx.home.sockets_dir().join(format!("build-{port}")),
         listen_tcp: true,
         durable: false,
         log_file: log.clone(),
@@ -431,7 +519,7 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let result = run_steps(ctx, &install, &build_dir, &opts, &database, &args.source).await;
     let result = match result {
         Ok(ext) => Ok(ext),
-        Err((step, e)) => Err(fail(ctx, &install, &build_dir, &log, step, e).await),
+        Err((step, e)) => Err(fail(ctx, &install, &build_dir, &log, &secrets, step, e).await),
     };
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let extensions = result?;
@@ -439,17 +527,17 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     // Step 7: measure, swap, record.
     let final_dir = templates_dir.join(&name);
     let old_dir = templates_dir.join(format!(".{name}.old-{ts}"));
-    let (b, f, o) = (build_dir.clone(), final_dir.clone(), old_dir);
+    let (b, f, o, l) = (build_dir.clone(), final_dir.clone(), old_dir, log.clone());
     let swapped = blocking(move || {
         let pg_major = read_pg_version(&b)?;
         let size_bytes = apparent_size(&b)?;
-        swap(&b, &f, &o)?;
+        swap(&b, &f, &o, &l)?;
         Ok((pg_major, size_bytes))
     })
     .await;
     let (pg_major, size_bytes) = match swapped {
         Ok(v) => v,
-        Err(e) => return Err(fail(ctx, &install, &build_dir, &log, "swap", e).await),
+        Err(e) => return Err(fail(ctx, &install, &build_dir, &log, &secrets, "swap", e).await),
     };
     let row = TemplateRow {
         name,
@@ -467,7 +555,7 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     };
     let upserted = ctx.store().upsert_template(&row);
     if let Err(e) = upserted {
-        return Err(fail(ctx, &install, &build_dir, &log, "swap", e).await);
+        return Err(fail(ctx, &install, &build_dir, &log, &secrets, "swap", e).await);
     }
     Ok(info(&row, now()))
 }
@@ -508,6 +596,53 @@ mod tests {
             "psql 'postgres://a:***@h/db' && psql postgresql://b:***@h2:1/x"
         );
         assert_eq!(redact_url("postgres://u@h/db"), "postgres://u@h/db");
+    }
+
+    #[test]
+    fn password_is_split_out_of_the_pg_dump_url() {
+        let s = split_password("postgres://u:s%40cr%3Aet@h:5432/db?sslmode=require").unwrap();
+        assert_eq!(s.url, "postgres://u@h:5432/db?sslmode=require");
+        assert_eq!(s.password.as_deref(), Some("s@cr:et"));
+        assert_eq!(s.raw_password.as_deref(), Some("s%40cr%3Aet"));
+        assert!(!s.url.contains("s%40cr") && !s.url.contains("s@cr"));
+
+        let none = split_password("postgres://u@h/db").unwrap();
+        assert_eq!((none.url.as_str(), none.password), ("postgres://u@h/db", None));
+        assert_eq!(split_password("postgres://h/db").unwrap().password, None);
+
+        let e = split_password("postgres://u:pa%zz@h/db").unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(!e.to_string().contains("pa%zz"), "{e}");
+        assert!(split_password("postgres://u:pa%4@h/db").is_err()); // truncated escape
+        assert!(split_password("postgres://u:pa%+1@h/db").is_err()); // sign is not a hex digit
+    }
+
+    #[test]
+    fn invalid_password_encoding_rejected_by_init_without_echo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx::open(crate::paths::Home::at(tmp.path().join("m")), Default::default()).unwrap();
+        let args = TemplateInitArgs {
+            name: "main".into(),
+            source: TemplateSource::Url { url: "postgres://u:pa%zz@h/db".into() },
+            database: None,
+            migrations: None,
+            max_age_secs: None,
+            pg_major: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let e = rt.block_on(init(&ctx, args)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(!e.to_string().contains("pa%zz"), "{e}");
+    }
+
+    #[test]
+    fn secrets_are_scrubbed_from_text() {
+        let src = TemplateSource::Url { url: "postgres://u:p%40ss@h/db".into() };
+        let secrets = source_secrets(&src);
+        assert_eq!(secrets, vec!["p%40ss".to_string(), "p@ss".to_string()]);
+        let text = "invalid token: \"p%40ss\"; also p@ss and postgres://x:y@h";
+        assert_eq!(scrub(text, &secrets), "invalid token: \"***\"; also *** and postgres://x:***@h");
+        assert!(source_secrets(&TemplateSource::Seed { command: "x".into(), cwd: None }).is_empty());
     }
 
     #[test]

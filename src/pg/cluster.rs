@@ -50,8 +50,26 @@ pub fn initdb(install: &PgInstall, data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// macOS limits a Unix socket path (`sun_path`) to 104 bytes including the trailing NUL.
+const MAX_SOCKET_PATH: usize = 103;
+
+/// Fails early when postgres could not create its socket file in `socket_dir`.
+pub fn check_socket_path(socket_dir: &Path, port: u16) -> Result<()> {
+    let path = socket_dir.join(format!(".s.PGSQL.{port}"));
+    let len = path.as_os_str().len();
+    if len > MAX_SOCKET_PATH {
+        return Err(MitosisError::new(
+            ErrorCode::PostgresStartFailed,
+            format!("socket path too long ({len} bytes, max {MAX_SOCKET_PATH}): {}", path.display()),
+        )
+        .with_hint("set MITOSIS_HOME to a shorter path"));
+    }
+    Ok(())
+}
+
 /// Spawns postgres in its own process group and returns without waiting for it to be ready.
 pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Result<RunningPg> {
+    check_socket_path(&opts.socket_dir, opts.port)?;
     if let Some(parent) = opts.log_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -280,6 +298,20 @@ mod tests {
         assert_eq!(tail.lines().count(), 20);
         assert!(tail.starts_with("line 11") && tail.ends_with("line 30"));
         assert_eq!(log_tail(&dir.path().join("none.log"), 20), "");
+    }
+
+    #[test]
+    fn socket_path_length_is_checked() {
+        // "/s/" + 82 chars + "/.s.PGSQL.54321" = 3 + 82 + 15 = 100 bytes
+        let ok = PathBuf::from(format!("/s/{}", "a".repeat(82)));
+        assert!(check_socket_path(&ok, 54321).is_ok());
+        let edge = PathBuf::from(format!("/s/{}", "a".repeat(85))); // exactly 103
+        assert!(check_socket_path(&edge, 54321).is_ok());
+        let long = PathBuf::from(format!("/s/{}", "a".repeat(86))); // 104
+        let e = check_socket_path(&long, 54321).unwrap_err();
+        assert_eq!(e.code, ErrorCode::PostgresStartFailed);
+        assert!(e.message.starts_with("socket path too long (104 bytes, max 103): /s/"), "{}", e.message);
+        assert_eq!(e.hint.as_deref(), Some("set MITOSIS_HOME to a shorter path"));
     }
 
     #[test]
