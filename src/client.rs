@@ -11,7 +11,10 @@ use tokio::net::UnixStream;
 
 /// Longest reply line accepted from the daemon.
 const MAX_REPLY: u64 = 16 << 20;
-const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// The daemon runs crash reconcile before it binds the socket, so a live child gets a long wait.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+/// After the child exits, a racing daemon that won the lock may still be about to bind.
+const EXIT_GRACE: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(50);
 
 fn unavailable(msg: impl Into<String>) -> MitosisError {
@@ -120,6 +123,7 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
         .open(&log_path)?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("daemon")
+        .current_dir("/")
         .env("MITOSIS_HOME", &home.root)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -134,16 +138,30 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
     }
     let mut child = cmd.spawn()?;
 
-    let deadline = Instant::now() + START_TIMEOUT;
+    let mut deadline = Instant::now() + START_TIMEOUT;
+    let mut exited = false;
     loop {
         if UnixStream::connect(home.daemon_sock()).await.is_ok() {
             return Ok(());
         }
-        // An early exit is usually AlreadyRunning (another client started one), so keep polling.
-        let _ = child.try_wait();
+        // An early exit is usually AlreadyRunning (another client won the lock): give it a moment to bind.
+        if !exited && matches!(child.try_wait(), Ok(Some(_))) {
+            exited = true;
+            deadline = deadline.min(Instant::now() + EXIT_GRACE);
+        }
         if Instant::now() >= deadline {
-            return Err(unavailable("the mitosis daemon did not start within 5 s")
-                .with_hint(format!("see {}", log_path.display())));
+            let tail = crate::pg::cluster::log_tail(&log_path, 10);
+            let why = if exited {
+                "the mitosis daemon exited before it was ready"
+            } else {
+                "the mitosis daemon did not start within 30 s"
+            };
+            let tail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n{tail}")
+            };
+            return Err(unavailable(why).with_hint(format!("see {}{tail}", log_path.display())));
         }
         tokio::time::sleep(POLL).await;
     }

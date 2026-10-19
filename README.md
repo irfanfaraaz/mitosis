@@ -20,12 +20,28 @@ brew install postgresql@18
 
 ## Quick start
 
-Build a template once. The seed command runs with `DATABASE_URL` set to the new database:
+Build a template once. `--seed` runs in the folder where you ran the command, with `DATABASE_URL` set to the new database:
 
 ```sh
 mitosis template init --seed 'psql "$DATABASE_URL" -f schema.sql'
-# or restore a dump:
+# or copy a live database (pg_dump of the source, restored into the template):
 mitosis template init --from-url postgres://user:pass@host/db
+```
+
+`template init` also takes:
+
+| Flag | Meaning |
+|---|---|
+| `[NAME]` | Template name (default `main`) |
+| `--database <DATABASE>` | Database name for a `--seed` template (default `app`); `--from-url` uses the name in the URL |
+| `--migrations <MIGRATIONS>` | Migrations folder; the template is flagged stale when it changes |
+| `--max-age <MAX_AGE>` | Age after which clones warn, like `7d` |
+| `--pg-version <PG_VERSION>` | Postgres major version to build with |
+
+List what you have:
+
+```sh
+mitosis template list [--json]
 ```
 
 Clone it. Only the URL is printed, so this works in a shell:
@@ -58,7 +74,7 @@ For Claude Code, add this to your MCP config:
 
 ## How it works
 
-1. **Template.** `mitosis template init` runs a real Postgres, loads your seed or dump, and keeps the resulting data directory as the template.
+1. **Template.** `mitosis template init` runs a real Postgres, loads your seed or the copied database, and keeps the resulting data directory as the template.
 2. **Clonefile.** `mitosis clone` copies the template with APFS `clonefile`. Blocks are shared until a clone writes to them.
 3. **Postgres.** The daemon starts a Postgres on a free local port and returns the URL.
 4. **Reap.** The daemon stops and deletes a clone when you destroy it, or when its TTL passes. Clones made through MCP are also removed when the agent session exits.

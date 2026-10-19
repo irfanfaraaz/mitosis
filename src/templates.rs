@@ -132,7 +132,7 @@ pub fn info(row: &TemplateRow, now: i64) -> TemplateInfo {
     }
 }
 
-/// Masks the password of every `scheme://user:password@host` in `text` as `***`.
+/// Masks the password of every `scheme://user:password@host` and every `?password=` query value as `***`.
 pub fn redact_url(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -154,10 +154,35 @@ pub fn redact_url(text: &str) -> String {
             }
             None => out.push_str(authority),
         }
-        rest = &tail[end..];
+        let after = &tail[end..];
+        let url_end = after
+            .find(|c: char| matches!(c, '\'' | '"') || c.is_whitespace())
+            .unwrap_or(after.len());
+        out.push_str(&mask_query_password(&after[..url_end]));
+        rest = &after[url_end..];
     }
     out.push_str(rest);
     out
+}
+
+/// Masks every `password=<value>` query parameter of the URL tail `s` (path, query, fragment).
+fn mask_query_password(s: &str) -> String {
+    let Some(q) = s.find('?') else {
+        return s.to_string();
+    };
+    let (path, query) = s.split_at(q + 1);
+    let (query, frag) = query.split_at(query.find('#').unwrap_or(query.len()));
+    let masked: Vec<&str> = query
+        .split('&')
+        .map(|p| {
+            if p.starts_with("password=") {
+                "password=***"
+            } else {
+                p
+            }
+        })
+        .collect();
+    format!("{path}{}{frag}", masked.join("&"))
 }
 
 /// A source URL with its password taken out, so the password can travel in `PGPASSWORD`.
@@ -190,7 +215,8 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Splits the password out of `url`. Bad percent-encoding is an error that never echoes the password.
+/// Splits the password out of `url`: the userinfo one or a `?password=` query parameter
+/// (the query one wins, as in libpq). Bad percent-encoding is an error that never echoes the password.
 fn split_password(url: &str) -> Result<SplitUrl> {
     let plain = || SplitUrl {
         url: url.to_string(),
@@ -203,19 +229,41 @@ fn split_password(url: &str) -> Result<SplitUrl> {
     let (head, tail) = url.split_at(i + 3);
     let end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
     let authority = &tail[..end];
-    let Some(at) = authority.rfind('@') else {
+    let mut raw: Option<String> = None;
+    let mut authority_out = authority.to_string();
+    if let Some(at) = authority.rfind('@') {
+        if let Some(colon) = authority[..at].find(':') {
+            raw = Some(authority[colon + 1..at].to_string());
+            authority_out = format!("{}{}", &authority[..colon], &authority[at..]);
+        }
+    }
+    let mut rest = tail[end..].to_string();
+    if let Some(q) = rest.find('?') {
+        let frag = rest[q..].find('#').map_or(rest.len(), |f| q + f);
+        let mut kept = Vec::new();
+        for p in rest[q + 1..frag].split('&').filter(|p| !p.is_empty()) {
+            match p.strip_prefix("password=") {
+                Some(v) => raw = Some(v.to_string()),
+                None => kept.push(p),
+            }
+        }
+        let query = if kept.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", kept.join("&"))
+        };
+        let joined = format!("{}{query}{}", &rest[..q], &rest[frag..]);
+        rest = joined;
+    }
+    let Some(raw) = raw else {
         return Ok(plain());
     };
-    let Some(colon) = authority[..at].find(':') else {
-        return Ok(plain());
-    };
-    let raw = &authority[colon + 1..at];
-    let password = percent_decode(raw)
+    let password = percent_decode(&raw)
         .ok_or_else(|| invalid("the password in the source URL has invalid percent-encoding"))?;
     Ok(SplitUrl {
-        url: format!("{head}{}{}", &authority[..colon], &tail[at..]),
+        url: format!("{head}{authority_out}{rest}"),
         password: Some(password),
-        raw_password: Some(raw.to_string()),
+        raw_password: Some(raw),
     })
 }
 
@@ -316,7 +364,7 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -814,6 +862,35 @@ mod tests {
         assert!(!e.to_string().contains("pa%zz"), "{e}");
         assert!(split_password("postgres://u:pa%4@h/db").is_err()); // truncated escape
         assert!(split_password("postgres://u:pa%+1@h/db").is_err()); // sign is not a hex digit
+    }
+
+    #[test]
+    fn query_password_is_split_out_and_redacted() {
+        let s = split_password("postgres://u@h/db?sslmode=require&password=s%40cr&x=1").unwrap();
+        assert_eq!(s.url, "postgres://u@h/db?sslmode=require&x=1");
+        assert_eq!(s.password.as_deref(), Some("s@cr"));
+        assert_eq!(s.raw_password.as_deref(), Some("s%40cr"));
+
+        let only = split_password("postgres://u@h/db?password=pw").unwrap();
+        assert_eq!(only.url, "postgres://u@h/db");
+
+        // The query password wins over the userinfo one.
+        let both = split_password("postgres://u:old@h/db?password=new").unwrap();
+        assert_eq!(
+            (both.url.as_str(), both.password.as_deref()),
+            ("postgres://u@h/db", Some("new"))
+        );
+
+        assert!(split_password("postgres://u@h/db?password=pa%zz").is_err());
+
+        assert_eq!(
+            redact_url("pg_dump 'postgres://u@h/db?sslmode=x&password=pw#f' ok"),
+            "pg_dump 'postgres://u@h/db?sslmode=x&password=***#f' ok"
+        );
+        assert_eq!(
+            redact_url("postgres://u@h/db?sslmode=x"),
+            "postgres://u@h/db?sslmode=x"
+        );
     }
 
     #[test]

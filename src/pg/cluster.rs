@@ -147,7 +147,7 @@ pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Resul
 }
 
 /// Last `n` lines of the last 64 KiB of the file; empty if unreadable.
-fn log_tail(path: &Path, n: usize) -> String {
+pub(crate) fn log_tail(path: &Path, n: usize) -> String {
     let read = || -> std::io::Result<String> {
         let mut f = std::fs::File::open(path)?;
         let len = f.metadata()?.len();

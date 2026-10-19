@@ -1,6 +1,21 @@
 use crate::error::{ErrorCode, MitosisError, Result};
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+/// Empty `value` counts as unset; a relative one is made absolute so the daemon never depends on its cwd.
+fn resolve(value: Option<OsString>, home_dir: Option<PathBuf>) -> Result<PathBuf> {
+    match value.filter(|v| !v.is_empty()) {
+        Some(p) => Ok(std::path::absolute(p)?),
+        None => {
+            let home = home_dir.ok_or_else(|| {
+                MitosisError::new(ErrorCode::Internal, "HOME is not set")
+                    .with_hint("set MITOSIS_HOME to choose where mitosis keeps its data")
+            })?;
+            Ok(home.join("Library/Application Support/mitosis"))
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Home {
@@ -10,16 +25,10 @@ pub struct Home {
 impl Home {
     /// `$MITOSIS_HOME`, else `~/Library/Application Support/mitosis`.
     pub fn from_env() -> Result<Home> {
-        if let Some(p) = std::env::var_os("MITOSIS_HOME") {
-            return Ok(Home::at(PathBuf::from(p)));
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            MitosisError::new(ErrorCode::Internal, "HOME is not set")
-                .with_hint("set MITOSIS_HOME to choose where mitosis keeps its data")
-        })?;
-        Ok(Home::at(
-            PathBuf::from(home).join("Library/Application Support/mitosis"),
-        ))
+        Ok(Home::at(resolve(
+            std::env::var_os("MITOSIS_HOME"),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )?))
     }
 
     pub fn at(root: PathBuf) -> Home {
@@ -103,5 +112,21 @@ mod tests {
             std::fs::metadata(&h.root).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn resolve_empty_is_default_and_relative_is_absolute() {
+        let home = Some(PathBuf::from("/Users/x"));
+        let default = PathBuf::from("/Users/x/Library/Application Support/mitosis");
+        assert_eq!(resolve(Some("".into()), home.clone()).unwrap(), default);
+        assert_eq!(resolve(None, home.clone()).unwrap(), default);
+        assert_eq!(
+            resolve(Some("/abs/m".into()), home.clone()).unwrap(),
+            PathBuf::from("/abs/m")
+        );
+        let rel = resolve(Some("rel/m".into()), home).unwrap();
+        assert!(rel.is_absolute());
+        assert!(rel.ends_with("rel/m"));
+        assert!(resolve(None, None).is_err());
     }
 }

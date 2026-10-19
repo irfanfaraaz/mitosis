@@ -45,7 +45,9 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         template: row.template.clone(),
         url: format!(
             "postgres://postgres:{}@127.0.0.1:{}/{}",
-            row.password, row.port, row.database
+            row.password,
+            row.port,
+            crate::templates::url_encode(&row.database)
         ),
         port: row.port,
         socket_dir: row.socket_dir.clone(),
@@ -426,6 +428,34 @@ mod tests {
             ("c0a1b2", 5, Some(3), true)
         );
         assert_eq!((i.rss_bytes, i.own_disk_bytes), (None, None));
+    }
+
+    #[test]
+    fn info_url_encodes_the_database_name() {
+        let mut row = CloneRow {
+            id: "c".into(),
+            name: None,
+            template: "main".into(),
+            dir: PathBuf::from("/h/c"),
+            port: 54321,
+            socket_dir: PathBuf::from("/h/s"),
+            password: "pw".into(),
+            database: "my db/x?y%z".into(),
+            pg_pid: None,
+            pg_start_time: None,
+            parent_pid: None,
+            parent_start_time: None,
+            created_at: 0,
+            expires_at: 0,
+            durable: false,
+            status: CloneStatus::Ready,
+        };
+        assert_eq!(
+            to_info(&row, 0).url,
+            "postgres://postgres:pw@127.0.0.1:54321/my%20db%2Fx%3Fy%25z"
+        );
+        row.database = "app".into();
+        assert!(to_info(&row, 0).url.ends_with("/app"));
     }
 
     // The daemon spawns these futures on a multi-thread runtime, so they must be Send.

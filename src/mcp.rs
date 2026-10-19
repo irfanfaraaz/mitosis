@@ -42,7 +42,7 @@ fn text(r: error::Result<String>) -> Result<String, String> {
     r.map_err(|e| e.to_string())
 }
 
-// Deliberately not `{r:?}`: a reply can hold a password-bearing URL.
+// Deliberately not `{r:?}`: a reply can hold a password-bearing URL. Same in `unexpected` in cli.rs.
 fn unexpected() -> MitosisError {
     MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
         .with_hint("restart the daemon: mitosis daemon stop")

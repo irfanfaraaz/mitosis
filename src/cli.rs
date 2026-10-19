@@ -130,12 +130,10 @@ fn fail(e: &MitosisError) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn unexpected(r: Response) -> MitosisError {
-    MitosisError::new(
-        ErrorCode::ProtocolMismatch,
-        format!("unexpected daemon reply: {r:?}"),
-    )
-    .with_hint("restart the daemon: mitosis daemon stop")
+// Deliberately not `{r:?}`: a reply can hold a password-bearing URL. Same in `unexpected` in mcp.rs.
+fn unexpected(_: Response) -> MitosisError {
+    MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
+        .with_hint("restart the daemon: mitosis daemon stop")
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
