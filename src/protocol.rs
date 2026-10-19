@@ -8,7 +8,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemplateSource {
     Url { url: String },
-    Seed { command: String },
+    Seed {
+        command: String,
+        /// Folder the command runs in; the daemon's own cwd when absent.
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -209,6 +214,14 @@ mod tests {
         round_trip(Response::Clones { clones: vec![clone_info()] });
         round_trip(Response::TemplateBuilt(template_info()));
         round_trip(Response::CloneCreated(clone_info()));
+    }
+
+    #[test]
+    fn seed_cwd_is_optional() {
+        let s: TemplateSource = serde_json::from_str(r#"{"kind":"seed","command":"make seed"}"#).unwrap();
+        assert_eq!(s, TemplateSource::Seed { command: "make seed".into(), cwd: None });
+        let s = TemplateSource::Seed { command: "x".into(), cwd: Some("/w".into()) };
+        assert_eq!(serde_json::from_str::<TemplateSource>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
     }
 
     #[test]
