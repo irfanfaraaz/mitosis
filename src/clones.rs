@@ -76,7 +76,7 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
         None => None,
     };
 
-    let mut row = reserve(ctx, &tpl, &args, parent_start_time)?;
+    let (mut row, _in_flight) = reserve(ctx, &tpl, &args, parent_start_time)?;
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, &tpl, &mut row).await {
         Ok(info) => Ok(info),
@@ -93,13 +93,26 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
     }
 }
 
+/// Marks a clone id as being created (see `Ctx::creating`) until dropped.
+struct InFlight<'a> {
+    ctx: &'a Ctx,
+    id: String,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.ctx.creating.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
 /// Steps 3-4 under one store lock, so concurrent creates cannot both pass the cap or share a port.
-fn reserve(
-    ctx: &Ctx,
+/// The id joins `ctx.creating` under that same lock, so reconcile never sees the row without it.
+fn reserve<'a>(
+    ctx: &'a Ctx,
     tpl: &TemplateRow,
     args: &CloneCreateArgs,
     parent_start_time: Option<u64>,
-) -> Result<CloneRow> {
+) -> Result<(CloneRow, InFlight<'a>)> {
     let store = ctx.store();
     let active: Vec<String> =
         store.list_clones()?.into_iter().filter(|c| c.status != CloneStatus::Stopping).map(|c| c.id).collect();
@@ -150,7 +163,8 @@ fn reserve(
         status: CloneStatus::Creating,
     };
     store.insert_clone(&row)?;
-    Ok(row)
+    ctx.creating.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone());
+    Ok((row, InFlight { ctx, id }))
 }
 
 fn set_status(ctx: &Ctx, row: &mut CloneRow, status: CloneStatus) -> Result<()> {
@@ -221,7 +235,7 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
 }
 
 /// The install whose `pg_ctl` stops the cluster in `dir`: its own major, else the newest.
-fn install_for(ctx: &Ctx, dir: &Path) -> Option<PgInstall> {
+pub(crate) fn install_for(ctx: &Ctx, dir: &Path) -> Option<PgInstall> {
     read_pg_version(dir)
         .ok()
         .and_then(|m| find_major(&ctx.installs, m).ok())

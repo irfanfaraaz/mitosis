@@ -40,6 +40,10 @@ pub struct Ctx {
     pub started_at: Instant,
     /// Template names with a build in progress (one build per name at a time).
     pub(crate) building: Mutex<HashSet<String>>,
+    /// Clone ids whose `clones::create` is still running; reconcile leaves them alone.
+    pub(crate) creating: Mutex<HashSet<String>>,
+    /// Clone ids with a parent-exit watcher thread, so gc does not start a second one.
+    pub(crate) watching: Mutex<HashSet<String>>,
 }
 
 impl Ctx {
@@ -67,6 +71,8 @@ impl Ctx {
             installs: discover(),
             started_at: Instant::now(),
             building: Mutex::new(HashSet::new()),
+            creating: Mutex::new(HashSet::new()),
+            watching: Mutex::new(HashSet::new()),
         })
     }
 
