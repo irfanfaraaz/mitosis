@@ -293,16 +293,27 @@ async fn blocking<T: Send + 'static>(ctx: &Arc<Ctx>, f: fn(&Ctx) -> Result<T>) -
 pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
     Ok(match req {
         Request::TemplateInit(args) => Response::TemplateBuilt(templates::init(&ctx, args).await?),
-        Request::TemplateRefresh { name, path } => {
+        Request::TemplateRefresh {
+            name,
+            path,
+            layered: true,
+        } => Response::TemplateBuilt(templates::layered(&ctx, &name, path).await?),
+        Request::TemplateRefresh { name, path, .. } => {
             Response::TemplateBuilt(templates::refresh(&ctx, &name, path).await?)
         }
+        Request::TemplateSet(args) => Response::TemplateBuilt(templates::set(&ctx, args)?),
         Request::TemplateList => Response::Templates {
             templates: blocking(&ctx, templates::list).await?,
         },
-        Request::TemplateHistory { name } => Response::Generations {
-            generations: templates::history(&ctx, &name)?,
-            template: name,
-        },
+        Request::TemplateHistory { name } => {
+            let generations = templates::history(&ctx, &name)?;
+            let paused = ctx.store().get_template(&name)?.is_some_and(|t| t.paused);
+            Response::Generations {
+                template: name,
+                generations,
+                paused,
+            }
+        }
         Request::TemplateRollback { name, to } => {
             Response::TemplateBuilt(templates::rollback(&ctx, &name, to).await?)
         }

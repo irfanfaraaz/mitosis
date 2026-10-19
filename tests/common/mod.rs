@@ -110,6 +110,7 @@ pub fn template_args(name: &str, source: TemplateSource) -> TemplateInitArgs {
         migrations: None,
         max_age_secs: None,
         pg_major: None,
+        settings: Default::default(),
     }
 }
 

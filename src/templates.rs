@@ -7,7 +7,10 @@ use crate::pg::{
     initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
 };
 use crate::ports::pick_port;
-use crate::protocol::{GenKind, GenerationInfo, TemplateInfo, TemplateInitArgs, TemplateSource};
+use crate::protocol::{
+    GenKind, GenerationInfo, MigrateCmd, TemplateInfo, TemplateInitArgs, TemplateSetArgs,
+    TemplateSettings, TemplateSource,
+};
 use crate::state::{GenerationRow, TemplateRow};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
@@ -22,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SEED_DATABASE: &str = "app";
+/// The shortest refresh interval `--every` accepts.
+const MIN_EVERY_SECS: u64 = 60;
 
 fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)
@@ -68,7 +73,8 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
         }
     }
     // An existing template gets a new generation from the new source, on the same database.
-    if let Some(t) = ctx.store().get_template(&args.name)? {
+    let existing = ctx.store().get_template(&args.name)?;
+    if let Some(t) = &existing {
         if args.database.is_none() && matches!(args.source, TemplateSource::Seed { .. }) {
             args.database = Some(t.database.clone());
         }
@@ -84,6 +90,11 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
             )));
         }
     }
+    // Settings are checked before the build and applied with its generation.
+    let mut preview =
+        existing.unwrap_or_else(|| TemplateRow::new(&args.name, "", args.source.clone(), None, 0));
+    preview.migrations = args.migrations.clone();
+    apply_settings(&mut preview, None, &args.settings)?;
     build(ctx, args).await
 }
 
@@ -118,8 +129,90 @@ pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<Temp
         migrations: row.migrations,
         max_age_secs: Some(row.max_age_secs),
         pg_major: Some(cur.pg_major),
+        settings: TemplateSettings::default(),
     };
     build(ctx, args).await
+}
+
+/// Changes the settings of `name`; `resume` clears `paused`.
+pub fn set(ctx: &Ctx, args: TemplateSetArgs) -> Result<TemplateInfo> {
+    validate_name("template", &args.name)?;
+    {
+        let store = ctx.store();
+        let mut t = store
+            .get_template(&args.name)?
+            .ok_or_else(|| not_found(&args.name))?;
+        apply_settings(&mut t, args.max_age_secs, &args.settings)?;
+        if args.resume {
+            t.paused = false;
+        }
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, &args.name)
+}
+
+/// Checks `s` and writes it, and `max_age_secs` when given, into `t`.
+fn apply_settings(
+    t: &mut TemplateRow,
+    max_age_secs: Option<u64>,
+    s: &TemplateSettings,
+) -> Result<()> {
+    if s.every_secs.is_some() && s.every_off {
+        return Err(invalid("set --every to a duration or to off, not both"));
+    }
+    if s.migrate.is_some() && s.migrate_off {
+        return Err(invalid("set --migrate to a command or to off, not both"));
+    }
+    if s.keep == Some(0) {
+        return Err(invalid("--keep must be at least 1"));
+    }
+    if s.every_secs.is_some_and(|e| e < MIN_EVERY_SECS) {
+        return Err(invalid("--every must be at least 1m"));
+    }
+    if s.migrate
+        .as_ref()
+        .is_some_and(|m| m.command.trim().is_empty())
+    {
+        return Err(invalid("--migrate needs a command, or off"));
+    }
+    if let Some(v) = max_age_secs {
+        t.max_age_secs = v;
+    }
+    if let Some(k) = s.keep {
+        t.keep = k;
+    }
+    if s.every_off {
+        t.every_secs = None;
+    } else if s.every_secs.is_some() {
+        t.every_secs = s.every_secs;
+    }
+    if let Some(m) = s.every_mode {
+        t.every_mode = m;
+    }
+    if s.migrate_off {
+        t.migrate = None;
+    } else if s.migrate.is_some() {
+        t.migrate = s.migrate.clone();
+    }
+    if let Some(a) = s.auto_migrate {
+        t.auto_migrate = a;
+    }
+    if let Some(o) = s.on_stale {
+        t.on_stale = o;
+    }
+    if t.auto_migrate && t.migrations.is_none() {
+        return Err(
+            invalid("--auto-migrate on needs --migrations").with_hint(format!(
+            "record the migrations folder with: mitosis template init {} --migrations <folder> ...",
+            t.name
+        )),
+        );
+    }
+    if t.auto_migrate && t.migrate.is_none() {
+        return Err(invalid("--auto-migrate on needs --migrate")
+            .with_hint(format!("mitosis template set {} --migrate \"…\"", t.name)));
+    }
+    Ok(())
 }
 
 /// Templates with a current generation; one still building its first is left out.
@@ -189,6 +282,12 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
         generations,
         paused: row.paused,
         last_error: row.last_error.clone(),
+        every_secs: row.every_secs,
+        every_mode: row.every_mode,
+        migrate: row.migrate.as_ref().map(|m| redact_url(&m.command)),
+        auto_migrate: row.auto_migrate,
+        on_stale: row.on_stale,
+        keep: row.keep,
     }
 }
 
@@ -678,9 +777,10 @@ fn dump_restore(
     }
 }
 
-/// Runs the seed command against the build server over TCP, in its own process group.
+/// Runs a seed or migrate command (`what`) against the build server over TCP, in its own
+/// process group.
 #[allow(clippy::too_many_arguments)]
-async fn run_seed(
+async fn run_command(
     install: &PgInstall,
     opts: &StartOptions,
     db: &str,
@@ -688,6 +788,7 @@ async fn run_seed(
     cwd: Option<&Path>,
     path: Option<&str>,
     groups: &Groups,
+    what: &str,
 ) -> Result<()> {
     // initdb sets host auth to scram-sha-256, so TCP needs a password: a throwaway one, cleared afterwards.
     // log_min_error_statement=panic keeps a failing statement (with the password) out of the log.
@@ -720,10 +821,10 @@ async fn run_seed(
     }
     let spawn_err = |e: std::io::Error| match cwd {
         Some(dir) => internal(format!(
-            "could not run the seed command in {}: {e}",
+            "could not run the {what} command in {}: {e}",
             dir.display()
         )),
-        None => internal(format!("could not run the seed command: {e}")),
+        None => internal(format!("could not run the {what} command: {e}")),
     };
     let mut child = cmd.spawn().map_err(spawn_err)?;
     let group = child.id().map(|pid| GroupGuard::new(groups, pid as i32));
@@ -733,7 +834,7 @@ async fn run_seed(
         if let Some(g) = &group {
             g.kill();
         }
-        return Err(internal(format!("seed command failed ({status})")));
+        return Err(internal(format!("{what} command failed ({status})")));
     }
     drop(group);
     run_psql(
@@ -818,32 +919,7 @@ async fn run_steps(
     blocking(move || initdb(&i, &d))
         .await
         .map_err(at("initdb"))?;
-
-    let mut tried = HashSet::new();
-    let pg: RunningPg = loop {
-        let pg = start(install, data_dir, opts).map_err(at("start"))?;
-        match wait_ready(install, &pg, opts, ctx.config().ready_timeout).await {
-            Ok(()) => break pg,
-            // Another process can take the picked port before postgres binds it.
-            Err(e) if e.code == ErrorCode::PortInUse && tried.len() + 1 < START_TRIES => {
-                let (i, d, t) = (
-                    install.clone(),
-                    data_dir.to_path_buf(),
-                    ctx.config().stop_timeout,
-                );
-                blocking(move || stop(&i, &d, Some(pg), t))
-                    .await
-                    .map_err(at("start"))?;
-                let _ = std::fs::remove_dir(&opts.socket_dir);
-                tried.insert(opts.port);
-                let leased = ctx.store().leased_ports().map_err(at("start"))?;
-                opts.port =
-                    pick_port(ctx.config().port_range, &leased, &tried).map_err(at("start"))?;
-                opts.socket_dir = build_socket_dir(ctx, opts.port);
-            }
-            Err(e) => return Err(("start", e)),
-        }
-    };
+    let pg = start_build_server(ctx, install, data_dir, opts).await?;
 
     if database != "postgres" {
         let sql = format!("CREATE DATABASE {}", quote_ident(database));
@@ -866,7 +942,7 @@ async fn run_steps(
                 .map_err(at("restore"))?;
         }
         TemplateSource::Seed { command, cwd, path } => {
-            run_seed(
+            run_command(
                 install,
                 opts,
                 database,
@@ -874,12 +950,58 @@ async fn run_steps(
                 cwd.as_deref(),
                 path.as_deref(),
                 &ctx.build_groups,
+                "seed",
             )
             .await
             .map_err(at("seed"))?;
         }
     }
+    extensions_and_stop(ctx, install, data_dir, opts, database, pg).await
+}
 
+/// Starts the build server in `data_dir`, moving `opts` to another port when the picked one is taken.
+async fn start_build_server(
+    ctx: &Ctx,
+    install: &PgInstall,
+    data_dir: &Path,
+    opts: &mut StartOptions,
+) -> StepResult<RunningPg> {
+    let mut tried = HashSet::new();
+    Ok(loop {
+        let pg = start(install, data_dir, opts).map_err(at("start"))?;
+        match wait_ready(install, &pg, opts, ctx.config().ready_timeout).await {
+            Ok(()) => break pg,
+            // Another process can take the picked port before postgres binds it.
+            Err(e) if e.code == ErrorCode::PortInUse && tried.len() + 1 < START_TRIES => {
+                let (i, d, t) = (
+                    install.clone(),
+                    data_dir.to_path_buf(),
+                    ctx.config().stop_timeout,
+                );
+                blocking(move || stop(&i, &d, Some(pg), t))
+                    .await
+                    .map_err(at("start"))?;
+                let _ = std::fs::remove_dir(&opts.socket_dir);
+                tried.insert(opts.port);
+                let leased = ctx.store().leased_ports().map_err(at("start"))?;
+                opts.port =
+                    pick_port(ctx.config().port_range, &leased, &tried).map_err(at("start"))?;
+                opts.socket_dir = build_socket_dir(ctx, opts.port);
+            }
+            Err(e) => return Err(("start", e)),
+        }
+    })
+}
+
+/// Lists the extensions of `database`, then stops the build server.
+async fn extensions_and_stop(
+    ctx: &Ctx,
+    install: &PgInstall,
+    data_dir: &Path,
+    opts: &StartOptions,
+    database: &str,
+    pg: RunningPg,
+) -> StepResult<Vec<String>> {
     let out = run_psql(
         install,
         opts,
@@ -1008,9 +1130,135 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     t.source = args.source;
     t.migrations = args.migrations;
     t.max_age_secs = max_age_secs;
+    apply_settings(&mut t, None, &args.settings)?;
+    resume_if_current(&mut t, gen);
     store.update_template_settings(&t)?;
     drop(store);
     template_info(ctx, &name)
+}
+
+/// A successful build that is still current clears `paused` and `last_error`. One that a
+/// rollback overtook leaves them, so the rollback sticks.
+fn resume_if_current(t: &mut TemplateRow, gen: u32) {
+    if t.current_gen == gen {
+        t.paused = false;
+        t.last_error = None;
+    }
+}
+
+/// Copies the current generation of `name`, runs only its migrate command on the copy and makes
+/// the result a `Layered` generation. `path`, when given, replaces the command's recorded `PATH`.
+pub async fn layered(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
+    validate_name("template", name)?;
+    let _guard = BuildGuard::take(ctx, name)?;
+    let (t, cur) = ctx.store().current(name)?.ok_or_else(|| not_found(name))?;
+    let Some(mut migrate) = t.migrate.clone() else {
+        return Err(
+            invalid(format!("template {name} has no migrate command")).with_hint(format!(
+                "set one with: mitosis template set {name} --migrate \"…\""
+            )),
+        );
+    };
+    migrate.path = path.or(migrate.path);
+    let install = ctx.install_major(cur.pg_major).await?;
+    let migrations_hash = match t.migrations.as_deref() {
+        Some(m) if m.is_dir() => Some(hash_dir(m)?),
+        _ => None,
+    };
+    let gen = ctx.store().alloc_gen(name)?;
+
+    let secrets = source_secrets(&t.source);
+    let ts = now();
+    let side = ctx.home.templates_dir().join(build_dir_name(name, ts));
+    let mut opts = build_start_options(ctx, name)?;
+    let log = opts.log_file.clone();
+    let result = layered_steps(
+        ctx,
+        &install,
+        &cur.dir,
+        &side,
+        &mut opts,
+        &t.database,
+        &migrate,
+    )
+    .await;
+    let result = match result {
+        Ok(ext) => Ok(ext),
+        Err((step, e)) => Err(fail(ctx, &install, &side, &log, &secrets, step, e).await),
+    };
+    let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
+    let row = GenerationRow {
+        template: name.to_string(),
+        gen,
+        kind: GenKind::Layered,
+        dir: side,
+        pg_major: 0,
+        bin_dir: install.bin_dir.clone(),
+        extensions: result?,
+        migrations_hash,
+        built_at: ts,
+        size_bytes: 0,
+        from_clone: None,
+        from_gen: Some(cur.gen),
+    };
+    commit_built(ctx, &install, &log, &secrets, row, cur.gen).await?;
+    {
+        let store = ctx.store();
+        let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+        resume_if_current(&mut t, gen);
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, name)
+}
+
+/// Copy of generation folder `from` into `dir`, started privately, migrated, stopped.
+async fn layered_steps(
+    ctx: &Ctx,
+    install: &PgInstall,
+    from: &Path,
+    dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+    migrate: &MigrateCmd,
+) -> StepResult<Vec<String>> {
+    {
+        // A commit or prune moves generation folders only under the write guard.
+        let _swap = ctx.template_swap.read().await;
+        let (b, f, d) = (ctx.backend.clone(), from.to_path_buf(), dir.to_path_buf());
+        blocking(move || b.clone_dir(&f, &d))
+            .await
+            .map_err(at("copy"))?;
+    }
+    let pg = start_build_server(ctx, install, dir, opts).await?;
+    run_command(
+        install,
+        opts,
+        database,
+        &migrate.command,
+        Some(&migrate.cwd),
+        migrate.path.as_deref(),
+        &ctx.build_groups,
+        "migrate",
+    )
+    .await
+    .map_err(at("migrate"))?;
+    extensions_and_stop(ctx, install, dir, opts, database, pg).await
+}
+
+/// Options for a private build server of `name` on a free port. Truncates the build log, so an
+/// error tail belongs to this build.
+fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
+    let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
+    std::fs::File::create(&log)?;
+    let leased = ctx.store().leased_ports()?;
+    let port = pick_port(ctx.config().port_range, &leased, &HashSet::new())?;
+    Ok(StartOptions {
+        port,
+        socket_dir: build_socket_dir(ctx, port),
+        listen_tcp: true,
+        durable: false,
+        log_file: log,
+    })
 }
 
 /// Builds generation `gen` in a side folder and commits it as a `Full` generation.
@@ -1027,17 +1275,8 @@ async fn build_gen(
     let secrets = source_secrets(&args.source);
     let ts = now();
     let build_dir = ctx.home.templates_dir().join(build_dir_name(name, ts));
-    let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
-    std::fs::File::create(&log)?; // truncate, so the error tail belongs to this build
-    let leased = ctx.store().leased_ports()?;
-    let port = pick_port(ctx.config().port_range, &leased, &HashSet::new())?;
-    let mut opts = StartOptions {
-        port,
-        socket_dir: build_socket_dir(ctx, port),
-        listen_tcp: true,
-        durable: false,
-        log_file: log.clone(),
-    };
+    let mut opts = build_start_options(ctx, name)?;
+    let log = opts.log_file.clone();
 
     let result = run_steps(ctx, install, &build_dir, &mut opts, database, &args.source).await;
     let result = match result {
@@ -1045,31 +1284,42 @@ async fn build_gen(
         Err((step, e)) => Err(fail(ctx, install, &build_dir, &log, &secrets, step, e).await),
     };
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
-    let extensions = result?;
-
-    // Step 7: measure, then commit.
-    let b = build_dir.clone();
-    let measured = blocking(move || Ok((read_pg_version(&b)?, apparent_size(&b)?))).await;
-    let (pg_major, size_bytes) = match measured {
-        Ok(v) => v,
-        Err(e) => return Err(fail(ctx, install, &build_dir, &log, &secrets, "measure", e).await),
-    };
     let row = GenerationRow {
         template: name.clone(),
         gen,
         kind: GenKind::Full,
-        dir: build_dir.clone(),
-        pg_major,
+        dir: build_dir,
+        pg_major: 0,
         bin_dir: install.bin_dir.clone(),
-        extensions,
+        extensions: result?,
         migrations_hash,
         built_at: ts,
-        size_bytes,
+        size_bytes: 0,
         from_clone: None,
         from_gen: None,
     };
+    commit_built(ctx, install, &log, &secrets, row, expected).await
+}
+
+/// Step 7: measures the built side folder `row.dir` (filling `pg_major` and `size_bytes`), then
+/// commits it. On failure the folder is removed and the error has the build-failure shape.
+async fn commit_built(
+    ctx: &Ctx,
+    install: &PgInstall,
+    log: &Path,
+    secrets: &[String],
+    mut row: GenerationRow,
+    expected: u32,
+) -> Result<()> {
+    let dir = row.dir.clone();
+    let b = dir.clone();
+    let measured = blocking(move || Ok((read_pg_version(&b)?, apparent_size(&b)?))).await;
+    (row.pg_major, row.size_bytes) = match measured {
+        Ok(v) => v,
+        Err(e) => return Err(fail(ctx, install, &dir, log, secrets, "measure", e).await),
+    };
     if let Err(e) = commit_generation(ctx, row, Some(expected)).await {
-        return Err(fail(ctx, install, &build_dir, &log, &secrets, "commit", e).await);
+        return Err(fail(ctx, install, &dir, log, secrets, "commit", e).await);
     }
     Ok(())
 }
@@ -1197,6 +1447,7 @@ mod tests {
             migrations: None,
             max_age_secs: None,
             pg_major: None,
+            settings: TemplateSettings::default(),
         };
         let seed = TemplateSource::Seed {
             command: "true".into(),
@@ -1305,6 +1556,7 @@ mod tests {
             migrations: None,
             max_age_secs: None,
             pg_major: None,
+            settings: TemplateSettings::default(),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1399,5 +1651,6 @@ mod tests {
         send(init(ctx, args));
         send(refresh(ctx, "main", None));
         send(rollback(ctx, "main", None));
+        send(layered(ctx, "main", None));
     }
 }

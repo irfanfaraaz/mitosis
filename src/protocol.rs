@@ -71,6 +71,28 @@ pub struct GenerationInfo {
     pub from_gen: Option<u32>,
 }
 
+/// Template settings a request may change; `None` / `false` leaves a setting as it is.
+/// An `_off` flag turns its setting off and must not come with a value.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TemplateSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_secs: Option<u64>,
+    #[serde(default)]
+    pub every_off: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_mode: Option<RefreshMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrate: Option<MigrateCmd>,
+    #[serde(default)]
+    pub migrate_off: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_migrate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_stale: Option<OnStale>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TemplateInitArgs {
     pub name: String,
@@ -79,6 +101,21 @@ pub struct TemplateInitArgs {
     pub migrations: Option<PathBuf>,
     pub max_age_secs: Option<u64>,
     pub pg_major: Option<u32>,
+    /// Applied with the first generation.
+    #[serde(flatten)]
+    pub settings: TemplateSettings,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TemplateSetArgs {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<u64>,
+    #[serde(flatten)]
+    pub settings: TemplateSettings,
+    /// Clears `paused`, so automatic builds run again.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -99,7 +136,11 @@ pub enum Request {
         /// The refreshing caller's `PATH`; for a seed template it replaces the recorded one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// Copy the current generation and run only the migrate command on it.
+        #[serde(default)]
+        layered: bool,
     },
+    TemplateSet(TemplateSetArgs),
     TemplateList,
     TemplateHistory {
         name: String,
@@ -141,6 +182,19 @@ pub struct TemplateInfo {
     pub paused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_secs: Option<u64>,
+    #[serde(default)]
+    pub every_mode: RefreshMode,
+    /// The migrate command, passwords masked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrate: Option<String>,
+    #[serde(default)]
+    pub auto_migrate: bool,
+    #[serde(default)]
+    pub on_stale: OnStale,
+    #[serde(default)]
+    pub keep: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -200,6 +254,9 @@ pub enum Response {
     Generations {
         template: String,
         generations: Vec<GenerationInfo>,
+        /// Automatic builds are stopped (after a rollback).
+        #[serde(default)]
+        paused: bool,
     },
     CloneCreated(CloneInfo),
     Clones {
@@ -297,6 +354,12 @@ mod tests {
             generations: 2,
             paused: true,
             last_error: Some("boom".into()),
+            every_secs: Some(86_400),
+            every_mode: RefreshMode::Layered,
+            migrate: Some("make migrate".into()),
+            auto_migrate: true,
+            on_stale: OnStale::Refresh,
+            keep: 3,
         }
     }
 
@@ -354,6 +417,7 @@ mod tests {
                 from_clone: Some("feat".into()),
                 from_gen: Some(3),
             }],
+            paused: true,
         });
     }
 
@@ -401,12 +465,64 @@ mod tests {
     fn refresh_path_is_optional() {
         let r: Request =
             serde_json::from_str(r#"{"type":"template_refresh","name":"main"}"#).unwrap();
-        assert!(matches!(r, Request::TemplateRefresh { path: None, .. }));
+        assert!(matches!(
+            r,
+            Request::TemplateRefresh {
+                path: None,
+                layered: false,
+                ..
+            }
+        ));
         let r: GcReport = serde_json::from_str(
             r#"{"adopted":[],"destroyed":[],"orphan_folders_removed":[],"records_dropped":[]}"#,
         )
         .unwrap();
         assert!(r.failed.is_empty());
+    }
+
+    #[test]
+    fn template_settings_are_flat_and_optional() {
+        let r: Request = serde_json::from_str(
+            r#"{"type":"template_init","name":"main","source":{"kind":"seed","command":"x"},
+                "database":null,"migrations":null,"max_age_secs":null,"pg_major":null}"#,
+        )
+        .unwrap();
+        let Request::TemplateInit(a) = r else {
+            panic!("wrong variant")
+        };
+        assert_eq!(a.settings, TemplateSettings::default());
+
+        let set = Request::TemplateSet(TemplateSetArgs {
+            name: "main".into(),
+            max_age_secs: Some(60),
+            settings: TemplateSettings {
+                keep: Some(2),
+                every_secs: Some(3600),
+                every_mode: Some(RefreshMode::Layered),
+                migrate: Some(MigrateCmd {
+                    command: "make migrate".into(),
+                    cwd: "/w".into(),
+                    path: None,
+                }),
+                auto_migrate: Some(true),
+                on_stale: Some(OnStale::Refresh),
+                ..Default::default()
+            },
+            resume: true,
+        });
+        let line = serde_json::to_string(&set).unwrap();
+        assert!(line.contains(r#""keep":2"#), "{line}");
+        let Request::TemplateSet(back) = serde_json::from_str(&line).unwrap() else {
+            panic!("wrong variant")
+        };
+        assert_eq!(back.settings.keep, Some(2));
+        assert_eq!(back.settings.every_mode, Some(RefreshMode::Layered));
+        assert_eq!(back.settings.migrate.unwrap().command, "make migrate");
+        assert!(back.resume && !back.settings.every_off);
+        let r: Response =
+            serde_json::from_str(r#"{"type":"generations","template":"main","generations":[]}"#)
+                .unwrap();
+        assert!(matches!(r, Response::Generations { paused: false, .. }));
     }
 
     #[test]

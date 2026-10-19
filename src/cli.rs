@@ -6,7 +6,8 @@ use crate::mcp;
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
 use crate::protocol::{
-    CloneCreateArgs, CloneInfo, Request, Response, TemplateInfo, TemplateInitArgs, TemplateSource,
+    CloneCreateArgs, CloneInfo, MigrateCmd, Request, Response, TemplateInfo, TemplateInitArgs,
+    TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::templates::now;
 use clap::{Parser, Subcommand};
@@ -99,16 +100,28 @@ enum TemplateCmd {
         /// Migrations folder; the template is flagged stale when it changes.
         #[arg(long)]
         migrations: Option<std::path::PathBuf>,
-        /// Age after which clones warn, like 7d.
-        #[arg(long)]
-        max_age: Option<String>,
         #[arg(long)]
         pg_version: Option<u32>,
+        #[command(flatten)]
+        settings: SettingsFlags,
     },
     /// Rebuild a template from its recorded source.
     Refresh {
         #[arg(default_value = "main")]
         name: String,
+        /// Copy the current generation and run only the migrate command on it.
+        #[arg(long)]
+        layered: bool,
+    },
+    /// Change a template's settings.
+    Set {
+        #[arg(default_value = "main")]
+        name: String,
+        #[command(flatten)]
+        settings: SettingsFlags,
+        /// Restart automatic builds stopped by a rollback.
+        #[arg(long)]
+        resume: bool,
     },
     /// List templates.
     List {
@@ -130,6 +143,81 @@ enum TemplateCmd {
         #[arg(long)]
         to: Option<u32>,
     },
+}
+
+/// Template settings shared by `template init` and `template set`.
+#[derive(clap::Args)]
+struct SettingsFlags {
+    /// Age after which clones warn, like 7d.
+    #[arg(long)]
+    max_age: Option<String>,
+    /// Generations to keep on disk (at least 1).
+    #[arg(long)]
+    keep: Option<u32>,
+    /// Rebuild on a schedule, like 24h (at least 1m), or off.
+    #[arg(long)]
+    every: Option<String>,
+    /// How scheduled rebuilds run.
+    #[arg(long, value_parser = ["full", "layered"])]
+    mode: Option<String>,
+    /// Migration command for layered refreshes, run in this folder with DATABASE_URL set, or off.
+    #[arg(long)]
+    migrate: Option<String>,
+    /// Run a layered refresh by itself when the migrations folder changes.
+    #[arg(long, value_parser = ["on", "off"])]
+    auto_migrate: Option<String>,
+    /// When a clone's template is older than --max-age: warn, or also refresh in the background.
+    #[arg(long, value_parser = ["warn", "refresh"])]
+    on_stale: Option<String>,
+}
+
+/// A protocol enum from its snake_case name (clap already limited the choices).
+fn enum_arg<T: serde::de::DeserializeOwned>(s: Option<String>) -> Result<Option<T>> {
+    Ok(
+        s.map(|s| serde_json::from_value(serde_json::Value::String(s)))
+            .transpose()?,
+    )
+}
+
+impl SettingsFlags {
+    /// The max age in seconds, and the settings.
+    fn parse(self) -> Result<(Option<u64>, TemplateSettings)> {
+        let max_age_secs = self
+            .max_age
+            .as_deref()
+            .map(parse_duration)
+            .transpose()?
+            .map(|d| d.as_secs());
+        let (every_secs, every_off) = match self.every.as_deref() {
+            Some("off") => (None, true),
+            Some(d) => (Some(parse_duration(d)?.as_secs()), false),
+            None => (None, false),
+        };
+        let (migrate, migrate_off) = match self.migrate {
+            Some(c) if c == "off" => (None, true),
+            // Runs where and with the PATH it would in this shell, like a seed.
+            Some(command) => (
+                Some(MigrateCmd {
+                    command,
+                    cwd: std::env::current_dir()?,
+                    path: std::env::var("PATH").ok(),
+                }),
+                false,
+            ),
+            None => (None, false),
+        };
+        let settings = TemplateSettings {
+            keep: self.keep,
+            every_secs,
+            every_off,
+            every_mode: enum_arg(self.mode)?,
+            migrate,
+            migrate_off,
+            auto_migrate: self.auto_migrate.map(|a| a == "on"),
+            on_stale: enum_arg(self.on_stale)?,
+        };
+        Ok((max_age_secs, settings))
+    }
 }
 
 #[derive(Subcommand)]
@@ -344,15 +432,11 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
             seed,
             database,
             migrations,
-            max_age,
             pg_version,
+            settings,
         } => {
             validate_name("template", &name)?;
-            let max_age_secs = max_age
-                .as_deref()
-                .map(parse_duration)
-                .transpose()?
-                .map(|d| d.as_secs());
+            let (max_age_secs, settings) = settings.parse()?;
             let migrations = migrations
                 .map(|dir| {
                     std::fs::canonicalize(&dir).map_err(|e| {
@@ -380,17 +464,46 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 migrations,
                 max_age_secs,
                 pg_major: pg_version,
+                settings,
             };
             match client::request(home, Request::TemplateInit(args)).await? {
                 Response::TemplateBuilt(t) => print_built(&t),
                 other => return Err(unexpected(other)),
             }
         }
-        TemplateCmd::Refresh { name } => {
+        TemplateCmd::Refresh { name, layered } => {
             validate_name("template", &name)?;
             let path = std::env::var("PATH").ok();
-            match client::request(home, Request::TemplateRefresh { name, path }).await? {
+            let req = Request::TemplateRefresh {
+                name,
+                path,
+                layered,
+            };
+            match client::request(home, req).await? {
                 Response::TemplateBuilt(t) => print_built(&t),
+                other => return Err(unexpected(other)),
+            }
+        }
+        TemplateCmd::Set {
+            name,
+            settings,
+            resume,
+        } => {
+            validate_name("template", &name)?;
+            let (max_age_secs, settings) = settings.parse()?;
+            let args = TemplateSetArgs {
+                name,
+                max_age_secs,
+                settings,
+                resume,
+            };
+            match client::request(home, Request::TemplateSet(args)).await? {
+                Response::TemplateBuilt(t) => {
+                    println!("template {} settings saved", t.name);
+                    if t.paused {
+                        println!("{}", paused_line(&t.name));
+                    }
+                }
                 other => return Err(unexpected(other)),
             }
         }
@@ -434,14 +547,25 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         }
         TemplateCmd::History { name, json } => {
             validate_name("template", &name)?;
-            let generations = match client::request(home, Request::TemplateHistory { name }).await?
-            {
-                Response::Generations { generations, .. } => generations,
-                other => return Err(unexpected(other)),
-            };
+            let (template, generations, paused) =
+                match client::request(home, Request::TemplateHistory { name }).await? {
+                    Response::Generations {
+                        template,
+                        generations,
+                        paused,
+                    } => (template, generations, paused),
+                    other => return Err(unexpected(other)),
+                };
             if json {
-                print_json(&generations)?;
+                print_json(&serde_json::json!({
+                    "template": template,
+                    "paused": paused,
+                    "generations": generations,
+                }))?;
             } else {
+                if paused {
+                    println!("{}", paused_line(&template));
+                }
                 let now = now();
                 print_table(
                     &["GEN", "KIND", "BUILT", "PG", "SIZE", "CURRENT"],
@@ -497,6 +621,12 @@ fn source_cell(source: &TemplateSource) -> String {
     }
     let cut: String = text.chars().take(MAX - 1).collect();
     format!("{cut}…")
+}
+
+fn paused_line(name: &str) -> String {
+    format!(
+        "paused: automatic builds stopped — run \"mitosis template refresh {name}\" or \"mitosis template set {name} --resume\""
+    )
 }
 
 fn print_built(t: &TemplateInfo) {
@@ -637,5 +767,49 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["mitosis", "template", "init", "--seed", "x"]).is_ok());
+    }
+
+    #[test]
+    fn settings_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "mitosis",
+            "template",
+            "set",
+            "main",
+            "--keep",
+            "2",
+            "--every",
+            "off",
+            "--mode",
+            "layered",
+            "--migrate",
+            "make migrate",
+            "--auto-migrate",
+            "on",
+            "--on-stale",
+            "refresh",
+            "--max-age",
+            "1d",
+            "--resume",
+        ])
+        .unwrap();
+        let Cmd::Template {
+            command: TemplateCmd::Set {
+                settings, resume, ..
+            },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert!(resume);
+        let (max_age, s) = settings.parse().unwrap();
+        assert_eq!(max_age, Some(86_400));
+        assert_eq!(s.keep, Some(2));
+        assert!(s.every_off && s.every_secs.is_none());
+        assert_eq!(s.every_mode, Some(crate::protocol::RefreshMode::Layered));
+        assert_eq!(s.migrate.unwrap().command, "make migrate");
+        assert_eq!(s.auto_migrate, Some(true));
+        assert_eq!(s.on_stale, Some(crate::protocol::OnStale::Refresh));
+        assert!(Cli::try_parse_from(["mitosis", "template", "set", "--mode", "fast"]).is_err());
     }
 }
