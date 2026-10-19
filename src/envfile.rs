@@ -85,6 +85,21 @@ pub fn get_var(text: &str, var: &str) -> Option<String> {
     Some(raw.split(" #").next().unwrap_or(raw).trim().to_string())
 }
 
+/// Everything after the `=` of the first `VAR=` line, exactly as written (quotes, spaces and a
+/// trailing comment included). What `restore` puts back.
+pub fn get_raw(text: &str, var: &str) -> Option<String> {
+    let f = find(text, var)?;
+    Some(text[f.value_start..f.content_end].to_string())
+}
+
+/// Replaces everything after the `=` of the first `VAR=` line with `raw`, verbatim.
+fn set_raw(text: &str, var: &str, raw: &str) -> String {
+    match find(text, var) {
+        Some(f) => format!("{}{raw}{}", &text[..f.value_start], &text[f.content_end..]),
+        None => set_var(text, var, raw),
+    }
+}
+
 /// Sets the first `VAR=` line (keeping indent and `export `), or appends one. The value is
 /// written as it is: a clone URL needs no quoting.
 pub fn set_var(text: &str, var: &str, value: &str) -> String {
@@ -210,7 +225,7 @@ pub fn restore(rec: &PendingRestore) -> Result<bool> {
         return Ok(false);
     }
     let new = match &rec.previous {
-        Some(prev) => set_var(&text, &rec.var, prev),
+        Some(prev) => set_raw(&text, &rec.var, prev),
         None => remove_var(&text, &rec.var),
     };
     write_file(&rec.file, &new)?;
@@ -242,7 +257,7 @@ fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
     }
     let file = std::env::current_dir()?.join(file);
     check_name(&file)?;
-    let previous = read_file(&file)?.and_then(|t| get_var(&t, &var));
+    let previous = read_file(&file)?.and_then(|t| get_raw(&t, &var));
     Ok(EnvTarget {
         file,
         var,
@@ -265,6 +280,9 @@ pub async fn create_clone(
         (None, None) => None,
     };
     let env = args.env.clone();
+    // Before this create writes the file: a restore left by a dead clone must see the value the
+    // clone put there, not the new URL, or the user's own value is lost.
+    let mut pending = finish_pending(home).await;
     let mut info = match client::request(home, Request::CloneCreate(args)).await? {
         Response::CloneCreated(info) => info,
         // Not the reply itself: it holds a password-bearing URL.
@@ -297,6 +315,8 @@ pub async fn create_clone(
             )),
         }
     }
+    pending.append(&mut info.warnings);
+    info.warnings = pending;
     Ok(info)
 }
 
@@ -398,6 +418,32 @@ mod tests {
         assert_eq!(set_var("", "V", "x"), "V=x\n");
         assert_eq!(remove_var("", "V"), "");
         assert_eq!(get_var("", "V"), None);
+    }
+
+    #[test]
+    fn env_restore_gives_back_the_identical_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        for (line, eol) in [
+            ("DATABASE_URL=\"a b # c\"", "\n"),
+            ("DATABASE_URL=x # comment", "\n"),
+            ("export DATABASE_URL='q' # c", "\r\n"),
+            ("DATABASE_URL=", "\r\n"),
+        ] {
+            let original = format!("A=1{eol}{line}{eol}B=2{eol}");
+            let previous = get_raw(&original, "DATABASE_URL");
+            let url = "postgres://postgres:pw@127.0.0.1:54321/app".to_string();
+            std::fs::write(&p, set_var(&original, "DATABASE_URL", &url)).unwrap();
+            let rec = PendingRestore {
+                id: 0,
+                file: p.clone(),
+                var: "DATABASE_URL".into(),
+                previous,
+                url,
+            };
+            assert!(restore(&rec).unwrap());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+        }
     }
 
     #[test]
