@@ -47,7 +47,10 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
 /// Resident memory in bytes of `pid` plus its direct children. Postgres backends call
 /// `setsid()`, so the process group holds only the postmaster; its children are found by ppid.
 pub fn rss_bytes(pid: i32) -> Option<u64> {
-    let out = Command::new("ps").args(["-axo", "pid=,ppid=,rss="]).output().ok()?;
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,rss="])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -62,7 +65,10 @@ fn sum_rss(ps: &str, pid: i32) -> Option<u64> {
     for line in ps.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         let [p, pp, rss] = f[..] else { continue };
-        let (Ok(p), Ok(pp), Ok(rss)) = (p.parse::<i32>(), pp.parse::<i32>(), rss.parse::<u64>()) else { continue };
+        let (Ok(p), Ok(pp), Ok(rss)) = (p.parse::<i32>(), pp.parse::<i32>(), rss.parse::<u64>())
+        else {
+            continue;
+        };
         if p == pid {
             found = true;
         }

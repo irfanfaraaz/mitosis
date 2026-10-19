@@ -53,30 +53,42 @@ impl Mitosis {
     #[tool(
         description = "Create a private, throwaway Postgres database cloned from a template in about a second. Use it for migrations, seeds and destructive tests. It is deleted when this session ends or the TTL passes."
     )]
-    async fn clone_create(&self, Parameters(p): Parameters<CloneCreateParams>) -> Result<String, String> {
+    async fn clone_create(
+        &self,
+        Parameters(p): Parameters<CloneCreateParams>,
+    ) -> Result<String, String> {
         text(self.create(p).await)
     }
 
     #[tool(description = "List all Mitosis clones as JSON.")]
     async fn clone_list(&self) -> Result<String, String> {
-        text(async {
-            match client::request(&self.home, Request::CloneList).await? {
-                Response::Clones { clones } => Ok(serde_json::to_string_pretty(&clones)?),
-                _ => Err(unexpected()),
+        text(
+            async {
+                match client::request(&self.home, Request::CloneList).await? {
+                    Response::Clones { clones } => Ok(serde_json::to_string_pretty(&clones)?),
+                    _ => Err(unexpected()),
+                }
             }
-        }
-        .await)
+            .await,
+        )
     }
 
     #[tool(description = "Destroy a clone by id or name.")]
-    async fn clone_destroy(&self, Parameters(p): Parameters<CloneDestroyParams>) -> Result<String, String> {
-        text(async {
-            match client::request(&self.home, Request::CloneDestroy { id_or_name: p.id }).await? {
-                Response::Destroyed { id } => Ok(format!("destroyed {id}")),
-                _ => Err(unexpected()),
+    async fn clone_destroy(
+        &self,
+        Parameters(p): Parameters<CloneDestroyParams>,
+    ) -> Result<String, String> {
+        text(
+            async {
+                match client::request(&self.home, Request::CloneDestroy { id_or_name: p.id })
+                    .await?
+                {
+                    Response::Destroyed { id } => Ok(format!("destroyed {id}")),
+                    _ => Err(unexpected()),
+                }
             }
-        }
-        .await)
+            .await,
+        )
     }
 }
 
@@ -102,14 +114,19 @@ impl Mitosis {
         };
         // Warnings are best effort: the clone already exists.
         let warnings: Vec<String> = match client::request(&self.home, Request::TemplateList).await {
-            Ok(Response::Templates { templates }) => {
-                templates.into_iter().filter(|t| t.name == template).flat_map(|t| t.warnings).collect()
-            }
+            Ok(Response::Templates { templates }) => templates
+                .into_iter()
+                .filter(|t| t.name == template)
+                .flat_map(|t| t.warnings)
+                .collect(),
             _ => Vec::new(),
         };
         let mut out = serde_json::to_value(&info)?;
         if let Some(obj) = out.as_object_mut() {
-            obj.insert("template_age".into(), format_duration(Duration::from_secs(info.template_age_secs)).into());
+            obj.insert(
+                "template_age".into(),
+                format_duration(Duration::from_secs(info.template_age_secs)).into(),
+            );
             obj.insert("warnings".into(), warnings.into());
         }
         Ok(serde_json::to_string_pretty(&out)?)
@@ -125,7 +142,13 @@ impl ServerHandler for Mitosis {}
 /// Serves the clone tools on stdin/stdout until stdin closes.
 pub async fn serve_stdio(home: Home) -> error::Result<()> {
     let internal = |e: String| MitosisError::new(ErrorCode::Internal, format!("mcp: {e}"));
-    let service = Mitosis { home }.serve(rmcp::transport::stdio()).await.map_err(|e| internal(e.to_string()))?;
-    service.waiting().await.map_err(|e| internal(e.to_string()))?;
+    let service = Mitosis { home }
+        .serve(rmcp::transport::stdio())
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    service
+        .waiting()
+        .await
+        .map_err(|e| internal(e.to_string()))?;
     Ok(())
 }

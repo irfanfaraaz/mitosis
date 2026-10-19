@@ -28,7 +28,11 @@ fn internal(msg: impl Into<String>) -> MitosisError {
 
 /// Appends one line to `logs/daemon.log`; lifecycle work has no caller to report errors to.
 fn log(ctx: &Ctx, msg: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(ctx.home.logs_dir().join("daemon.log")) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ctx.home.logs_dir().join("daemon.log"))
+    {
         let _ = writeln!(f, "[{}] {msg}", now());
     }
 }
@@ -45,7 +49,8 @@ pub fn parent_alive(pid: i32, start_time: Option<u64>) -> bool {
 /// The postmaster named by `dir/postmaster.pid` when it is alive and really serves `dir`.
 fn live_postmaster(dir: &Path) -> Option<PostmasterInfo> {
     let info = read_postmaster_pid(dir).ok()??;
-    let same_dir = matches!((info.data_dir.canonicalize(), dir.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    let same_dir =
+        matches!((info.data_dir.canonicalize(), dir.canonicalize()), (Ok(a), Ok(b)) if a == b);
     // Same slack as `cluster::stop` uses for the pid file's own start time.
     let same_proc = process_start_time(info.pid).is_some_and(|t| t.abs_diff(info.start_time) <= 2);
     (same_dir && same_proc && is_alive(info.pid)).then_some(info)
@@ -61,7 +66,10 @@ fn clear_stale_pid(dir: &Path) {
 }
 
 fn in_flight(ctx: &Ctx, id: &str) -> bool {
-    ctx.in_flight.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id)
+    ctx.in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(id)
 }
 
 /// Destroys Ready clones whose TTL has run out; returns the ids destroyed.
@@ -69,7 +77,10 @@ pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
     let rows = ctx.store().list_clones()?;
     let mut reaped = Vec::new();
     // Creating/Starting rows belong to an in-flight create; the next pass gets them.
-    for row in rows.iter().filter(|r| r.status == CloneStatus::Ready && r.expires_at <= now) {
+    for row in rows
+        .iter()
+        .filter(|r| r.status == CloneStatus::Ready && r.expires_at <= now)
+    {
         if in_flight(ctx, &row.id) {
             continue;
         }
@@ -96,9 +107,19 @@ pub fn watch_parent(ctx: Arc<Ctx>, clone_id: String, parent_pid: i32) {
     };
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
-        Err(e) => return log(&ctx, &format!("parent watch for clone {clone_id}: no tokio runtime: {e}")),
+        Err(e) => {
+            return log(
+                &ctx,
+                &format!("parent watch for clone {clone_id}: no tokio runtime: {e}"),
+            )
+        }
     };
-    if !ctx.watching.lock().unwrap_or_else(|e| e.into_inner()).insert(clone_id.clone()) {
+    if !ctx
+        .watching
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(clone_id.clone())
+    {
         return;
     }
     let watch = Watch { ctx, id: clone_id };
@@ -118,13 +139,23 @@ struct Watch {
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        self.ctx.watching.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        self.ctx
+            .watching
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 
 /// False once the clone is gone or already being torn down, so its watcher can stop.
 fn still_watched(ctx: &Ctx, id: &str) -> bool {
-    if ctx.in_flight.lock().unwrap_or_else(|e| e.into_inner()).get(id) == Some(&InFlightOp::Destroy) {
+    if ctx
+        .in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        == Some(&InFlightOp::Destroy)
+    {
         return false;
     }
     match ctx.store().get_clone(id) {
@@ -161,12 +192,28 @@ fn wait_for_parent_exit(watch: &Watch, pid: i32, start_time: Option<u64>) -> boo
         Ok(None) => return true,
         Ok(Some(kq)) => Some(kq),
         Err(e) => {
-            log(&watch.ctx, &format!("parent watch for clone {}: kqueue failed ({e}); polling", watch.id));
+            log(
+                &watch.ctx,
+                &format!(
+                    "parent watch for clone {}: kqueue failed ({e}); polling",
+                    watch.id
+                ),
+            );
             None
         }
     };
-    let recheck = libc::timespec { tv_sec: WATCH_RECHECK.as_secs() as libc::time_t, tv_nsec: 0 };
-    let mut out = [KEvent::new(0, EventFilter::EVFILT_PROC, EvFlags::empty(), FilterFlag::empty(), 0, 0)];
+    let recheck = libc::timespec {
+        tv_sec: WATCH_RECHECK.as_secs() as libc::time_t,
+        tv_nsec: 0,
+    };
+    let mut out = [KEvent::new(
+        0,
+        EventFilter::EVFILT_PROC,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
     loop {
         // Also covers an exit just before registering, and a pid reused by another process.
         if !parent_alive(pid, start_time) {
@@ -180,7 +227,13 @@ fn wait_for_parent_exit(watch: &Watch, pid: i32, start_time: Option<u64>) -> boo
                 Ok(n) if n > 0 => return true,
                 Ok(_) | Err(Errno::EINTR) => {}
                 Err(e) => {
-                    log(&watch.ctx, &format!("parent watch for clone {}: kevent failed ({e}); polling", watch.id));
+                    log(
+                        &watch.ctx,
+                        &format!(
+                            "parent watch for clone {}: kevent failed ({e}); polling",
+                            watch.id
+                        ),
+                    );
                     kq = None;
                 }
             },
@@ -197,11 +250,17 @@ async fn destroy_after_parent_exit(watch: Watch) {
             Ok(_) => break,
             Err(e) if e.code == ErrorCode::CloneNotFound => break,
             // destroy refuses a clone whose create has not finished; a slow create can take a while.
-            Err(e) if e.code == ErrorCode::InvalidRequest && tokio::time::Instant::now() < deadline => {
+            Err(e)
+                if e.code == ErrorCode::InvalidRequest
+                    && tokio::time::Instant::now() < deadline =>
+            {
                 tokio::time::sleep(DESTROY_RETRY_DELAY).await
             }
             Err(e) => {
-                log(ctx, &format!("parent of clone {id} exited, but destroy failed: {e}"));
+                log(
+                    ctx,
+                    &format!("parent of clone {id} exited, but destroy failed: {e}"),
+                );
                 break;
             }
         }
@@ -213,7 +272,12 @@ async fn destroy_after_parent_exit(watch: Watch) {
 /// A failure on one entry is logged to `logs/daemon.log` and the rest still run.
 pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
     let mut report = GcReport::default();
-    let ids: Vec<String> = ctx.store().list_clones()?.into_iter().map(|r| r.id).collect();
+    let ids: Vec<String> = ctx
+        .store()
+        .list_clones()?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
     for id in ids {
         if in_flight(&ctx, &id) {
             continue;
@@ -231,24 +295,36 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
     Ok(report)
 }
 
-async fn reconcile_clone(ctx: &Arc<Ctx>, row: &CloneRow, now: i64, report: &mut GcReport) -> Result<()> {
+async fn reconcile_clone(
+    ctx: &Arc<Ctx>,
+    row: &CloneRow,
+    now: i64,
+    report: &mut GcReport,
+) -> Result<()> {
     let dir = ctx.home.clones_dir().join(&row.id);
     if !dir.exists() {
         // A destroy that started since the in-flight check owns it now.
-        let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else { return Ok(()) };
+        let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
+            return Ok(());
+        };
         stop_and_remove(ctx, row).await?; // also clears its socket folder and log
         report.records_dropped.push(row.id.clone());
         return Ok(());
     }
     let running = row.status == CloneStatus::Ready
         && live_postmaster(&dir).is_some_and(|pm| {
-            row.pg_pid == Some(pm.pid) && row.pg_start_time.is_some_and(|t| start_matches(pm.pid, t))
+            row.pg_pid == Some(pm.pid)
+                && row.pg_start_time.is_some_and(|t| start_matches(pm.pid, t))
         });
     let keep = running
         && row.expires_at > now
-        && row.parent_pid.is_none_or(|p| parent_alive(p, row.parent_start_time));
+        && row
+            .parent_pid
+            .is_none_or(|p| parent_alive(p, row.parent_start_time));
     if !keep {
-        let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else { return Ok(()) };
+        let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
+            return Ok(());
+        };
         clear_stale_pid(&dir);
         stop_and_remove(ctx, row).await?;
         report.destroyed.push(row.id.clone());
@@ -262,14 +338,24 @@ async fn reconcile_clone(ctx: &Arc<Ctx>, row: &CloneRow, now: i64, report: &mut 
 }
 
 fn entries(dir: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path())).collect()
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect()
 }
 
 fn remove_path(path: &Path) -> Result<()> {
-    let res = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+    let res = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
     match res {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(internal(format!("remove {}: {e}", path.display()))),
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            Err(internal(format!("remove {}: {e}", path.display())))
+        }
         _ => Ok(()),
     }
 }
@@ -280,8 +366,12 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     let timeout = ctx.config.stop_timeout;
     tokio::task::spawn_blocking(move || {
         if live_postmaster(&dir).is_some() {
-            let install = install
-                .ok_or_else(|| internal(format!("no Postgres install found to stop the server in {}", dir.display())))?;
+            let install = install.ok_or_else(|| {
+                internal(format!(
+                    "no Postgres install found to stop the server in {}",
+                    dir.display()
+                ))
+            })?;
             stop(&install, &dir, timeout)?;
         }
         remove_path(&dir)
@@ -301,13 +391,18 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
         // Store and in-flight set are read under the store lock, as `clones::reserve` writes them.
         let owned = {
             let store = ctx.store();
-            store.get_clone(&id).map(|r| r.is_some() || in_flight(ctx, &id))
+            store
+                .get_clone(&id)
+                .map(|r| r.is_some() || in_flight(ctx, &id))
         };
         match owned {
             Ok(false) => {}
             Ok(true) => continue,
             Err(e) => {
-                log(ctx, &format!("gc: orphan check for {}: {e}", path.display()));
+                log(
+                    ctx,
+                    &format!("gc: orphan check for {}: {e}", path.display()),
+                );
                 continue;
             }
         }
@@ -338,11 +433,15 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
 
     for (name, path) in entries(&ctx.home.templates_dir()) {
         // Leftovers are `.<name>.building-<ts>` and `.<name>.old-<ts>`; template names have no dots.
-        let Some(rest) = name.strip_prefix('.') else { continue };
+        let Some(rest) = name.strip_prefix('.') else {
+            continue;
+        };
         let leftover = match rest.split_once('.') {
-            Some((tpl, suffix)) if suffix.starts_with("building-") => {
-                !ctx.building.lock().unwrap_or_else(|e| e.into_inner()).contains(tpl)
-            }
+            Some((tpl, suffix)) if suffix.starts_with("building-") => !ctx
+                .building
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(tpl),
             Some((_, suffix)) => suffix.starts_with("old-"),
             None => false,
         };
@@ -360,8 +459,15 @@ mod tests {
 
     fn tmp_ctx() -> (tempfile::TempDir, Arc<Ctx>) {
         // Under /tmp: short paths, on APFS.
-        let tmp = tempfile::Builder::new().prefix("mt").tempdir_in("/tmp").unwrap();
-        let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), crate::ctx::Config::default()).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("mt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let ctx = Ctx::open(
+            Home::at(tmp.path().to_path_buf()),
+            crate::ctx::Config::default(),
+        )
+        .unwrap();
         (tmp, Arc::new(ctx))
     }
 
@@ -397,7 +503,10 @@ mod tests {
         let row = fake_clone(&ctx, "cbusy01", CloneStatus::Creating);
         let m = mark(&ctx, &row.id, InFlightOp::Create).unwrap();
         let report = reconcile(ctx.clone(), now()).await.unwrap();
-        assert!(report.destroyed.is_empty() && report.orphan_folders_removed.is_empty(), "{report:?}");
+        assert!(
+            report.destroyed.is_empty() && report.orphan_folders_removed.is_empty(),
+            "{report:?}"
+        );
         assert!(row.dir.is_dir() && ctx.store().get_clone(&row.id).unwrap().is_some());
 
         drop(m); // the create "crashed": now it is debris
@@ -413,15 +522,28 @@ mod tests {
         {
             let _m = mark(&ctx, &row.id, InFlightOp::Destroy).unwrap();
             assert!(reap_expired(&ctx, now() + 10_000).await.unwrap().is_empty());
-            assert_eq!(destroy(&ctx, &row.id).await.unwrap(), row.id, "a second destroy is a quiet success");
+            assert_eq!(
+                destroy(&ctx, &row.id).await.unwrap(),
+                row.id,
+                "a second destroy is a quiet success"
+            );
             assert!(row.dir.is_dir(), "the running destroy owns the folder");
         }
         {
             let _m = mark(&ctx, &row.id, InFlightOp::Create).unwrap();
-            assert_eq!(destroy(&ctx, &row.id).await.unwrap_err().code, ErrorCode::InvalidRequest);
+            assert_eq!(
+                destroy(&ctx, &row.id).await.unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
         }
-        assert!(mark(&ctx, &row.id, InFlightOp::Destroy).is_ok(), "marks are released on drop");
-        assert_eq!(reap_expired(&ctx, now() + 10_000).await.unwrap(), vec![row.id.clone()]);
+        assert!(
+            mark(&ctx, &row.id, InFlightOp::Destroy).is_ok(),
+            "marks are released on drop"
+        );
+        assert_eq!(
+            reap_expired(&ctx, now() + 10_000).await.unwrap(),
+            vec![row.id.clone()]
+        );
         assert!(!row.dir.exists());
     }
 
@@ -431,6 +553,9 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(reap_expired(ctx, 0));
         send(reconcile(arc.clone(), 0));
-        send(destroy_after_parent_exit(Watch { ctx: arc, id: String::new() }));
+        send(destroy_after_parent_exit(Watch {
+            ctx: arc,
+            id: String::new(),
+        }));
     }
 }

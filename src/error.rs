@@ -32,7 +32,11 @@ pub struct MitosisError {
 
 impl MitosisError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        MitosisError { code, message: message.into(), hint: None }
+        MitosisError {
+            code,
+            message: message.into(),
+            hint: None,
+        }
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -81,11 +85,17 @@ mod tests {
     fn display_with_and_without_hint() {
         let e = MitosisError::new(ErrorCode::Internal, "boom");
         assert_eq!(e.to_string(), "boom");
-        assert_eq!(e.with_hint("try again").to_string(), "boom\nhint: try again");
+        assert_eq!(
+            e.with_hint("try again").to_string(),
+            "boom\nhint: try again"
+        );
     }
 
     #[test]
     fn code_serializes_snake_case() {
-        assert_eq!(serde_json::to_string(&ErrorCode::NoMatchingPostgres).unwrap(), "\"no_matching_postgres\"");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::NoMatchingPostgres).unwrap(),
+            "\"no_matching_postgres\""
+        );
     }
 }

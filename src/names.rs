@@ -11,8 +11,11 @@ pub fn validate_name(kind: &str, name: &str) -> Result<()> {
     if ok {
         return Ok(());
     }
-    Err(MitosisError::new(ErrorCode::InvalidRequest, format!("invalid {kind} name {name:?}"))
-        .with_hint("use 1-63 characters: a-z, 0-9, '_' or '-', starting with a letter or digit"))
+    Err(MitosisError::new(
+        ErrorCode::InvalidRequest,
+        format!("invalid {kind} name {name:?}"),
+    )
+    .with_hint("use 1-63 characters: a-z, 0-9, '_' or '-', starting with a letter or digit"))
 }
 
 /// Positive integer followed by one unit: `s`, `m`, `h` or `d`.
@@ -75,7 +78,10 @@ mod tests {
         assert!(validate_name("clone", "feature-x_2").is_ok());
         assert!(validate_name("clone", &"a".repeat(63)).is_ok());
         for bad in ["", "../x", "a/b", "Main", "-x", &"a".repeat(64)] {
-            assert_eq!(validate_name("template", bad).unwrap_err().code, ErrorCode::InvalidRequest);
+            assert_eq!(
+                validate_name("template", bad).unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
         }
     }
 

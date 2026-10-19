@@ -42,10 +42,20 @@ pub fn initdb(install: &PgInstall, data_dir: &Path) -> Result<()> {
     let out = Command::new(install.bin("initdb"))
         .arg("-D")
         .arg(data_dir)
-        .args(["-U", "postgres", "-E", "UTF8", "--auth-local=trust", "--auth-host=scram-sha-256"])
+        .args([
+            "-U",
+            "postgres",
+            "-E",
+            "UTF8",
+            "--auth-local=trust",
+            "--auth-host=scram-sha-256",
+        ])
         .output()?;
     if !out.status.success() {
-        return Err(internal(format!("initdb failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+        return Err(internal(format!(
+            "initdb failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     Ok(())
 }
@@ -60,7 +70,10 @@ pub fn check_socket_path(socket_dir: &Path, port: u16) -> Result<()> {
     if len > MAX_SOCKET_PATH {
         return Err(MitosisError::new(
             ErrorCode::PostgresStartFailed,
-            format!("socket path too long ({len} bytes, max {MAX_SOCKET_PATH}): {}", path.display()),
+            format!(
+                "socket path too long ({len} bytes, max {MAX_SOCKET_PATH}): {}",
+                path.display()
+            ),
         )
         .with_hint("set MITOSIS_HOME to a shorter path"));
     }
@@ -74,19 +87,40 @@ pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Resul
         std::fs::create_dir_all(parent)?;
     }
     std::fs::create_dir_all(&opts.socket_dir)?;
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(&opts.log_file)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&opts.log_file)?;
     let log_err = log.try_clone()?;
 
-    let listen = if opts.listen_tcp { "listen_addresses=127.0.0.1" } else { "listen_addresses=" };
+    let listen = if opts.listen_tcp {
+        "listen_addresses=127.0.0.1"
+    } else {
+        "listen_addresses="
+    };
     let mut cmd = Command::new(install.bin("postgres"));
     cmd.arg("-D")
         .arg(data_dir)
         .args(["-p", &opts.port.to_string()])
         .arg("-k")
         .arg(&opts.socket_dir)
-        .args(["-c", listen, "-c", "shared_buffers=32MB", "-c", "max_connections=20"]);
+        .args([
+            "-c",
+            listen,
+            "-c",
+            "shared_buffers=32MB",
+            "-c",
+            "max_connections=20",
+        ]);
     if !opts.durable {
-        cmd.args(["-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]);
+        cmd.args([
+            "-c",
+            "fsync=off",
+            "-c",
+            "synchronous_commit=off",
+            "-c",
+            "full_page_writes=off",
+        ]);
     }
     let child = cmd
         .process_group(0)
@@ -94,11 +128,19 @@ pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Resul
         .stdout(log)
         .stderr(log_err)
         .spawn()
-        .map_err(|e| MitosisError::new(ErrorCode::PostgresStartFailed, format!("could not spawn postgres: {e}")))?;
+        .map_err(|e| {
+            MitosisError::new(
+                ErrorCode::PostgresStartFailed,
+                format!("could not spawn postgres: {e}"),
+            )
+        })?;
     let pid = child.id() as i32;
     drop(child); // dropping a std Child neither kills nor waits; has_exited reaps it later
-    // 0 only if the process died before we could look; wait_ready reports that failure.
-    Ok(RunningPg { pid, start_time: process_start_time(pid).unwrap_or(0) })
+                 // 0 only if the process died before we could look; wait_ready reports that failure.
+    Ok(RunningPg {
+        pid,
+        start_time: process_start_time(pid).unwrap_or(0),
+    })
 }
 
 /// Last `n` lines of the last 64 KiB of the file; empty if unreadable.
@@ -118,9 +160,15 @@ fn log_tail(path: &Path, n: usize) -> String {
 
 fn start_failure(log_tail: &str, port: u16) -> MitosisError {
     if log_tail.contains("could not bind") || log_tail.contains("Address already in use") {
-        MitosisError::new(ErrorCode::PortInUse, format!("port {port} is already in use"))
+        MitosisError::new(
+            ErrorCode::PortInUse,
+            format!("port {port} is already in use"),
+        )
     } else {
-        MitosisError::new(ErrorCode::PostgresStartFailed, format!("postgres exited during startup:\n{log_tail}"))
+        MitosisError::new(
+            ErrorCode::PostgresStartFailed,
+            format!("postgres exited during startup:\n{log_tail}"),
+        )
     }
 }
 
@@ -163,7 +211,13 @@ pub async fn wait_ready(
 
 /// Runs `sql` with psql over the socket. The SQL goes on stdin, never in argv, so `ps` cannot show
 /// secrets in it (e.g. `ALTER ROLE ... PASSWORD`).
-pub fn psql(install: &PgInstall, socket_dir: &Path, port: u16, db: &str, sql: &str) -> Result<String> {
+pub fn psql(
+    install: &PgInstall,
+    socket_dir: &Path,
+    port: u16,
+    db: &str,
+    sql: &str,
+) -> Result<String> {
     let mut child = Command::new(install.bin("psql"))
         .arg("-h")
         .arg(socket_dir)
@@ -179,9 +233,14 @@ pub fn psql(install: &PgInstall, socket_dir: &Path, port: u16, db: &str, sql: &s
     // Written from a thread so a large output cannot deadlock against a large input.
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes())); // stdin closes on drop
     let out = child.wait_with_output()?;
-    let written = writer.join().unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")));
+    let written = writer
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")));
     if !out.status.success() {
-        return Err(internal(format!("psql failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+        return Err(internal(format!(
+            "psql failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     written.map_err(|e| internal(format!("could not send SQL to psql: {e}")))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -203,7 +262,9 @@ fn wait_exited(pid: i32, wait: Duration) -> bool {
 /// Refuses (without signalling anything) when the pid now belongs to another process.
 /// Blocks (up to the timeout plus a few seconds): callers in async code use `spawn_blocking`.
 pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<()> {
-    let Some(info) = read_postmaster_pid(data_dir)? else { return Ok(()) };
+    let Some(info) = read_postmaster_pid(data_dir)? else {
+        return Ok(());
+    };
     if !is_alive(info.pid) {
         // Stale file from a crash or reboot.
         match std::fs::remove_file(data_dir.join("postmaster.pid")) {
@@ -242,7 +303,12 @@ pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<(
     }
     match res {
         Ok(()) | Err(Errno::ESRCH) => {}
-        Err(e) => return Err(internal(format!("could not kill postgres pid {}: {e}", info.pid))),
+        Err(e) => {
+            return Err(internal(format!(
+                "could not kill postgres pid {}: {e}",
+                info.pid
+            )))
+        }
     }
     if !wait_exited(info.pid, Duration::from_secs(5)) {
         return Err(internal(format!(
@@ -262,12 +328,36 @@ pub fn read_postmaster_pid(data_dir: &Path) -> Result<Option<PostmasterInfo>> {
         Err(e) => return Err(e.into()),
     };
     let lines: Vec<&str> = text.lines().collect();
-    let bad = || internal(format!("malformed postmaster.pid in {}", data_dir.display()));
-    let pid: i32 = lines.first().and_then(|l| l.trim().parse().ok()).filter(|p| *p > 1).ok_or_else(bad)?;
-    let dir = lines.get(1).map(|l| l.trim()).filter(|l| !l.is_empty()).ok_or_else(bad)?;
-    let start_time = lines.get(2).and_then(|l| l.trim().parse().ok()).ok_or_else(bad)?;
-    let port = lines.get(3).and_then(|l| l.trim().parse().ok()).ok_or_else(bad)?;
-    Ok(Some(PostmasterInfo { pid, data_dir: PathBuf::from(dir), port, start_time }))
+    let bad = || {
+        internal(format!(
+            "malformed postmaster.pid in {}",
+            data_dir.display()
+        ))
+    };
+    let pid: i32 = lines
+        .first()
+        .and_then(|l| l.trim().parse().ok())
+        .filter(|p| *p > 1)
+        .ok_or_else(bad)?;
+    let dir = lines
+        .get(1)
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .ok_or_else(bad)?;
+    let start_time = lines
+        .get(2)
+        .and_then(|l| l.trim().parse().ok())
+        .ok_or_else(bad)?;
+    let port = lines
+        .get(3)
+        .and_then(|l| l.trim().parse().ok())
+        .ok_or_else(bad)?;
+    Ok(Some(PostmasterInfo {
+        pid,
+        data_dir: PathBuf::from(dir),
+        port,
+        start_time,
+    }))
 }
 
 #[cfg(test)]
@@ -297,7 +387,11 @@ mod tests {
     #[test]
     fn stop_never_runs_pg_ctl_for_a_foreign_or_dead_pid() {
         // A bin dir with no pg_ctl: reaching pg_ctl would fail with an io error instead.
-        let install = PgInstall { bin_dir: PathBuf::from("/nonexistent"), major: 16, version: "16.0".into() };
+        let install = PgInstall {
+            bin_dir: PathBuf::from("/nonexistent"),
+            major: 16,
+            version: "16.0".into(),
+        };
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("postmaster.pid");
 
@@ -322,10 +416,21 @@ mod tests {
         std::fs::write(dir.path().join("postmaster.pid"), "oops\n").unwrap();
         assert!(read_postmaster_pid(dir.path()).is_err());
         for pid in ["0", "1", "-1"] {
-            std::fs::write(dir.path().join("postmaster.pid"), format!("{pid}\n/tmp/data\n1700000000\n54321\n")).unwrap();
-            assert!(read_postmaster_pid(dir.path()).is_err(), "pid {pid} must be rejected");
+            std::fs::write(
+                dir.path().join("postmaster.pid"),
+                format!("{pid}\n/tmp/data\n1700000000\n54321\n"),
+            )
+            .unwrap();
+            assert!(
+                read_postmaster_pid(dir.path()).is_err(),
+                "pid {pid} must be rejected"
+            );
         }
-        std::fs::write(dir.path().join("postmaster.pid"), "4242\n/tmp/data\nnotatime\n54321\n").unwrap();
+        std::fs::write(
+            dir.path().join("postmaster.pid"),
+            "4242\n/tmp/data\nnotatime\n54321\n",
+        )
+        .unwrap();
         assert!(read_postmaster_pid(dir.path()).is_err());
     }
 
@@ -351,13 +456,24 @@ mod tests {
         let long = PathBuf::from(format!("/s/{}", "a".repeat(86))); // 104
         let e = check_socket_path(&long, 54321).unwrap_err();
         assert_eq!(e.code, ErrorCode::PostgresStartFailed);
-        assert!(e.message.starts_with("socket path too long (104 bytes, max 103): /s/"), "{}", e.message);
-        assert_eq!(e.hint.as_deref(), Some("set MITOSIS_HOME to a shorter path"));
+        assert!(
+            e.message
+                .starts_with("socket path too long (104 bytes, max 103): /s/"),
+            "{}",
+            e.message
+        );
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("set MITOSIS_HOME to a shorter path")
+        );
     }
 
     #[test]
     fn start_failure_classifies_port_conflicts() {
-        let e = start_failure("FATAL:  could not bind IPv4 address \"127.0.0.1\": Address already in use", 54321);
+        let e = start_failure(
+            "FATAL:  could not bind IPv4 address \"127.0.0.1\": Address already in use",
+            54321,
+        );
         assert_eq!(e.code, ErrorCode::PortInUse);
         let e = start_failure("FATAL:  data directory has wrong ownership", 54321);
         assert_eq!(e.code, ErrorCode::PostgresStartFailed);

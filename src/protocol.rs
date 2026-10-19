@@ -7,7 +7,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemplateSource {
-    Url { url: String },
+    Url {
+        url: String,
+    },
     Seed {
         command: String,
         /// Folder the command runs in; the daemon's own cwd when absent.
@@ -127,7 +129,10 @@ mod tests {
 
     #[test]
     fn gc_is_tagged_only() {
-        assert_eq!(serde_json::to_string(&Request::Gc).unwrap(), r#"{"type":"gc"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::Gc).unwrap(),
+            r#"{"type":"gc"}"#
+        );
     }
 
     #[test]
@@ -161,7 +166,9 @@ mod tests {
     fn err_response_round_trip() {
         let env = ResponseEnvelope {
             v: PROTOCOL_VERSION,
-            result: Err(MitosisError::new(ErrorCode::CapReached, "too many").with_hint("destroy one")),
+            result: Err(
+                MitosisError::new(ErrorCode::CapReached, "too many").with_hint("destroy one")
+            ),
         };
         let line = serde_json::to_string(&env).unwrap();
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
@@ -174,7 +181,9 @@ mod tests {
         TemplateInfo {
             name: "main".into(),
             pg_major: 16,
-            source: TemplateSource::Url { url: "postgres://x".into() },
+            source: TemplateSource::Url {
+                url: "postgres://x".into(),
+            },
             database: "app".into(),
             size_bytes: 1024,
             built_at: 1_700_000_000,
@@ -202,31 +211,57 @@ mod tests {
     }
 
     fn round_trip(r: Response) {
-        let env = ResponseEnvelope { v: PROTOCOL_VERSION, result: Ok(r) };
+        let env = ResponseEnvelope {
+            v: PROTOCOL_VERSION,
+            result: Ok(r),
+        };
         let line = serde_json::to_string(&env).unwrap();
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
-        assert_eq!(serde_json::to_value(&env).unwrap(), serde_json::to_value(&back).unwrap());
+        assert_eq!(
+            serde_json::to_value(&env).unwrap(),
+            serde_json::to_value(&back).unwrap()
+        );
     }
 
     #[test]
     fn list_and_newtype_responses_round_trip() {
-        round_trip(Response::Templates { templates: vec![template_info()] });
-        round_trip(Response::Clones { clones: vec![clone_info()] });
+        round_trip(Response::Templates {
+            templates: vec![template_info()],
+        });
+        round_trip(Response::Clones {
+            clones: vec![clone_info()],
+        });
         round_trip(Response::TemplateBuilt(template_info()));
         round_trip(Response::CloneCreated(clone_info()));
     }
 
     #[test]
     fn seed_cwd_is_optional() {
-        let s: TemplateSource = serde_json::from_str(r#"{"kind":"seed","command":"make seed"}"#).unwrap();
-        assert_eq!(s, TemplateSource::Seed { command: "make seed".into(), cwd: None });
-        let s = TemplateSource::Seed { command: "x".into(), cwd: Some("/w".into()) };
-        assert_eq!(serde_json::from_str::<TemplateSource>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        let s: TemplateSource =
+            serde_json::from_str(r#"{"kind":"seed","command":"make seed"}"#).unwrap();
+        assert_eq!(
+            s,
+            TemplateSource::Seed {
+                command: "make seed".into(),
+                cwd: None
+            }
+        );
+        let s = TemplateSource::Seed {
+            command: "x".into(),
+            cwd: Some("/w".into()),
+        };
+        assert_eq!(
+            serde_json::from_str::<TemplateSource>(&serde_json::to_string(&s).unwrap()).unwrap(),
+            s
+        );
     }
 
     #[test]
     fn ok_response_round_trip() {
-        let env = ResponseEnvelope { v: PROTOCOL_VERSION, result: Ok(Response::Ok) };
+        let env = ResponseEnvelope {
+            v: PROTOCOL_VERSION,
+            result: Ok(Response::Ok),
+        };
         let line = serde_json::to_string(&env).unwrap();
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert!(matches!(back.result, Ok(Response::Ok)));

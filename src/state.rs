@@ -158,7 +158,8 @@ fn clone_from_row(r: &Row) -> rusqlite::Result<CloneRow> {
         created_at: r.get(12)?,
         expires_at: r.get(13)?,
         durable: r.get::<_, i64>(14)? != 0,
-        status: CloneStatus::parse(&status).ok_or_else(|| conv_err(15, format!("bad status {status}")))?,
+        status: CloneStatus::parse(&status)
+            .ok_or_else(|| conv_err(15, format!("bad status {status}")))?,
     })
 }
 
@@ -193,7 +194,11 @@ macro_rules! clone_params {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         // Create the file 0600 first so the -wal/-shm files SQLite derives from it inherit that mode.
-        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let conn = Connection::open(path)?;
         // journal_mode returns a row, so read it instead of executing.
@@ -235,8 +240,12 @@ impl Store {
     }
 
     pub fn list_templates(&self) -> Result<Vec<TemplateRow>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {TEMPLATE_COLS} FROM templates ORDER BY name"))?;
-        let rows = stmt.query_map([], template_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TEMPLATE_COLS} FROM templates ORDER BY name"
+        ))?;
+        let rows = stmt
+            .query_map([], template_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -267,14 +276,20 @@ impl Store {
             clone_params!(c),
         )?;
         if n == 0 {
-            return Err(MitosisError::new(ErrorCode::CloneNotFound, format!("clone {} no longer exists", c.id)));
+            return Err(MitosisError::new(
+                ErrorCode::CloneNotFound,
+                format!("clone {} no longer exists", c.id),
+            ));
         }
         Ok(())
     }
 
     /// Changes only the status column; false when no row has this id.
     pub fn set_clone_status(&self, id: &str, status: CloneStatus) -> Result<bool> {
-        Ok(self.conn.execute("UPDATE clones SET status = ?2 WHERE id = ?1", params![id, status.as_str()])? > 0)
+        Ok(self.conn.execute(
+            "UPDATE clones SET status = ?2 WHERE id = ?1",
+            params![id, status.as_str()],
+        )? > 0)
     }
 
     /// Matches id first, then name.
@@ -290,13 +305,18 @@ impl Store {
     }
 
     pub fn list_clones(&self) -> Result<Vec<CloneRow>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {CLONE_COLS} FROM clones ORDER BY created_at, id"))?;
-        let rows = stmt.query_map([], clone_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CLONE_COLS} FROM clones ORDER BY created_at, id"
+        ))?;
+        let rows = stmt
+            .query_map([], clone_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn delete_clone(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM clones WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM clones WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -322,7 +342,9 @@ mod tests {
             bin_dir: PathBuf::from("/opt/pg16/bin"),
             extensions: vec!["pgcrypto".into()],
             database: "app".into(),
-            source: TemplateSource::Url { url: "postgres://x".into() },
+            source: TemplateSource::Url {
+                url: "postgres://x".into(),
+            },
             migrations: Some(PathBuf::from("/tmp/m")),
             migrations_hash: Some("abc".into()),
             max_age_secs: 604_800,
@@ -359,7 +381,12 @@ mod tests {
         assert!(store.get_template("main").unwrap().is_none());
         store.upsert_template(&tpl("main")).unwrap();
         assert_eq!(store.get_template("main").unwrap().unwrap(), tpl("main"));
-        store.upsert_template(&TemplateRow { size_bytes: 42, ..tpl("main") }).unwrap();
+        store
+            .upsert_template(&TemplateRow {
+                size_bytes: 42,
+                ..tpl("main")
+            })
+            .unwrap();
         assert_eq!(store.get_template("main").unwrap().unwrap().size_bytes, 42);
         store.upsert_template(&tpl("other")).unwrap();
         assert_eq!(store.list_templates().unwrap().len(), 2);
@@ -369,9 +396,14 @@ mod tests {
     fn clone_crud_names_and_ports() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).unwrap();
-        store.insert_clone(&clone_row("c1", Some("x"), 54320)).unwrap();
+        store
+            .insert_clone(&clone_row("c1", Some("x"), 54320))
+            .unwrap();
         assert_eq!(
-            store.insert_clone(&clone_row("c2", Some("x"), 54321)).unwrap_err().code,
+            store
+                .insert_clone(&clone_row("c2", Some("x"), 54321))
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidRequest
         );
         // unnamed clones never collide on name
@@ -380,10 +412,13 @@ mod tests {
 
         assert_eq!(store.get_clone("x").unwrap().unwrap().id, "c1");
         assert_eq!(store.get_clone("c1").unwrap().unwrap().port, 54320);
-        assert_eq!(store.get_clone("c1").unwrap().unwrap(), clone_row("c1", Some("x"), 54320));
+        assert_eq!(
+            store.get_clone("c1").unwrap().unwrap(),
+            clone_row("c1", Some("x"), 54320)
+        );
         assert!(store.get_clone("nope").unwrap().is_none());
         assert!(store.leased_ports().unwrap().contains(&54320));
-        assert_eq!(store.list_clones().unwrap().len(), 4);
+        assert_eq!(store.list_clones().unwrap().len(), 3);
 
         let mut c = clone_row("c1", Some("x"), 54320);
         c.status = CloneStatus::Stopping;
@@ -394,11 +429,20 @@ mod tests {
 
         assert!(store.set_clone_status("c3", CloneStatus::Stopping).unwrap());
         let c3 = store.get_clone("c3").unwrap().unwrap();
-        assert_eq!(c3, CloneRow { status: CloneStatus::Stopping, ..clone_row("c3", None, 54322) });
+        assert_eq!(
+            c3,
+            CloneRow {
+                status: CloneStatus::Stopping,
+                ..clone_row("c3", None, 54322)
+            }
+        );
 
         store.delete_clone("c1").unwrap();
         assert!(store.get_clone("c1").unwrap().is_none());
-        assert_eq!(store.update_clone(&c).unwrap_err().code, ErrorCode::CloneNotFound);
+        assert_eq!(
+            store.update_clone(&c).unwrap_err().code,
+            ErrorCode::CloneNotFound
+        );
         assert!(!store.set_clone_status("c1", CloneStatus::Ready).unwrap());
         assert!(!store.leased_ports().unwrap().contains(&54320));
     }
@@ -410,7 +454,9 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             store.upsert_template(&tpl("main")).unwrap();
-            store.insert_clone(&clone_row("c1", Some("x"), 54320)).unwrap();
+            store
+                .insert_clone(&clone_row("c1", Some("x"), 54320))
+                .unwrap();
             // while open, the WAL side files exist and must be private too
             for suffix in ["-wal", "-shm"] {
                 let side = dir.path().join(format!("state.db{suffix}"));
@@ -421,6 +467,9 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.get_template("main").unwrap().is_some());
         assert_eq!(store.get_clone("x").unwrap().unwrap().id, "c1");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

@@ -29,11 +29,16 @@ pub async fn request(home: &Home, req: Request) -> Result<Response> {
         Ok(s) => s,
         Err(e) if not_listening(&e) => {
             ensure_daemon(home).await?;
-            UnixStream::connect(home.daemon_sock())
-                .await
-                .map_err(|e| unavailable(format!("connect to {}: {e}", home.daemon_sock().display())))?
+            UnixStream::connect(home.daemon_sock()).await.map_err(|e| {
+                unavailable(format!("connect to {}: {e}", home.daemon_sock().display()))
+            })?
         }
-        Err(e) => return Err(unavailable(format!("connect to {}: {e}", home.daemon_sock().display()))),
+        Err(e) => {
+            return Err(unavailable(format!(
+                "connect to {}: {e}",
+                home.daemon_sock().display()
+            )))
+        }
     };
     exchange(stream, req).await
 }
@@ -43,16 +48,26 @@ pub async fn request_if_running(home: &Home, req: Request) -> Result<Option<Resp
     match UnixStream::connect(home.daemon_sock()).await {
         Ok(s) => exchange(s, req).await.map(Some),
         Err(e) if not_listening(&e) => Ok(None),
-        Err(e) => Err(unavailable(format!("connect to {}: {e}", home.daemon_sock().display()))),
+        Err(e) => Err(unavailable(format!(
+            "connect to {}: {e}",
+            home.daemon_sock().display()
+        ))),
     }
 }
 
 async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
     let (rd, mut wr) = stream.into_split();
-    let mut line = serde_json::to_vec(&RequestEnvelope { v: PROTOCOL_VERSION, request: req })?;
+    let mut line = serde_json::to_vec(&RequestEnvelope {
+        v: PROTOCOL_VERSION,
+        request: req,
+    })?;
     line.push(b'\n');
-    wr.write_all(&line).await.map_err(|e| unavailable(format!("send request: {e}")))?;
-    wr.flush().await.map_err(|e| unavailable(format!("send request: {e}")))?;
+    wr.write_all(&line)
+        .await
+        .map_err(|e| unavailable(format!("send request: {e}")))?;
+    wr.flush()
+        .await
+        .map_err(|e| unavailable(format!("send request: {e}")))?;
 
     let mut buf = Vec::new();
     BufReader::new(rd)
@@ -61,23 +76,37 @@ async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
         .await
         .map_err(|e| unavailable(format!("read reply: {e}")))?;
     if buf.last() != Some(&b'\n') {
-        let msg = if buf.len() as u64 > MAX_REPLY { "daemon reply too large" } else { "daemon closed the connection" };
+        let msg = if buf.len() as u64 > MAX_REPLY {
+            "daemon reply too large"
+        } else {
+            "daemon closed the connection"
+        };
         return Err(unavailable(msg));
     }
     // Check the version before the shape: another version may not decode at all.
-    let value: serde_json::Value = serde_json::from_slice(&buf)
-        .map_err(|e| MitosisError::new(ErrorCode::ProtocolMismatch, format!("unreadable daemon reply: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&buf).map_err(|e| {
+        MitosisError::new(
+            ErrorCode::ProtocolMismatch,
+            format!("unreadable daemon reply: {e}"),
+        )
+    })?;
     let v = value.get("v").and_then(|v| v.as_u64());
     if v != Some(u64::from(PROTOCOL_VERSION)) {
         let theirs = v.map_or("unknown".to_string(), |v| v.to_string());
         return Err(MitosisError::new(
             ErrorCode::ProtocolMismatch,
-            format!("daemon speaks protocol {theirs}, this client speaks protocol {PROTOCOL_VERSION}"),
+            format!(
+                "daemon speaks protocol {theirs}, this client speaks protocol {PROTOCOL_VERSION}"
+            ),
         )
         .with_hint("restart the daemon: mitosis daemon stop"));
     }
-    let env: ResponseEnvelope = serde_json::from_value(value)
-        .map_err(|e| MitosisError::new(ErrorCode::ProtocolMismatch, format!("unreadable daemon reply: {e}")))?;
+    let env: ResponseEnvelope = serde_json::from_value(value).map_err(|e| {
+        MitosisError::new(
+            ErrorCode::ProtocolMismatch,
+            format!("unreadable daemon reply: {e}"),
+        )
+    })?;
     env.result
 }
 
@@ -85,7 +114,10 @@ async fn exchange(stream: UnixStream, req: Request) -> Result<Response> {
 pub async fn ensure_daemon(home: &Home) -> Result<()> {
     home.ensure_dirs()?;
     let log_path = home.logs_dir().join("daemon.log");
-    let log = OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("daemon")
         .env("MITOSIS_HOME", &home.root)
@@ -94,7 +126,11 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
         .stderr(log);
     // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
     unsafe {
-        cmd.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from));
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(std::io::Error::from)
+        });
     }
     let mut child = cmd.spawn()?;
 

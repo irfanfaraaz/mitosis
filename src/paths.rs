@@ -17,7 +17,9 @@ impl Home {
             MitosisError::new(ErrorCode::Internal, "HOME is not set")
                 .with_hint("set MITOSIS_HOME to choose where mitosis keeps its data")
         })?;
-        Ok(Home::at(PathBuf::from(home).join("Library/Application Support/mitosis")))
+        Ok(Home::at(
+            PathBuf::from(home).join("Library/Application Support/mitosis"),
+        ))
     }
 
     pub fn at(root: PathBuf) -> Home {
@@ -56,7 +58,12 @@ impl Home {
         std::fs::create_dir_all(&self.root)?;
         // Clone sockets under sockets/ use trust auth: keep other local users out.
         std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
-        for d in [self.templates_dir(), self.clones_dir(), self.sockets_dir(), self.logs_dir()] {
+        for d in [
+            self.templates_dir(),
+            self.clones_dir(),
+            self.sockets_dir(),
+            self.logs_dir(),
+        ] {
             std::fs::create_dir_all(d)?;
         }
         Ok(())
@@ -72,7 +79,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let h = Home::at(tmp.path().join("m"));
         h.ensure_dirs().unwrap();
-        for d in [h.templates_dir(), h.clones_dir(), h.sockets_dir(), h.logs_dir()] {
+        for d in [
+            h.templates_dir(),
+            h.clones_dir(),
+            h.sockets_dir(),
+            h.logs_dir(),
+        ] {
             assert!(d.is_dir());
         }
         assert_eq!(h.state_db(), h.root.join("state.db"));
@@ -87,6 +99,9 @@ mod tests {
         std::fs::create_dir(&h.root).unwrap();
         std::fs::set_permissions(&h.root, std::fs::Permissions::from_mode(0o755)).unwrap();
         h.ensure_dirs().unwrap();
-        assert_eq!(std::fs::metadata(&h.root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&h.root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

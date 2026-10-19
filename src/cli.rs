@@ -5,14 +5,20 @@ use crate::error::{ErrorCode, MitosisError, Result};
 use crate::mcp;
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
-use crate::protocol::{CloneCreateArgs, CloneInfo, Request, Response, TemplateInfo, TemplateInitArgs, TemplateSource};
+use crate::protocol::{
+    CloneCreateArgs, CloneInfo, Request, Response, TemplateInfo, TemplateInitArgs, TemplateSource,
+};
 use crate::templates::now;
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "mitosis", version, about = "Copy-on-write Postgres clones for AI agent tasks")]
+#[command(
+    name = "mitosis",
+    version,
+    about = "Copy-on-write Postgres clones for AI agent tasks"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -103,7 +109,10 @@ enum DaemonCmd {
 
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => return fail(&MitosisError::from(e)),
     };
@@ -122,8 +131,11 @@ fn fail(e: &MitosisError) -> ExitCode {
 }
 
 fn unexpected(r: Response) -> MitosisError {
-    MitosisError::new(ErrorCode::ProtocolMismatch, format!("unexpected daemon reply: {r:?}"))
-        .with_hint("restart the daemon: mitosis daemon stop")
+    MitosisError::new(
+        ErrorCode::ProtocolMismatch,
+        format!("unexpected daemon reply: {r:?}"),
+    )
+    .with_hint("restart the daemon: mitosis daemon stop")
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -137,20 +149,38 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Daemon { command: None } => daemon::run(home, Config::default()).await?,
         Cmd::Mcp => mcp::serve_stdio(home).await?,
         Cmd::Template { command } => template(&home, command).await?,
-        Cmd::Clone { template, name, ttl, durable, json } => {
+        Cmd::Clone {
+            template,
+            name,
+            ttl,
+            durable,
+            json,
+        } => {
             validate_name("template", &template)?;
             if let Some(n) = &name {
                 validate_name("clone", n)?;
             }
             let ttl_secs = parse_duration(&ttl)?.as_secs();
-            let args = CloneCreateArgs { template: template.clone(), name, ttl_secs, durable, parent_pid: None };
+            let args = CloneCreateArgs {
+                template: template.clone(),
+                name,
+                ttl_secs,
+                durable,
+                parent_pid: None,
+            };
             let info = match client::request(&home, Request::CloneCreate(args)).await? {
                 Response::CloneCreated(info) => info,
                 other => return Err(unexpected(other)),
             };
             // Warnings are best effort: the clone already exists.
-            if let Ok(Response::Templates { templates }) = client::request(&home, Request::TemplateList).await {
-                for w in templates.iter().filter(|t| t.name == template).flat_map(|t| &t.warnings) {
+            if let Ok(Response::Templates { templates }) =
+                client::request(&home, Request::TemplateList).await
+            {
+                for w in templates
+                    .iter()
+                    .filter(|t| t.name == template)
+                    .flat_map(|t| &t.warnings)
+                {
                     eprintln!("warning: {w}");
                 }
             }
@@ -171,10 +201,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_clones(&clones);
             }
         }
-        Cmd::Destroy { id_or_name } => match client::request(&home, Request::CloneDestroy { id_or_name }).await? {
-            Response::Destroyed { id } => println!("{id}"),
-            other => return Err(unexpected(other)),
-        },
+        Cmd::Destroy { id_or_name } => {
+            match client::request(&home, Request::CloneDestroy { id_or_name }).await? {
+                Response::Destroyed { id } => println!("{id}"),
+                other => return Err(unexpected(other)),
+            }
+        }
         Cmd::Gc => match client::request(&home, Request::Gc).await? {
             Response::Gc(r) => println!(
                 "adopted {}, destroyed {}, orphan folders removed {}, records dropped {}",
@@ -185,24 +217,29 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             ),
             other => return Err(unexpected(other)),
         },
-        Cmd::Daemon { command: Some(DaemonCmd::Status) } => {
-            match client::request_if_running(&home, Request::Status).await? {
-                None => {
-                    println!("daemon is not running");
-                    return Ok(ExitCode::FAILURE);
-                }
-                Some(Response::Status(s)) => {
-                    println!("daemon is running");
-                    println!("pid       {}", s.pid);
-                    println!("home      {}", s.home.display());
-                    println!("clones    {}", s.clones);
-                    println!("templates {}", s.templates);
-                    println!("uptime    {}", format_duration(Duration::from_secs(s.uptime_secs)));
-                }
-                Some(other) => return Err(unexpected(other)),
+        Cmd::Daemon {
+            command: Some(DaemonCmd::Status),
+        } => match client::request_if_running(&home, Request::Status).await? {
+            None => {
+                println!("daemon is not running");
+                return Ok(ExitCode::FAILURE);
             }
-        }
-        Cmd::Daemon { command: Some(DaemonCmd::Stop) } => {
+            Some(Response::Status(s)) => {
+                println!("daemon is running");
+                println!("pid       {}", s.pid);
+                println!("home      {}", s.home.display());
+                println!("clones    {}", s.clones);
+                println!("templates {}", s.templates);
+                println!(
+                    "uptime    {}",
+                    format_duration(Duration::from_secs(s.uptime_secs))
+                );
+            }
+            Some(other) => return Err(unexpected(other)),
+        },
+        Cmd::Daemon {
+            command: Some(DaemonCmd::Stop),
+        } => {
             match client::request_if_running(&home, Request::Shutdown).await? {
                 None => println!("daemon is not running"),
                 Some(Response::Ok) => {
@@ -222,9 +259,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
 async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
     match cmd {
-        TemplateCmd::Init { name, from_url, seed, database, migrations, max_age, pg_version } => {
+        TemplateCmd::Init {
+            name,
+            from_url,
+            seed,
+            database,
+            migrations,
+            max_age,
+            pg_version,
+        } => {
             validate_name("template", &name)?;
-            let max_age_secs = max_age.as_deref().map(parse_duration).transpose()?.map(|d| d.as_secs());
+            let max_age_secs = max_age
+                .as_deref()
+                .map(parse_duration)
+                .transpose()?
+                .map(|d| d.as_secs());
             let migrations = migrations
                 .map(|dir| {
                     std::fs::canonicalize(&dir).map_err(|e| {
@@ -237,10 +286,20 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 .transpose()?;
             let source = match (from_url, seed) {
                 (Some(url), _) => TemplateSource::Url { url },
-                (None, Some(command)) => TemplateSource::Seed { command, cwd: Some(std::env::current_dir()?) },
+                (None, Some(command)) => TemplateSource::Seed {
+                    command,
+                    cwd: Some(std::env::current_dir()?),
+                },
                 (None, None) => unreachable!("clap requires --from-url or --seed"),
             };
-            let args = TemplateInitArgs { name, source, database, migrations, max_age_secs, pg_major: pg_version };
+            let args = TemplateInitArgs {
+                name,
+                source,
+                database,
+                migrations,
+                max_age_secs,
+                pg_major: pg_version,
+            };
             match client::request(home, Request::TemplateInit(args)).await? {
                 Response::TemplateBuilt(t) => print_built(&t),
                 other => return Err(unexpected(other)),
@@ -288,7 +347,12 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
 }
 
 fn print_built(t: &TemplateInfo) {
-    println!("template {} built (Postgres {}, {})", t.name, t.pg_major, human_bytes(t.size_bytes));
+    println!(
+        "template {} built (Postgres {}, {})",
+        t.name,
+        t.pg_major,
+        human_bytes(t.size_bytes)
+    );
 }
 
 fn print_clones(clones: &[CloneInfo]) {
@@ -296,7 +360,16 @@ fn print_clones(clones: &[CloneInfo]) {
     let secs = |s: i64| format_duration(Duration::from_secs(u64::try_from(s).unwrap_or(0)));
     let opt_bytes = |b: Option<u64>| b.map_or("-".to_string(), human_bytes);
     print_table(
-        &["ID", "NAME", "TEMPLATE", "PORT", "AGE", "TTL LEFT", "RAM", "EXTRA DISK"],
+        &[
+            "ID",
+            "NAME",
+            "TEMPLATE",
+            "PORT",
+            "AGE",
+            "TTL LEFT",
+            "RAM",
+            "EXTRA DISK",
+        ],
         clones
             .iter()
             .map(|c| {
@@ -324,7 +397,11 @@ fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
         }
     }
     let line = |cells: Vec<&str>| {
-        let parts: Vec<String> = cells.iter().zip(&widths).map(|(c, w)| format!("{c:<w$}")).collect();
+        let parts: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
         println!("{}", parts.join("  ").trim_end());
     };
     line(headers.to_vec());
@@ -376,7 +453,16 @@ mod tests {
     #[test]
     fn init_needs_exactly_one_source() {
         assert!(Cli::try_parse_from(["mitosis", "template", "init"]).is_err());
-        assert!(Cli::try_parse_from(["mitosis", "template", "init", "--seed", "x", "--from-url", "y"]).is_err());
+        assert!(Cli::try_parse_from([
+            "mitosis",
+            "template",
+            "init",
+            "--seed",
+            "x",
+            "--from-url",
+            "y"
+        ])
+        .is_err());
         assert!(Cli::try_parse_from(["mitosis", "template", "init", "--seed", "x"]).is_ok());
     }
 }

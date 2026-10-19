@@ -18,7 +18,10 @@ pub struct TestEnv {
 
 /// A fresh home under /tmp: short enough for the ~103-byte Unix socket path limit, and on APFS.
 pub fn tmp_home() -> TempDir {
-    tempfile::Builder::new().prefix("mt").tempdir_in("/tmp").expect("create temp home")
+    tempfile::Builder::new()
+        .prefix("mt")
+        .tempdir_in("/tmp")
+        .expect("create temp home")
 }
 
 impl TestEnv {
@@ -31,18 +34,28 @@ impl TestEnv {
         // One of 250 random 20-port slices of 55000-59999, so parallel test binaries rarely meet.
         let slice = u16::from_str_radix(&random_hex(2), 16).unwrap() % 250;
         let lo = 55_000 + slice * 20;
-        let config = Config { port_range: lo..=lo + 19, ..Config::default() };
+        let config = Config {
+            port_range: lo..=lo + 19,
+            ..Config::default()
+        };
         let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), config).expect("open ctx");
-        Some(TestEnv { ctx: Arc::new(ctx), tmp })
+        Some(TestEnv {
+            ctx: Arc::new(ctx),
+            tmp,
+        })
     }
 }
 
 impl Drop for TestEnv {
     /// Stops any Postgres still running in this home so tests never leak servers.
     fn drop(&mut self) {
-        let Ok(install) = newest(&self.ctx.installs) else { return };
+        let Ok(install) = newest(&self.ctx.installs) else {
+            return;
+        };
         for parent in [self.ctx.home.clones_dir(), self.ctx.home.templates_dir()] {
-            let Ok(rd) = std::fs::read_dir(parent) else { continue };
+            let Ok(rd) = std::fs::read_dir(parent) else {
+                continue;
+            };
             for entry in rd.flatten() {
                 let _ = stop(install, &entry.path(), Duration::from_secs(5));
             }
@@ -59,7 +72,11 @@ pub fn psql_url(env: &TestEnv, url: &str, sql: &str) -> String {
         .env("PGCONNECT_TIMEOUT", "5")
         .output()
         .expect("run psql");
-    assert!(out.status.success(), "psql failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "psql failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -95,5 +112,7 @@ pub fn template_args(name: &str, source: TemplateSource) -> TemplateInitArgs {
 
 /// Builds template `name` from a seed running `sql`; panics on failure.
 pub async fn template(env: &TestEnv, name: &str, sql: &str) -> TemplateInfo {
-    templates::init(&env.ctx, template_args(name, seed(sql))).await.expect("build template")
+    templates::init(&env.ctx, template_args(name, seed(sql)))
+        .await
+        .expect("build template")
 }

@@ -66,7 +66,9 @@ impl Ctx {
                     home.clones_dir().display()
                 ),
             )
-            .with_hint("keep templates/ and clones/ on the same APFS volume (no symlinks to other disks)"));
+            .with_hint(
+                "keep templates/ and clones/ on the same APFS volume (no symlinks to other disks)",
+            ));
         }
         let store = Store::open(&home.state_db())?;
         Ok(Ctx {

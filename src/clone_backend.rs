@@ -17,7 +17,10 @@ pub struct ApfsBackend;
 
 fn cpath(p: &Path) -> Result<CString> {
     CString::new(p.as_os_str().as_bytes()).map_err(|_| {
-        MitosisError::new(ErrorCode::Internal, format!("path contains a NUL byte: {}", p.display()))
+        MitosisError::new(
+            ErrorCode::Internal,
+            format!("path contains a NUL byte: {}", p.display()),
+        )
     })
 }
 
@@ -82,13 +85,22 @@ pub fn free_space(path: &Path) -> Result<u64> {
 }
 
 /// Calls `f` for every regular file under `path` (or `path` itself), never following symlinks.
-fn walk_files(path: &Path, f: &mut dyn FnMut(&Path, &Metadata) -> Option<()>) -> Result<Option<()>> {
+fn walk_files(
+    path: &Path,
+    f: &mut dyn FnMut(&Path, &Metadata) -> Option<()>,
+) -> Result<Option<()>> {
     let md = std::fs::symlink_metadata(path).map_err(|e| {
-        MitosisError::new(ErrorCode::Internal, format!("lstat {}: {e}", path.display()))
+        MitosisError::new(
+            ErrorCode::Internal,
+            format!("lstat {}: {e}", path.display()),
+        )
     })?;
     if md.is_dir() {
         let rd = std::fs::read_dir(path).map_err(|e| {
-            MitosisError::new(ErrorCode::Internal, format!("read_dir {}: {e}", path.display()))
+            MitosisError::new(
+                ErrorCode::Internal,
+                format!("read_dir {}: {e}", path.display()),
+            )
         })?;
         for entry in rd {
             let entry = entry?;
@@ -124,7 +136,10 @@ fn file_private_size(path: &Path) -> Option<u64> {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     al.forkattr = libc::ATTR_CMNEXT_PRIVATESIZE; // extended common attrs travel in forkattr
-    let mut reply = Reply { length: 0, private_size: 0 };
+    let mut reply = Reply {
+        length: 0,
+        private_size: 0,
+    };
     let rc = unsafe {
         libc::getattrlist(
             c.as_ptr(),

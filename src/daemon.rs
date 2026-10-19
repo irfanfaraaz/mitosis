@@ -3,7 +3,9 @@ use crate::ctx::{Config, Ctx};
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::lifecycle;
 use crate::paths::Home;
-use crate::protocol::{DaemonStatus, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION};
+use crate::protocol::{
+    DaemonStatus, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
+};
 use crate::templates::{self, now};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -26,18 +28,31 @@ fn internal(msg: impl Into<String>) -> MitosisError {
 
 /// Appends one timestamped line to `logs/daemon.log`. Never pass clone URLs: they hold passwords.
 fn log(home: &Home, msg: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(home.logs_dir().join("daemon.log")) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.logs_dir().join("daemon.log"))
+    {
         let _ = writeln!(f, "[{}] {msg}", now());
     }
 }
 
 /// Takes the exclusive daemon lock; it is released when the returned value drops.
 fn take_lock(home: &Home) -> Result<Flock<File>> {
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(home.daemon_lock())?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(home.daemon_lock())?;
     Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| match errno {
         Errno::EWOULDBLOCK => MitosisError::new(
             ErrorCode::AlreadyRunning,
-            format!("a mitosis daemon is already running for {}", home.root.display()),
+            format!(
+                "a mitosis daemon is already running for {}",
+                home.root.display()
+            ),
         ),
         e => internal(format!("lock {}: {e}", home.daemon_lock().display())),
     })
@@ -62,9 +77,22 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
             .map_err(|e| internal(format!("background task failed: {e}")))??,
     );
     let home = ctx.home.clone();
-    log(&home, &format!("daemon started: pid {}, home {}", std::process::id(), home.root.display()));
+    log(
+        &home,
+        &format!(
+            "daemon started: pid {}, home {}",
+            std::process::id(),
+            home.root.display()
+        ),
+    );
     match lifecycle::reconcile(ctx.clone(), now()).await {
-        Ok(r) => log(&home, &format!("startup gc: {}", serde_json::to_string(&r).unwrap_or_default())),
+        Ok(r) => log(
+            &home,
+            &format!(
+                "startup gc: {}",
+                serde_json::to_string(&r).unwrap_or_default()
+            ),
+        ),
         Err(e) => log(&home, &format!("startup gc failed: {e}")),
     }
 
@@ -79,7 +107,11 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
 
     let (work_tx, mut work_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let shared = Shared { ctx: ctx.clone(), work: work_tx.downgrade(), shutdown: Arc::new(shutdown_tx) };
+    let shared = Shared {
+        ctx: ctx.clone(),
+        work: work_tx.downgrade(),
+        shutdown: Arc::new(shutdown_tx),
+    };
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
 
     loop {
@@ -101,8 +133,14 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     drop(work_tx);
     // recv() yields None once every running request has dropped its sender.
-    if tokio::time::timeout(ctx.config.ready_timeout, work_rx.recv()).await.is_err() {
-        log(&home, "shutdown: requests still running after the wait; stopping anyway");
+    if tokio::time::timeout(ctx.config.ready_timeout, work_rx.recv())
+        .await
+        .is_err()
+    {
+        log(
+            &home,
+            "shutdown: requests still running after the wait; stopping anyway",
+        );
     }
     log(&home, "daemon stopped");
     drop(lock);
@@ -117,9 +155,14 @@ async fn reaper(shared: Shared, mut shutdown: watch::Receiver<bool>) {
             _ = shutdown.changed() => return,
             _ = tick.tick() => {}
         }
-        let Some(_token) = shared.work.upgrade() else { return };
+        let Some(_token) = shared.work.upgrade() else {
+            return;
+        };
         match lifecycle::reap_expired(&shared.ctx, now()).await {
-            Ok(ids) if !ids.is_empty() => log(&shared.ctx.home, &format!("reaper destroyed: {}", ids.join(", "))),
+            Ok(ids) if !ids.is_empty() => log(
+                &shared.ctx.home,
+                &format!("reaper destroyed: {}", ids.join(", ")),
+            ),
             Ok(_) => {}
             Err(e) => log(&shared.ctx.home, &format!("reaper failed: {e}")),
         }
@@ -132,13 +175,23 @@ async fn connection(shared: Shared, stream: UnixStream) {
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match (&mut rd).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf).await {
+        match (&mut rd)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
         let too_large = buf.len() > MAX_LINE && buf.last() != Some(&b'\n');
         let (result, shutdown) = if too_large {
-            (Err(MitosisError::new(ErrorCode::InvalidRequest, "request too large")), false)
+            (
+                Err(MitosisError::new(
+                    ErrorCode::InvalidRequest,
+                    "request too large",
+                )),
+                false,
+            )
         } else {
             let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
@@ -152,7 +205,10 @@ async fn connection(shared: Shared, stream: UnixStream) {
                 Err(e) => (Err(e), false),
             }
         };
-        let mut out = match serde_json::to_vec(&ResponseEnvelope { v: PROTOCOL_VERSION, result }) {
+        let mut out = match serde_json::to_vec(&ResponseEnvelope {
+            v: PROTOCOL_VERSION,
+            result,
+        }) {
             Ok(out) => out,
             Err(e) => {
                 log(&shared.ctx.home, &format!("encode reply: {e}"));
@@ -172,10 +228,15 @@ async fn connection(shared: Shared, stream: UnixStream) {
 
 /// Reads one request line; the version is checked before the request shape.
 fn parse(line: &str) -> Result<Request> {
-    let invalid = |e: serde_json::Error| MitosisError::new(ErrorCode::InvalidRequest, format!("invalid request: {e}"));
+    let invalid = |e: serde_json::Error| {
+        MitosisError::new(ErrorCode::InvalidRequest, format!("invalid request: {e}"))
+    };
     let value: serde_json::Value = serde_json::from_str(line).map_err(invalid)?;
     let Some(v) = value.get("v").and_then(|v| v.as_u64()) else {
-        return Err(MitosisError::new(ErrorCode::InvalidRequest, "invalid request: missing protocol version \"v\""));
+        return Err(MitosisError::new(
+            ErrorCode::InvalidRequest,
+            "invalid request: missing protocol version \"v\"",
+        ));
     };
     if v != u64::from(PROTOCOL_VERSION) {
         return Err(MitosisError::new(
@@ -184,17 +245,25 @@ fn parse(line: &str) -> Result<Request> {
         )
         .with_hint("run the same mitosis version for the client and the daemon"));
     }
-    Ok(serde_json::from_value::<RequestEnvelope>(value).map_err(invalid)?.request)
+    Ok(serde_json::from_value::<RequestEnvelope>(value)
+        .map_err(invalid)?
+        .request)
 }
 
 /// Runs `req` on its own task so a dropped connection never cancels a half-done create or destroy.
 async fn dispatch(shared: &Shared, req: Request) -> Result<Response> {
     let token = shared.work.upgrade();
     if token.is_none() && !matches!(req, Request::Status | Request::Shutdown) {
-        return Err(MitosisError::new(ErrorCode::DaemonUnavailable, "the daemon is shutting down"));
+        return Err(MitosisError::new(
+            ErrorCode::DaemonUnavailable,
+            "the daemon is shutting down",
+        ));
     }
     // Only the type tag: the full request can hold a source URL with a password.
-    let kind = serde_json::to_value(&req).ok().and_then(|v| v["type"].as_str().map(String::from)).unwrap_or_default();
+    let kind = serde_json::to_value(&req)
+        .ok()
+        .and_then(|v| v["type"].as_str().map(String::from))
+        .unwrap_or_default();
     let ctx = shared.ctx.clone();
     let res = tokio::spawn(async move {
         let _token = token;
@@ -203,7 +272,10 @@ async fn dispatch(shared: &Shared, req: Request) -> Result<Response> {
     .await
     .unwrap_or_else(|e| Err(internal(format!("request task failed: {e}"))));
     if let Err(e) = &res {
-        log(&shared.ctx.home, &format!("{kind} failed: {:?}: {}", e.code, e.message));
+        log(
+            &shared.ctx.home,
+            &format!("{kind} failed: {:?}: {}", e.code, e.message),
+        );
     }
     res
 }
@@ -219,8 +291,12 @@ async fn blocking<T: Send + 'static>(ctx: &Arc<Ctx>, f: fn(&Ctx) -> Result<T>) -
 pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
     Ok(match req {
         Request::TemplateInit(args) => Response::TemplateBuilt(templates::init(&ctx, args).await?),
-        Request::TemplateRefresh { name } => Response::TemplateBuilt(templates::refresh(&ctx, &name).await?),
-        Request::TemplateList => Response::Templates { templates: blocking(&ctx, templates::list).await? },
+        Request::TemplateRefresh { name } => {
+            Response::TemplateBuilt(templates::refresh(&ctx, &name).await?)
+        }
+        Request::TemplateList => Response::Templates {
+            templates: blocking(&ctx, templates::list).await?,
+        },
         Request::CloneCreate(args) => {
             let parent = args.parent_pid;
             let info = clones::create(&ctx, args).await?;
@@ -229,8 +305,12 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
             }
             Response::CloneCreated(info)
         }
-        Request::CloneList => Response::Clones { clones: blocking(&ctx, clones::list).await? },
-        Request::CloneDestroy { id_or_name } => Response::Destroyed { id: clones::destroy(&ctx, &id_or_name).await? },
+        Request::CloneList => Response::Clones {
+            clones: blocking(&ctx, clones::list).await?,
+        },
+        Request::CloneDestroy { id_or_name } => Response::Destroyed {
+            id: clones::destroy(&ctx, &id_or_name).await?,
+        },
         Request::Gc => Response::Gc(lifecycle::reconcile(ctx.clone(), now()).await?),
         Request::Status => {
             let (clones, templates) = {

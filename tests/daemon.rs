@@ -5,7 +5,9 @@ use mitosis::ctx::Config;
 use mitosis::daemon::run;
 use mitosis::error::{ErrorCode, Result};
 use mitosis::paths::Home;
-use mitosis::protocol::{CloneCreateArgs, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION};
+use mitosis::protocol::{
+    CloneCreateArgs, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
+};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,7 +19,10 @@ const SEED: &str = "create table t(id int); insert into t values (1)";
 
 /// A short home under /tmp with no Postgres needed.
 fn short_home() -> tempfile::TempDir {
-    tempfile::Builder::new().prefix("md").tempdir_in("/tmp").unwrap()
+    tempfile::Builder::new()
+        .prefix("md")
+        .tempdir_in("/tmp")
+        .unwrap()
 }
 
 /// Starts the daemon on `root` and waits until its socket accepts connections.
@@ -26,7 +31,10 @@ async fn start(root: &Path, config: Config) -> JoinHandle<Result<()>> {
     let sock = root.join("daemon.sock");
     let deadline = Instant::now() + Duration::from_secs(30);
     while UnixStream::connect(&sock).await.is_err() {
-        assert!(!handle.is_finished(), "daemon exited before binding its socket");
+        assert!(
+            !handle.is_finished(),
+            "daemon exited before binding its socket"
+        );
         assert!(Instant::now() < deadline, "daemon socket never appeared");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -40,12 +48,21 @@ struct Conn {
 
 impl Conn {
     async fn open(root: &Path) -> Conn {
-        let (rd, wr) = UnixStream::connect(root.join("daemon.sock")).await.unwrap().into_split();
-        Conn { rd: BufReader::new(rd), wr }
+        let (rd, wr) = UnixStream::connect(root.join("daemon.sock"))
+            .await
+            .unwrap()
+            .into_split();
+        Conn {
+            rd: BufReader::new(rd),
+            wr,
+        }
     }
 
     async fn line(&mut self, line: &str) -> ResponseEnvelope {
-        self.wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        self.wr
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
         let mut reply = String::new();
         self.rd.read_line(&mut reply).await.unwrap();
         assert!(reply.ends_with('\n'), "reply is not one line: {reply:?}");
@@ -53,7 +70,14 @@ impl Conn {
     }
 
     async fn send(&mut self, request: Request) -> ResponseEnvelope {
-        self.line(&serde_json::to_string(&RequestEnvelope { v: PROTOCOL_VERSION, request }).unwrap()).await
+        self.line(
+            &serde_json::to_string(&RequestEnvelope {
+                v: PROTOCOL_VERSION,
+                request,
+            })
+            .unwrap(),
+        )
+        .await
     }
 
     async fn ok(&mut self, request: Request) -> Response {
@@ -63,8 +87,15 @@ impl Conn {
 
 /// Sends Shutdown and waits for `run` to return.
 async fn shutdown(root: &Path, handle: JoinHandle<Result<()>>) {
-    assert!(matches!(Conn::open(root).await.ok(Request::Shutdown).await, Response::Ok));
-    tokio::time::timeout(Duration::from_secs(30), handle).await.unwrap().unwrap().unwrap();
+    assert!(matches!(
+        Conn::open(root).await.ok(Request::Shutdown).await,
+        Response::Ok
+    ));
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(!root.join("daemon.sock").exists());
 }
 
@@ -95,10 +126,17 @@ async fn status_over_socket() {
 async fn protocol_mismatch() {
     let tmp = short_home();
     let handle = start(tmp.path(), Config::default()).await;
-    let reply = Conn::open(tmp.path()).await.line(r#"{"v":99,"request":{"type":"status"}}"#).await;
+    let reply = Conn::open(tmp.path())
+        .await
+        .line(r#"{"v":99,"request":{"type":"status"}}"#)
+        .await;
     let e = reply.result.unwrap_err();
     assert_eq!(e.code, ErrorCode::ProtocolMismatch);
-    assert!(e.message.contains("99") && e.message.contains('1'), "{}", e.message);
+    assert!(
+        e.message.contains("99") && e.message.contains('1'),
+        "{}",
+        e.message
+    );
     shutdown(tmp.path(), handle).await;
 }
 
@@ -107,9 +145,15 @@ async fn garbage_line() {
     let tmp = short_home();
     let handle = start(tmp.path(), Config::default()).await;
     let mut conn = Conn::open(tmp.path()).await;
-    assert_eq!(conn.line("not json").await.result.unwrap_err().code, ErrorCode::InvalidRequest);
+    assert_eq!(
+        conn.line("not json").await.result.unwrap_err().code,
+        ErrorCode::InvalidRequest
+    );
     // The same connection still serves the next line.
-    assert!(matches!(conn.ok(Request::Status).await, Response::Status(_)));
+    assert!(matches!(
+        conn.ok(Request::Status).await,
+        Response::Status(_)
+    ));
     shutdown(tmp.path(), handle).await;
 }
 
@@ -125,7 +169,13 @@ async fn second_daemon_refused() {
 }
 
 fn clone_args() -> CloneCreateArgs {
-    CloneCreateArgs { template: "main".into(), name: None, ttl_secs: 7200, durable: false, parent_pid: None }
+    CloneCreateArgs {
+        template: "main".into(),
+        name: None,
+        ttl_secs: 7200,
+        durable: false,
+        parent_pid: None,
+    }
 }
 
 async fn clones(conn: &mut Conn) -> usize {
@@ -143,7 +193,8 @@ async fn clone_roundtrip_over_socket() {
     let mut conn = Conn::open(root).await;
 
     assert!(matches!(
-        conn.ok(Request::TemplateInit(template_args("main", seed(SEED)))).await,
+        conn.ok(Request::TemplateInit(template_args("main", seed(SEED))))
+            .await,
         Response::TemplateBuilt(_)
     ));
     let info = match conn.ok(Request::CloneCreate(clone_args())).await {
@@ -152,7 +203,12 @@ async fn clone_roundtrip_over_socket() {
     };
     assert_eq!(psql_url(&env, &info.url, "select count(*) from t"), "1");
     assert_eq!(clones(&mut conn).await, 1);
-    match conn.ok(Request::CloneDestroy { id_or_name: info.id.clone() }).await {
+    match conn
+        .ok(Request::CloneDestroy {
+            id_or_name: info.id.clone(),
+        })
+        .await
+    {
         Response::Destroyed { id } => assert_eq!(id, info.id),
         other => panic!("wrong response: {other:?}"),
     }
@@ -166,7 +222,8 @@ async fn shutdown_keeps_clones() {
     let root = env.tmp.path();
     let handle = start(root, env.ctx.config.clone()).await;
     let mut conn = Conn::open(root).await;
-    conn.ok(Request::TemplateInit(template_args("main", seed(SEED)))).await;
+    conn.ok(Request::TemplateInit(template_args("main", seed(SEED))))
+        .await;
     let info = match conn.ok(Request::CloneCreate(clone_args())).await {
         Response::CloneCreated(info) => info,
         other => panic!("wrong response: {other:?}"),

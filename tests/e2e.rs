@@ -32,7 +32,11 @@ fn stderr(o: &Output) -> String {
 
 fn ok(home: &Path, args: &[&str]) -> String {
     let o = mitosis(home, args);
-    assert!(o.status.success(), "mitosis {args:?} failed: {}", stderr(&o));
+    assert!(
+        o.status.success(),
+        "mitosis {args:?} failed: {}",
+        stderr(&o)
+    );
     stdout(&o)
 }
 
@@ -65,7 +69,9 @@ fn cli_autostarts_daemon_and_clones() {
     let home = tmp.path();
     let _cleanup = Cleanup(home);
 
-    let TemplateSource::Seed { command, .. } = seed(SEED) else { unreachable!() };
+    let TemplateSource::Seed { command, .. } = seed(SEED) else {
+        unreachable!()
+    };
     ok(home, &["template", "init", "--seed", &command]);
 
     let out = ok(home, &["clone"]);
@@ -78,7 +84,13 @@ fn cli_autostarts_daemon_and_clones() {
     let psql = newest(&installs).unwrap().bin("psql");
     let q = Command::new(psql)
         .arg(url)
-        .args(["-v", "ON_ERROR_STOP=1", "-X", "-Atc", "select count(*) from t"])
+        .args([
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-X",
+            "-Atc",
+            "select count(*) from t",
+        ])
         .env("PGCONNECT_TIMEOUT", "5")
         .output()
         .unwrap();
@@ -124,23 +136,37 @@ async fn mcp_client(home: &Path) -> McpClient {
     let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mitosis")).configure(|c| {
         c.arg("mcp").env("MITOSIS_HOME", home);
     });
-    ().serve(TokioChildProcess::new(cmd).expect("spawn mitosis mcp")).await.expect("mcp handshake")
+    ().serve(TokioChildProcess::new(cmd).expect("spawn mitosis mcp"))
+        .await
+        .expect("mcp handshake")
 }
 
 async fn tool_names(client: &McpClient) -> Vec<String> {
-    let mut names: Vec<String> =
-        client.list_all_tools().await.expect("list tools").into_iter().map(|t| t.name.into_owned()).collect();
+    let mut names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .expect("list tools")
+        .into_iter()
+        .map(|t| t.name.into_owned())
+        .collect();
     names.sort();
     names
 }
 
 async fn call(client: &McpClient, tool: &'static str, args: serde_json::Value) -> CallToolResult {
     let args = args.as_object().cloned().unwrap_or_default();
-    client.call_tool(CallToolRequestParams::new(tool).with_arguments(args)).await.expect("call tool")
+    client
+        .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+        .await
+        .expect("call tool")
 }
 
 fn result_text(r: &CallToolResult) -> String {
-    r.content.iter().filter_map(|c| c.as_text()).map(|t| t.text.as_str()).collect()
+    r.content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -149,7 +175,10 @@ async fn mcp_lists_three_tools() {
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let client = mcp_client(home).await;
-    assert_eq!(tool_names(&client).await, ["clone_create", "clone_destroy", "clone_list"]);
+    assert_eq!(
+        tool_names(&client).await,
+        ["clone_create", "clone_destroy", "clone_list"]
+    );
     client.cancel().await.expect("stop mcp client");
 }
 
@@ -176,16 +205,22 @@ async fn mcp_tools_roundtrip() {
     let home = tmp.path();
     let _cleanup = Cleanup(home);
 
-    let TemplateSource::Seed { command, .. } = seed(SEED) else { unreachable!() };
+    let TemplateSource::Seed { command, .. } = seed(SEED) else {
+        unreachable!()
+    };
     ok(home, &["template", "init", "--seed", &command]);
 
     let client = mcp_client(home).await;
-    assert_eq!(tool_names(&client).await, ["clone_create", "clone_destroy", "clone_list"]);
+    assert_eq!(
+        tool_names(&client).await,
+        ["clone_create", "clone_destroy", "clone_list"]
+    );
 
     let r = call(&client, "clone_create", json!({})).await;
     let text = result_text(&r);
     assert_ne!(r.is_error, Some(true), "{text}");
-    let info: CloneInfo = serde_json::from_str(&text).expect("clone_create text parses as CloneInfo");
+    let info: CloneInfo =
+        serde_json::from_str(&text).expect("clone_create text parses as CloneInfo");
     let extra: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert!(extra["template_age"].is_string(), "{text}");
     assert!(extra["warnings"].is_array(), "{text}");
@@ -210,7 +245,10 @@ async fn mcp_tools_roundtrip() {
     client.cancel().await.expect("stop mcp client");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !list(home).is_empty() {
-        assert!(Instant::now() < deadline, "clone outlived its mcp session by 5 s");
+        assert!(
+            Instant::now() < deadline,
+            "clone outlived its mcp session by 5 s"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

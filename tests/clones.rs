@@ -12,7 +12,13 @@ use std::net::TcpListener;
 const SEED: &str = "create table t(id int); insert into t values (1)";
 
 fn args(template: &str) -> CloneCreateArgs {
-    CloneCreateArgs { template: template.into(), name: None, ttl_secs: 7200, durable: false, parent_pid: None }
+    CloneCreateArgs {
+        template: template.into(),
+        name: None,
+        ttl_secs: 7200,
+        durable: false,
+        parent_pid: None,
+    }
 }
 
 /// A second Ctx on the env's home (same store and templates) with a changed config.
@@ -31,7 +37,11 @@ async fn clone_is_isolated() {
     psql_url(&env, &a.url, "insert into t values (2)");
     assert_eq!(psql_url(&env, &a.url, "select count(*) from t"), "2");
     assert_eq!(psql_url(&env, &b.url, "select count(*) from t"), "1");
-    assert!(a.url.starts_with("postgres://postgres:") && a.url.contains("@127.0.0.1:") && a.url.ends_with("/app"));
+    assert!(
+        a.url.starts_with("postgres://postgres:")
+            && a.url.contains("@127.0.0.1:")
+            && a.url.ends_with("/app")
+    );
     assert_ne!(a.port, b.port);
 }
 
@@ -46,14 +56,25 @@ async fn destroy_frees_everything() {
     assert!(!env.ctx.home.sockets_dir().join(&a.id).exists());
     assert!(list(&env.ctx).unwrap().is_empty());
     assert!(TcpListener::bind(("127.0.0.1", a.port)).is_ok());
-    assert_eq!(destroy(&env.ctx, &a.id).await.unwrap_err().code, ErrorCode::CloneNotFound);
+    assert_eq!(
+        destroy(&env.ctx, &a.id).await.unwrap_err().code,
+        ErrorCode::CloneNotFound
+    );
 }
 
 #[tokio::test]
 async fn destroy_by_name() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
-    let a = create(&env.ctx, CloneCreateArgs { name: Some("feat-x".into()), ..args("main") }).await.unwrap();
+    let a = create(
+        &env.ctx,
+        CloneCreateArgs {
+            name: Some("feat-x".into()),
+            ..args("main")
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(a.name.as_deref(), Some("feat-x"));
     assert_eq!(destroy(&env.ctx, "feat-x").await.unwrap(), a.id);
 }
@@ -62,7 +83,10 @@ async fn destroy_by_name() {
 async fn duplicate_clone_name_rejected() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
-    let named = || CloneCreateArgs { name: Some("dup".into()), ..args("main") };
+    let named = || CloneCreateArgs {
+        name: Some("dup".into()),
+        ..args("main")
+    };
     create(&env.ctx, named()).await.unwrap();
     let e = create(&env.ctx, named()).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidRequest);
@@ -85,7 +109,10 @@ async fn low_disk() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
     let ctx = ctx_with(&env, |c| c.min_free_bytes = u64::MAX);
-    assert_eq!(create(&ctx, args("main")).await.unwrap_err().code, ErrorCode::LowDisk);
+    assert_eq!(
+        create(&ctx, args("main")).await.unwrap_err().code,
+        ErrorCode::LowDisk
+    );
     assert!(list(&ctx).unwrap().is_empty());
 }
 
@@ -125,7 +152,12 @@ async fn missing_extension() {
     let e = create(&env.ctx, args("main")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::MissingExtension);
     assert!(e.message.contains("no_such_ext"), "{}", e.message);
-    assert_eq!(std::fs::read_dir(env.ctx.home.clones_dir()).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_dir(env.ctx.home.clones_dir())
+            .unwrap()
+            .count(),
+        0
+    );
     assert!(list(&env.ctx).unwrap().is_empty());
 }
 
@@ -136,7 +168,10 @@ async fn unknown_template() {
     let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap();
     let e = create(&ctx, args("nope")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::TemplateNotFound);
-    assert_eq!(e.hint.as_deref(), Some("mitosis template init nope --seed \"…\""));
+    assert_eq!(
+        e.hint.as_deref(),
+        Some("mitosis template init nope --seed \"…\"")
+    );
 }
 
 #[tokio::test]
@@ -152,7 +187,15 @@ async fn refresh_while_clone_runs() {
 async fn durable_flag() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
-    let durable = create(&env.ctx, CloneCreateArgs { durable: true, ..args("main") }).await.unwrap();
+    let durable = create(
+        &env.ctx,
+        CloneCreateArgs {
+            durable: true,
+            ..args("main")
+        },
+    )
+    .await
+    .unwrap();
     let fast = create(&env.ctx, args("main")).await.unwrap();
     assert_eq!(psql_url(&env, &durable.url, "show fsync"), "on");
     assert_eq!(psql_url(&env, &fast.url, "show fsync"), "off");
