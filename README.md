@@ -15,7 +15,7 @@ Homebrew will come later.
 You also need a Postgres server install on the machine, for example:
 
 ```sh
-brew install postgresql@17
+brew install postgresql@18
 ```
 
 ## Quick start

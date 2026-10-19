@@ -17,7 +17,7 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 /// Start attempts when the chosen port turns out to be taken.
-const START_TRIES: usize = 3;
+pub(crate) const START_TRIES: usize = 3;
 
 fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)

@@ -99,6 +99,9 @@ pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Resul
         "listen_addresses="
     };
     let mut cmd = Command::new(install.bin("postgres"));
+    // macOS postgres aborts ("postmaster became multithreaded") when no locale is set in the
+    // environment; database collation comes from initdb, so C here changes nothing else.
+    cmd.env("LC_ALL", "C");
     cmd.arg("-D")
         .arg(data_dir)
         .args(["-p", &opts.port.to_string()])

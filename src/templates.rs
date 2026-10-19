@@ -1,4 +1,5 @@
 use crate::clone_backend::apparent_size;
+use crate::clones::START_TRIES;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::{random_hex, validate_name};
@@ -494,11 +495,16 @@ async fn run_seed(
 }
 
 /// Steps 3-6: initdb, start, create database, restore or seed, extensions, stop.
+// Named by port, not template name, to stay under the Unix socket path limit.
+fn build_socket_dir(ctx: &Ctx, port: u16) -> PathBuf {
+    ctx.home.sockets_dir().join(format!("build-{port}"))
+}
+
 async fn run_steps(
     ctx: &Ctx,
     install: &PgInstall,
     data_dir: &Path,
-    opts: &StartOptions,
+    opts: &mut StartOptions,
     database: &str,
     source: &TemplateSource,
 ) -> StepResult<Vec<String>> {
@@ -507,10 +513,31 @@ async fn run_steps(
         .await
         .map_err(at("initdb"))?;
 
-    let pg = start(install, data_dir, opts).map_err(at("start"))?;
-    wait_ready(install, &pg, opts, ctx.config.ready_timeout)
-        .await
-        .map_err(at("start"))?;
+    let mut tried = HashSet::new();
+    loop {
+        let pg = start(install, data_dir, opts).map_err(at("start"))?;
+        match wait_ready(install, &pg, opts, ctx.config.ready_timeout).await {
+            Ok(()) => break,
+            // Another process can take the picked port before postgres binds it.
+            Err(e) if e.code == ErrorCode::PortInUse && tried.len() + 1 < START_TRIES => {
+                let (i, d, t) = (
+                    install.clone(),
+                    data_dir.to_path_buf(),
+                    ctx.config.stop_timeout,
+                );
+                blocking(move || stop(&i, &d, t))
+                    .await
+                    .map_err(at("start"))?;
+                let _ = std::fs::remove_dir(&opts.socket_dir);
+                tried.insert(opts.port);
+                let leased = ctx.store().leased_ports().map_err(at("start"))?;
+                opts.port = pick_port(ctx.config.port_range.clone(), &leased, &tried)
+                    .map_err(at("start"))?;
+                opts.socket_dir = build_socket_dir(ctx, opts.port);
+            }
+            Err(e) => return Err(("start", e)),
+        }
+    }
 
     if database != "postgres" {
         let sql = format!("CREATE DATABASE {}", quote_ident(database));
@@ -660,16 +687,23 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     std::fs::File::create(&log)?; // truncate, so the error tail belongs to this build
     let leased = ctx.store().leased_ports()?;
     let port = pick_port(ctx.config.port_range.clone(), &leased, &HashSet::new())?;
-    let opts = StartOptions {
+    let mut opts = StartOptions {
         port,
-        // Named by port, not template name, to stay under the Unix socket path limit.
-        socket_dir: ctx.home.sockets_dir().join(format!("build-{port}")),
+        socket_dir: build_socket_dir(ctx, port),
         listen_tcp: true,
         durable: false,
         log_file: log.clone(),
     };
 
-    let result = run_steps(ctx, &install, &build_dir, &opts, &database, &args.source).await;
+    let result = run_steps(
+        ctx,
+        &install,
+        &build_dir,
+        &mut opts,
+        &database,
+        &args.source,
+    )
+    .await;
     let result = match result {
         Ok(ext) => Ok(ext),
         Err((step, e)) => Err(fail(ctx, &install, &build_dir, &log, &secrets, step, e).await),

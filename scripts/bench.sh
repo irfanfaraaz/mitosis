@@ -20,7 +20,7 @@ if ! command -v pgbench >/dev/null; then
     if [ -x "$d/pgbench" ]; then PATH="$d:$PATH"; break; fi
   done
 fi
-command -v pgbench >/dev/null || { echo "error: pgbench not found; put it on PATH (brew install postgresql@17)" >&2; exit 1; }
+command -v pgbench >/dev/null || { echo "error: pgbench not found; put it on PATH (brew install postgresql@18)" >&2; exit 1; }
 
 MITOSIS_HOME="$(mktemp -d "${TMPDIR:-/tmp}/mitosis-bench.XXXXXX")"
 BENCH_HOME="$MITOSIS_HOME"
