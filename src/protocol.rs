@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemplateSource {
     Url { url: String },
