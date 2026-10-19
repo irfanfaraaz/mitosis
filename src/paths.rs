@@ -1,4 +1,5 @@
 use crate::error::{ErrorCode, MitosisError, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -52,6 +53,9 @@ impl Home {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        // Clone sockets under sockets/ use trust auth: keep other local users out.
+        std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
         for d in [self.templates_dir(), self.clones_dir(), self.sockets_dir(), self.logs_dir()] {
             std::fs::create_dir_all(d)?;
         }
@@ -74,5 +78,15 @@ mod tests {
         assert_eq!(h.state_db(), h.root.join("state.db"));
         assert_eq!(h.daemon_sock(), h.root.join("daemon.sock"));
         assert_eq!(h.daemon_lock(), h.root.join("daemon.lock"));
+    }
+
+    #[test]
+    fn home_root_is_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Home::at(tmp.path().join("m"));
+        std::fs::create_dir(&h.root).unwrap();
+        std::fs::set_permissions(&h.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        h.ensure_dirs().unwrap();
+        assert_eq!(std::fs::metadata(&h.root).unwrap().permissions().mode() & 0o777, 0o700);
     }
 }
