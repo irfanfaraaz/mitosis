@@ -215,6 +215,12 @@ pub struct CloneInfo {
     /// The template generation this clone was made from.
     #[serde(default)]
     pub generation: u32,
+    /// The template was older than its max age when this clone was made.
+    #[serde(default)]
+    pub stale: bool,
+    /// A background refresh of the template was running (or was started) when this clone was made.
+    #[serde(default)]
+    pub refreshing: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -379,6 +385,8 @@ mod tests {
             rss_bytes: None,
             own_disk_bytes: Some(9),
             generation: 2,
+            stale: true,
+            refreshing: true,
         }
     }
 

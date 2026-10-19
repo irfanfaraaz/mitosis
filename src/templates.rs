@@ -8,8 +8,8 @@ use crate::pg::{
 };
 use crate::ports::pick_port;
 use crate::protocol::{
-    GenKind, GenerationInfo, MigrateCmd, TemplateInfo, TemplateInitArgs, TemplateSetArgs,
-    TemplateSettings, TemplateSource,
+    GenKind, GenerationInfo, MigrateCmd, RefreshMode, TemplateInfo, TemplateInitArgs,
+    TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::state::{GenerationRow, TemplateRow};
 use nix::sys::signal::{killpg, Signal};
@@ -109,6 +109,12 @@ fn not_found(name: &str) -> MitosisError {
 /// Rebuilds `name` from its recorded source. `path`, when given, replaces a seed's recorded `PATH`.
 pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
     validate_name("template", name)?;
+    let args = refresh_args(ctx, name, path)?;
+    build(ctx, args).await
+}
+
+/// The build arguments that rebuild `name` from its recorded source on the current major.
+fn refresh_args(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInitArgs> {
     let (row, cur) = ctx.store().current(name)?.ok_or_else(|| not_found(name))?;
     let source = match row.source {
         TemplateSource::Seed {
@@ -122,7 +128,7 @@ pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<Temp
         },
         url => url,
     };
-    let args = TemplateInitArgs {
+    Ok(TemplateInitArgs {
         name: row.name,
         source,
         database: Some(row.database),
@@ -130,8 +136,7 @@ pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<Temp
         max_age_secs: Some(row.max_age_secs),
         pg_major: Some(cur.pg_major),
         settings: TemplateSettings::default(),
-    };
-    build(ctx, args).await
+    })
 }
 
 /// Changes the settings of `name`; `resume` clears `paused`.
@@ -644,6 +649,82 @@ impl Drop for BuildGuard<'_> {
     }
 }
 
+/// Takes the build slot of `name` for a `background` build; false when a build of it runs.
+pub(crate) fn claim_build(ctx: &Ctx, name: &str) -> bool {
+    ctx.building
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string())
+}
+
+/// True while a build of `name` runs.
+pub(crate) fn is_building(ctx: &Ctx, name: &str) -> bool {
+    ctx.building
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(name)
+}
+
+/// A scheduled or stale-triggered build of `name` in `mode`. The caller took the build slot with
+/// `claim_build`; it is released when this returns. Never clears `paused`. The outcome is stored
+/// before the slot is released, so no new attempt can start without seeing it: `last_attempt_at`
+/// is set to the start; a failure stores its scrubbed message in `last_error`, a success clears it.
+pub(crate) async fn background(ctx: &Ctx, name: &str, mode: RefreshMode) {
+    // Adopts the slot the caller claimed.
+    let _guard = BuildGuard {
+        ctx,
+        name: name.to_string(),
+    };
+    let started = now();
+    let res = match mode {
+        RefreshMode::Full => match refresh_args(ctx, name, None) {
+            Ok(args) => build_held(ctx, args, false).await,
+            Err(e) => Err(e),
+        },
+        RefreshMode::Layered => layered_held(ctx, name, None, false).await,
+    };
+    let store = ctx.store();
+    let mut t = match store.get_template(name) {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            drop(store);
+            return crate::lifecycle::log(
+                ctx,
+                &format!("template {name}: read after refresh: {e}"),
+            );
+        }
+    };
+    t.last_attempt_at = Some(started);
+    t.last_error = res.as_ref().err().map(|e| {
+        // The first line names the failed step; the hint points at the full log.
+        let first = e.message.lines().next().unwrap_or_default();
+        let msg = match &e.hint {
+            Some(h) => format!("{first} ({h})"),
+            None => first.to_string(),
+        };
+        scrub(&msg, &source_secrets(&t.source))
+    });
+    let saved = store.update_template_settings(&t);
+    drop(store);
+    let mode = serde_json::to_value(mode)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    let outcome = match (&res, &t.last_error) {
+        (Ok(i), _) => format!("done, current generation {}", i.current_gen),
+        (Err(_), Some(m)) => format!("failed: {m}"),
+        (Err(_), None) => "failed".into(),
+    };
+    crate::lifecycle::log(
+        ctx,
+        &format!("background {mode} refresh of template {name}: {outcome}"),
+    );
+    if let Err(e) = saved {
+        crate::lifecycle::log(ctx, &format!("template {name}: store refresh result: {e}"));
+    }
+}
+
 type StepResult<T> = std::result::Result<T, (&'static str, MitosisError)>;
 
 fn at(step: &'static str) -> impl FnOnce(MitosisError) -> (&'static str, MitosisError) {
@@ -1074,10 +1155,16 @@ async fn fail(
     .with_hint(format!("full log: {}", log.display()))
 }
 
+/// A manual build of `args.name`: takes its build slot first.
 async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
+    let _guard = BuildGuard::take(ctx, &args.name)?;
+    build_held(ctx, args, true).await
+}
+
+/// `build` for a caller that holds the build slot. Only a `manual` build clears `paused`.
+async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<TemplateInfo> {
     let name = args.name.clone();
     let database = database_for(&args)?;
-    let _guard = BuildGuard::take(ctx, &name)?;
     let install = match args.pg_major {
         Some(major) => ctx.install_major(major).await?,
         None => ctx.newest_install().await?,
@@ -1131,7 +1218,9 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     t.migrations = args.migrations;
     t.max_age_secs = max_age_secs;
     apply_settings(&mut t, None, &args.settings)?;
-    resume_if_current(&mut t, gen);
+    if manual {
+        resume_if_current(&mut t, gen);
+    }
     store.update_template_settings(&t)?;
     drop(store);
     template_info(ctx, &name)
@@ -1151,6 +1240,16 @@ fn resume_if_current(t: &mut TemplateRow, gen: u32) {
 pub async fn layered(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
     validate_name("template", name)?;
     let _guard = BuildGuard::take(ctx, name)?;
+    layered_held(ctx, name, path, true).await
+}
+
+/// `layered` for a caller that holds the build slot. Only a `manual` build clears `paused`.
+async fn layered_held(
+    ctx: &Ctx,
+    name: &str,
+    path: Option<String>,
+    manual: bool,
+) -> Result<TemplateInfo> {
     let (t, cur) = ctx.store().current(name)?.ok_or_else(|| not_found(name))?;
     let Some(mut migrate) = t.migrate.clone() else {
         return Err(
@@ -1202,7 +1301,7 @@ pub async fn layered(ctx: &Ctx, name: &str, path: Option<String>) -> Result<Temp
         from_gen: Some(cur.gen),
     };
     commit_built(ctx, &install, &log, &secrets, row, cur.gen).await?;
-    {
+    if manual {
         let store = ctx.store();
         let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
         resume_if_current(&mut t, gen);
@@ -1367,7 +1466,7 @@ pub async fn commit_generation(
 /// Removes generations beyond the newest `keep`, never the current one: rows first, then the
 /// folders, renamed aside under the write guard (no clonefile reads them meanwhile) and deleted
 /// outside it. Failures are logged; gc removes what is left.
-async fn prune(ctx: &Ctx, name: &str) {
+pub(crate) async fn prune(ctx: &Ctx, name: &str) {
     let doomed = match prune_rows(ctx, name) {
         Ok(d) => d,
         Err(e) => {
@@ -1652,5 +1751,6 @@ mod tests {
         send(refresh(ctx, "main", None));
         send(rollback(ctx, "main", None));
         send(layered(ctx, "main", None));
+        send(background(ctx, "main", RefreshMode::Layered));
     }
 }

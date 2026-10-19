@@ -8,6 +8,7 @@ use mitosis::paths::Home;
 use mitosis::protocol::CloneCreateArgs;
 use mitosis::templates;
 use std::net::TcpListener;
+use std::sync::Arc;
 
 const SEED: &str = "create table t(id int); insert into t values (1)";
 
@@ -22,10 +23,10 @@ fn args(template: &str) -> CloneCreateArgs {
 }
 
 /// A second Ctx on the env's home (same store and templates) with a changed config.
-fn ctx_with(env: &TestEnv, f: impl FnOnce(&mut Config)) -> Ctx {
+fn ctx_with(env: &TestEnv, f: impl FnOnce(&mut Config)) -> Arc<Ctx> {
     let mut config = env.ctx.config();
     f(&mut config);
-    Ctx::open(Home::at(env.tmp.path().to_path_buf()), config).unwrap()
+    Arc::new(Ctx::open(Home::at(env.tmp.path().to_path_buf()), config).unwrap())
 }
 
 #[tokio::test]
@@ -170,7 +171,7 @@ async fn missing_extension() {
 async fn unknown_template() {
     // Fails before any Postgres work, so it runs without Postgres installed.
     let tmp = tmp_home();
-    let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap();
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
     let e = create(&ctx, args("nope")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::TemplateNotFound);
     assert_eq!(

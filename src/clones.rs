@@ -8,13 +8,15 @@ use crate::pg::{
 };
 use crate::ports::pick_port;
 use crate::proc_util::{is_alive, process_start_time, rss_bytes};
-use crate::protocol::{CloneCreateArgs, CloneInfo};
+use crate::protocol::{CloneCreateArgs, CloneInfo, OnStale};
+use crate::scheduler;
 use crate::state::{CloneRow, CloneStatus, GenerationRow, TemplateRow};
 use crate::templates::{age_secs, now};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Start attempts when the chosen port turns out to be taken.
 pub(crate) const START_TRIES: usize = 3;
@@ -59,10 +61,12 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         rss_bytes: None,
         own_disk_bytes: None,
         generation: row.generation,
+        stale: false,
+        refreshing: false,
     }
 }
 
-pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
+pub async fn create(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
         validate_name("clone", name)?;
     }
@@ -97,7 +101,10 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
     let (mut row, _in_flight) = reserve(ctx, &tpl, &gen, &args, parent_start_time)?;
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, swap, &gen, &mut row).await {
-        Ok(info) => Ok(info),
+        Ok(mut info) => {
+            (info.stale, info.refreshing) = stale_while_refresh(ctx, &tpl, &gen);
+            Ok(info)
+        }
         Err(e) => {
             // A failed cleanup leaves the row in Stopping for gc; the caller still gets the cause.
             if let Err(ce) = stop_and_remove(ctx, &row).await {
@@ -109,6 +116,23 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
             Err(e)
         }
     }
+}
+
+/// `(stale, refreshing)` for a clone just made from `gen`, the current generation of `tpl`. A stale
+/// template with `on_stale = refresh` that is not paused gets a background refresh in its
+/// `every_mode` unless one runs; `refreshing` is also true when a build was already running.
+fn stale_while_refresh(ctx: &Arc<Ctx>, tpl: &TemplateRow, gen: &GenerationRow) -> (bool, bool) {
+    let now = now();
+    if age_secs(gen.built_at, now) <= tpl.max_age_secs {
+        return (false, false);
+    }
+    if tpl.on_stale == OnStale::Warn {
+        return (true, false);
+    }
+    if !tpl.paused && scheduler::may_retry(tpl, now) {
+        scheduler::start(ctx, &tpl.name, tpl.every_mode);
+    }
+    (true, crate::templates::is_building(ctx, &tpl.name))
 }
 
 /// Marks a clone id as having a create or destroy running (see `Ctx::in_flight`) until dropped.
@@ -490,7 +514,7 @@ mod tests {
 
     // The daemon spawns these futures on a multi-thread runtime, so they must be Send.
     #[allow(dead_code)]
-    fn futures_are_send(ctx: &'static Ctx, args: CloneCreateArgs, row: &'static CloneRow) {
+    fn futures_are_send(ctx: &'static Arc<Ctx>, args: CloneCreateArgs, row: &'static CloneRow) {
         fn send<T: Send>(_: T) {}
         send(create(ctx, args));
         send(destroy(ctx, "x"));

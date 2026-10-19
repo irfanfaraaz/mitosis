@@ -330,7 +330,7 @@ async fn v01_store_is_migrated() {
         .unwrap();
     }
 
-    let ctx = Ctx::open(home, env.ctx.config()).unwrap();
+    let ctx = Arc::new(Ctx::open(home, env.ctx.config()).unwrap());
     {
         let store = ctx.store();
         assert_eq!(store.list_templates().unwrap().len(), 1);

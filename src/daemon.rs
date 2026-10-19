@@ -6,6 +6,7 @@ use crate::paths::Home;
 use crate::protocol::{
     DaemonStatus, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
 };
+use crate::scheduler;
 use crate::templates::{self, now};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -113,6 +114,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
         shutdown: Arc::new(shutdown_tx),
     };
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
+    scheduler::run(ctx.clone(), shutdown_rx.clone());
 
     loop {
         tokio::select! {
