@@ -1,0 +1,99 @@
+use crate::error::{ErrorCode, MitosisError, Result};
+use std::io::Read;
+use std::time::Duration;
+
+/// Template and clone names: `^[a-z0-9][a-z0-9_-]{0,62}$`.
+pub fn validate_name(kind: &str, name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = name.len() <= 63
+        && matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if ok {
+        return Ok(());
+    }
+    Err(MitosisError::new(ErrorCode::InvalidRequest, format!("invalid {kind} name {name:?}"))
+        .with_hint("use 1-63 characters: a-z, 0-9, '_' or '-', starting with a letter or digit"))
+}
+
+/// Positive integer followed by one unit: `s`, `m`, `h` or `d`.
+pub fn parse_duration(s: &str) -> Result<Duration> {
+    let bad = || {
+        MitosisError::new(ErrorCode::InvalidRequest, format!("invalid duration {s:?}"))
+            .with_hint("use a positive whole number plus a unit, like 90s, 30m, 2h or 1d")
+    };
+    let unit = s.chars().last().ok_or_else(bad)?;
+    let mult: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let digits = &s[..s.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    if n == 0 {
+        return Err(bad());
+    }
+    n.checked_mul(mult).map(Duration::from_secs).ok_or_else(bad)
+}
+
+/// Compound, largest unit first, zero parts skipped: 7200s -> "2h", 90s -> "1m30s", 0 -> "0s".
+pub fn format_duration(d: Duration) -> String {
+    let mut secs = d.as_secs();
+    if secs == 0 {
+        return "0s".into();
+    }
+    let mut out = String::new();
+    for (unit, size) in [('d', 86_400), ('h', 3600), ('m', 60), ('s', 1)] {
+        if secs >= size {
+            out.push_str(&format!("{}{unit}", secs / size));
+            secs %= size;
+        }
+    }
+    out
+}
+
+/// `bytes` random bytes from `/dev/urandom`, as lowercase hex.
+pub fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .expect("read /dev/urandom");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names() {
+        assert!(validate_name("template", "main").is_ok());
+        assert!(validate_name("clone", "feature-x_2").is_ok());
+        assert!(validate_name("clone", &"a".repeat(63)).is_ok());
+        for bad in ["", "../x", "a/b", "Main", "-x", &"a".repeat(64)] {
+            assert_eq!(validate_name("template", bad).unwrap_err().code, ErrorCode::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86_400));
+        for bad in ["", "0m", "abc", "5", "-1h", "+1h", "1.5h"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(format_duration(Duration::from_secs(7200)), "2h");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+    }
+
+    #[test]
+    fn hex() {
+        assert_eq!(random_hex(12).len(), 24);
+    }
+}

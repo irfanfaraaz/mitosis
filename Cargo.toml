@@ -1,0 +1,27 @@
+[package]
+name = "mitosis-db"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Copy-on-write Postgres clones for AI agent tasks on macOS APFS"
+
+[lib]
+name = "mitosis"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mitosis"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rmcp = { version = "3.5", features = ["server", "client", "macros", "transport-io", "transport-child-process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nix = { version = "0.31", features = ["signal", "process", "event", "fs"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
