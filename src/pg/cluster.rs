@@ -199,10 +199,27 @@ fn wait_exited(pid: i32, wait: Duration) -> bool {
     true
 }
 
-/// Stops the cluster; a cluster with no `postmaster.pid` is already stopped.
+/// Stops the cluster; a cluster with no `postmaster.pid`, or whose pid is gone, is already stopped.
+/// Refuses (without signalling anything) when the pid now belongs to another process.
 /// Blocks (up to the timeout plus a few seconds): callers in async code use `spawn_blocking`.
 pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<()> {
     let Some(info) = read_postmaster_pid(data_dir)? else { return Ok(()) };
+    if !is_alive(info.pid) {
+        // Stale file from a crash or reboot.
+        match std::fs::remove_file(data_dir.join("postmaster.pid")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => return Ok(()),
+        }
+    }
+    // Checked before pg_ctl, which signals whatever pid the file names (stale file + reused pid).
+    let ours = process_start_time(info.pid).is_some_and(|t| t.abs_diff(info.start_time) <= 2);
+    if !ours {
+        return Err(internal(format!(
+            "postmaster.pid at {} points to pid {} which is not this cluster's postgres",
+            data_dir.display(),
+            info.pid
+        )));
+    }
     let secs = timeout.as_secs().max(1);
     let out = Command::new(install.bin("pg_ctl"))
         .arg("stop")
@@ -215,16 +232,7 @@ pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<(
         return Ok(());
     }
     if !is_alive(info.pid) {
-        return Ok(()); // stale pid file
-    }
-    // Never signal a pid that is not this cluster's postmaster (stale file + reused pid).
-    let ours = process_start_time(info.pid).is_some_and(|t| t.abs_diff(info.start_time) <= 2);
-    if !ours {
-        return Err(internal(format!(
-            "postmaster.pid at {} points to pid {} which is not this cluster's postgres",
-            data_dir.display(),
-            info.pid
-        )));
+        return Ok(()); // exited while pg_ctl gave up
     }
     let pid = Pid::from_raw(info.pid);
     // The postmaster leads its own group when we started it; otherwise hit just the pid.
@@ -284,6 +292,27 @@ mod tests {
                 start_time: 1_700_000_000
             }
         );
+    }
+
+    #[test]
+    fn stop_never_runs_pg_ctl_for_a_foreign_or_dead_pid() {
+        // A bin dir with no pg_ctl: reaching pg_ctl would fail with an io error instead.
+        let install = PgInstall { bin_dir: PathBuf::from("/nonexistent"), major: 16, version: "16.0".into() };
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("postmaster.pid");
+
+        let me = std::process::id();
+        std::fs::write(&pid_file, format!("{me}\n/tmp/data\n1000\n54321\n")).unwrap();
+        let e = stop(&install, dir.path(), Duration::from_secs(1)).unwrap_err();
+        assert!(e.message.contains("not this cluster's postgres"), "{e}");
+        assert!(pid_file.exists() && is_alive(me as i32));
+
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(&pid_file, format!("{dead}\n/tmp/data\n1000\n54321\n")).unwrap();
+        stop(&install, dir.path(), Duration::from_secs(1)).unwrap();
+        assert!(!pid_file.exists(), "a stale pid file is removed");
     }
 
     #[test]

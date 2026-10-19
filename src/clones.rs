@@ -1,5 +1,5 @@
 use crate::clone_backend::{free_space, private_size};
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::{random_hex, validate_name};
 use crate::pg::{
@@ -93,20 +93,30 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
     }
 }
 
-/// Marks a clone id as being created (see `Ctx::creating`) until dropped.
-struct InFlight<'a> {
+/// Marks a clone id as having a create or destroy running (see `Ctx::in_flight`) until dropped.
+pub(crate) struct InFlight<'a> {
     ctx: &'a Ctx,
     id: String,
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.ctx.creating.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        self.ctx.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
     }
 }
 
+/// Marks `id` for `op`; when it already has an operation running, returns that operation.
+pub(crate) fn mark<'a>(ctx: &'a Ctx, id: &str, op: InFlightOp) -> std::result::Result<InFlight<'a>, InFlightOp> {
+    let mut map = ctx.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(running) = map.get(id) {
+        return Err(*running);
+    }
+    map.insert(id.to_string(), op);
+    Ok(InFlight { ctx, id: id.to_string() })
+}
+
 /// Steps 3-4 under one store lock, so concurrent creates cannot both pass the cap or share a port.
-/// The id joins `ctx.creating` under that same lock, so reconcile never sees the row without it.
+/// The id joins `ctx.in_flight` under that same lock, so reconcile never sees the row without it.
 fn reserve<'a>(
     ctx: &'a Ctx,
     tpl: &TemplateRow,
@@ -138,7 +148,8 @@ fn reserve<'a>(
     }
     let id = loop {
         let id = format!("c{}", random_hex(3));
-        if store.get_clone(&id)?.is_none() && !clones_dir.join(&id).exists() {
+        let marked = ctx.in_flight.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id);
+        if !marked && store.get_clone(&id)?.is_none() && !clones_dir.join(&id).exists() {
             break id;
         }
     };
@@ -163,8 +174,8 @@ fn reserve<'a>(
         status: CloneStatus::Creating,
     };
     store.insert_clone(&row)?;
-    ctx.creating.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone());
-    Ok((row, InFlight { ctx, id }))
+    let mark = mark(ctx, &id, InFlightOp::Create).map_err(|_| internal(format!("clone {id} is already in use")))?;
+    Ok((row, mark))
 }
 
 fn set_status(ctx: &Ctx, row: &mut CloneRow, status: CloneStatus) -> Result<()> {
@@ -226,10 +237,16 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
         MitosisError::new(ErrorCode::CloneNotFound, format!("clone {id_or_name} not found"))
             .with_hint("see existing clones with: mitosis clone list")
     })?;
+    let starting = || invalid(format!("clone {} is still starting; try again in a moment", row.id));
     // An in-flight create owns these; removing them under it would orphan its server.
     if matches!(row.status, CloneStatus::Creating | CloneStatus::Starting) {
-        return Err(invalid(format!("clone {} is still starting; try again in a moment", row.id)));
+        return Err(starting());
     }
+    let _mark = match mark(ctx, &row.id, InFlightOp::Destroy) {
+        Ok(m) => m,
+        Err(InFlightOp::Create) => return Err(starting()), // Ready, but create has not returned yet
+        Err(InFlightOp::Destroy) => return Ok(row.id),     // user, reaper or parent watcher got there first
+    };
     stop_and_remove(ctx, &row).await?;
     Ok(row.id)
 }

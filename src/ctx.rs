@@ -3,7 +3,7 @@ use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
 use crate::pg::{discover, PgInstall};
 use crate::state::Store;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -31,6 +31,12 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InFlightOp {
+    Create,
+    Destroy,
+}
+
 pub struct Ctx {
     pub home: Home,
     pub config: Config,
@@ -40,8 +46,8 @@ pub struct Ctx {
     pub started_at: Instant,
     /// Template names with a build in progress (one build per name at a time).
     pub(crate) building: Mutex<HashSet<String>>,
-    /// Clone ids whose `clones::create` is still running; reconcile leaves them alone.
-    pub(crate) creating: Mutex<HashSet<String>>,
+    /// Clone ids with a create or destroy still running; gc and the reaper leave them alone.
+    pub(crate) in_flight: Mutex<HashMap<String, InFlightOp>>,
     /// Clone ids with a parent-exit watcher thread, so gc does not start a second one.
     pub(crate) watching: Mutex<HashSet<String>>,
 }
@@ -71,7 +77,7 @@ impl Ctx {
             installs: discover(),
             started_at: Instant::now(),
             building: Mutex::new(HashSet::new()),
-            creating: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
             watching: Mutex::new(HashSet::new()),
         })
     }
