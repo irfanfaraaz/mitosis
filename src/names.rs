@@ -68,6 +68,20 @@ pub fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A fresh clone id: `c` plus 6 lowercase hex digits.
+pub(crate) fn new_clone_id() -> String {
+    format!("c{}", random_hex(3))
+}
+
+/// True for names `new_clone_id` can produce; gc touches nothing else in `clones/` and `sockets/`.
+pub(crate) fn is_clone_id(s: &str) -> bool {
+    s.len() == 7
+        && s.starts_with('c')
+        && s[1..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +115,17 @@ mod tests {
     #[test]
     fn hex() {
         assert_eq!(random_hex(12).len(), 24);
+    }
+
+    #[test]
+    fn clone_ids() {
+        for _ in 0..20 {
+            assert!(is_clone_id(&new_clone_id()));
+        }
+        for bad in [
+            "c12345", "c1234567", "cABCDEF", "x123456", "c12345g", "zzz", "build-1",
+        ] {
+            assert!(!is_clone_id(bad), "{bad}");
+        }
     }
 }

@@ -142,6 +142,8 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
             "shutdown: requests still running after the wait; stopping anyway",
         );
     }
+    // A seed or dump still running would be orphaned when this process exits.
+    templates::kill_build_groups(&ctx);
     log(&home, "daemon stopped");
     drop(lock);
     Ok(())
@@ -291,8 +293,8 @@ async fn blocking<T: Send + 'static>(ctx: &Arc<Ctx>, f: fn(&Ctx) -> Result<T>) -
 pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
     Ok(match req {
         Request::TemplateInit(args) => Response::TemplateBuilt(templates::init(&ctx, args).await?),
-        Request::TemplateRefresh { name } => {
-            Response::TemplateBuilt(templates::refresh(&ctx, &name).await?)
+        Request::TemplateRefresh { name, path } => {
+            Response::TemplateBuilt(templates::refresh(&ctx, &name, path).await?)
         }
         Request::TemplateList => Response::Templates {
             templates: blocking(&ctx, templates::list).await?,

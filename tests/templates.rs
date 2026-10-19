@@ -1,11 +1,12 @@
 mod common;
 
 use common::*;
+use mitosis::clones::create;
 use mitosis::ctx::{Config, Ctx};
 use mitosis::error::ErrorCode;
 use mitosis::paths::Home;
 use mitosis::pg::newest;
-use mitosis::protocol::TemplateSource;
+use mitosis::protocol::{CloneCreateArgs, TemplateSource};
 use mitosis::state::TemplateRow;
 use mitosis::templates::{self, hash_dir, info, redact_url};
 use std::path::PathBuf;
@@ -102,13 +103,14 @@ async fn seed_runs_in_its_cwd() {
     let work = env.tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
     std::fs::write(work.join("schema.sql"), "create table s(id int);").unwrap();
-    let psql = newest(&env.ctx.installs).unwrap().bin("psql");
+    let psql = newest(&env.ctx.installs()).unwrap().bin("psql");
     let source = TemplateSource::Seed {
         command: format!(
             "'{}' \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -X -f schema.sql",
             psql.display()
         ),
         cwd: Some(work),
+        path: None,
     };
     templates::init(&env.ctx, template_args("main", source))
         .await
@@ -116,11 +118,96 @@ async fn seed_runs_in_its_cwd() {
 }
 
 #[tokio::test]
+async fn seed_uses_the_callers_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(env) = TestEnv::new() else { return };
+    let bin = tempfile::tempdir().unwrap();
+    let tool = bin.path().join("mitosis-test-seed");
+    let psql = newest(&env.ctx.installs()).unwrap().bin("psql");
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -X -c 'create table p(id int)'\n",
+            psql.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let seed = |path: Option<String>| TemplateSource::Seed {
+        command: "mitosis-test-seed".into(),
+        cwd: None,
+        path,
+    };
+
+    templates::init(&env.ctx, template_args("main", seed(Some(path.clone()))))
+        .await
+        .unwrap();
+    // A refresh without a PATH reuses the recorded one.
+    templates::refresh(&env.ctx, "main", None).await.unwrap();
+    // Without it the tool is not found: the daemon's own PATH does not have it.
+    let e = templates::init(&env.ctx, template_args("other", seed(None)))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::TemplateBuildFailed);
+}
+
+#[tokio::test]
+async fn from_url_copies_data_without_leaking_the_password() {
+    let Some(env) = TestEnv::new() else { return };
+    template(
+        &env,
+        "a",
+        "create table t(id int); insert into t values (1), (2)",
+    )
+    .await;
+    let args = |template: &str| CloneCreateArgs {
+        template: template.into(),
+        name: None,
+        ttl_secs: 7200,
+        durable: false,
+        parent_pid: None,
+    };
+    let src = create(&env.ctx, args("a")).await.unwrap();
+    let password = src
+        .url
+        .strip_prefix("postgres://postgres:")
+        .and_then(|r| r.split_once('@'))
+        .map(|(pw, _)| pw.to_string())
+        .unwrap();
+    assert_eq!(password.len(), 32, "{password}");
+
+    let b = templates::init(
+        &env.ctx,
+        template_args(
+            "b",
+            TemplateSource::Url {
+                url: src.url.clone(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.database, "app");
+    let copy = create(&env.ctx, args("b")).await.unwrap();
+    assert_eq!(psql_url(&env, &copy.url, "select count(*) from t"), "2");
+
+    let listed = serde_json::to_string(&templates::list(&env.ctx).unwrap()).unwrap();
+    assert!(!listed.contains(&password), "{listed}");
+    assert!(
+        listed.contains("postgres://postgres:***@127.0.0.1"),
+        "{listed}"
+    );
+    let log = std::fs::read_to_string(env.ctx.home.logs_dir().join("template-b.log")).unwrap();
+    assert!(!log.contains(&password), "{log}");
+}
+
+#[tokio::test]
 async fn refresh_reuses_source_and_updates_built_at() {
     let Some(env) = TestEnv::new() else { return };
     let t1 = template(&env, "main", "create table t(id int)").await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let t2 = templates::refresh(&env.ctx, "main").await.unwrap();
+    let t2 = templates::refresh(&env.ctx, "main", None).await.unwrap();
     assert!(t2.built_at > t1.built_at);
     assert_eq!(t2.source, t1.source);
     assert_eq!(t2.database, t1.database);
@@ -138,7 +225,10 @@ async fn refresh_reuses_source_and_updates_built_at() {
 async fn refresh_unknown_template_not_found() {
     let (_tmp, ctx) = bare_ctx();
     assert_eq!(
-        templates::refresh(&ctx, "nope").await.unwrap_err().code,
+        templates::refresh(&ctx, "nope", None)
+            .await
+            .unwrap_err()
+            .code,
         ErrorCode::TemplateNotFound
     );
 }
@@ -178,6 +268,7 @@ fn stale_and_migrations_warnings() {
         TemplateSource::Seed {
             command: "true".into(),
             cwd: None,
+            path: None,
         },
     );
     r.built_at = now - 8 * 86_400;
@@ -217,6 +308,7 @@ async fn invalid_template_name_rejected() {
     let source = TemplateSource::Seed {
         command: "true".into(),
         cwd: None,
+        path: None,
     };
     let e = templates::init(&ctx, template_args("../x", source))
         .await

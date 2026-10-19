@@ -15,6 +15,8 @@ const MAX_REPLY: u64 = 16 << 20;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// After the child exits, a racing daemon that won the lock may still be about to bind.
 const EXIT_GRACE: Duration = Duration::from_millis(500);
+/// Exit status of `mitosis daemon` when another daemon already holds the home's lock.
+pub const EXIT_ALREADY_RUNNING: u8 = 3;
 const POLL: Duration = Duration::from_millis(50);
 
 fn unavailable(msg: impl Into<String>) -> MitosisError {
@@ -144,10 +146,15 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
         if UnixStream::connect(home.daemon_sock()).await.is_ok() {
             return Ok(());
         }
-        // An early exit is usually AlreadyRunning (another client won the lock): give it a moment to bind.
-        if !exited && matches!(child.try_wait(), Ok(Some(_))) {
-            exited = true;
-            deadline = deadline.min(Instant::now() + EXIT_GRACE);
+        if !exited {
+            if let Ok(Some(status)) = child.try_wait() {
+                exited = true;
+                // Lost the lock to another daemon, which may still be reconciling before it binds:
+                // keep the long wait. Any other exit is a failed start: give a racer a moment only.
+                if status.code() != Some(i32::from(EXIT_ALREADY_RUNNING)) {
+                    deadline = deadline.min(Instant::now() + EXIT_GRACE);
+                }
+            }
         }
         if Instant::now() >= deadline {
             let tail = crate::pg::cluster::log_tail(&log_path, 10);

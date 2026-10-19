@@ -236,19 +236,44 @@ async fn mcp_tools_roundtrip() {
     assert!(q.status.success(), "psql failed: {}", stderr(&q));
     assert_eq!(stdout(&q).trim(), "1");
 
+    // A clone made outside this session (here by the CLI) is neither listed nor destroyable.
+    let other: CloneInfo =
+        serde_json::from_str(&ok(home, &["clone", "--json", "--name", "not-mine"])).unwrap();
+
     let r = call(&client, "clone_list", json!({})).await;
     let clones: Vec<CloneInfo> = serde_json::from_str(&result_text(&r)).expect("clone_list parses");
     assert_eq!(clones.len(), 1);
     assert_eq!(clones[0].id, info.id);
 
+    for target in [other.id.as_str(), "not-mine"] {
+        let r = call(&client, "clone_destroy", json!({ "id": target })).await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("not created by this session"), "{text}");
+    }
+    assert!(list(home).iter().any(|c| c.id == other.id));
+
+    // clone_destroy removes this session's own clone.
+    let r = call(&client, "clone_create", json!({})).await;
+    let second: CloneInfo = serde_json::from_str(&result_text(&r)).expect("second clone");
+    let r = call(&client, "clone_destroy", json!({ "id": second.id })).await;
+    let text = result_text(&r);
+    assert_ne!(r.is_error, Some(true), "{text}");
+    assert_eq!(text, format!("destroyed {}", second.id));
+    assert!(!list(home).iter().any(|c| c.id == second.id));
+
     // Ending the session ends `mitosis mcp`, the clone's parent, so the daemon destroys the clone.
     client.cancel().await.expect("stop mcp client");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !list(home).is_empty() {
+    while list(home).iter().any(|c| c.id == info.id) {
         assert!(
             Instant::now() < deadline,
             "clone outlived its mcp session by 5 s"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(
+        list(home).iter().any(|c| c.id == other.id),
+        "the CLI clone is not tied to the session"
+    );
 }

@@ -49,7 +49,8 @@ impl TestEnv {
 impl Drop for TestEnv {
     /// Stops any Postgres still running in this home so tests never leak servers.
     fn drop(&mut self) {
-        let Ok(install) = newest(&self.ctx.installs) else {
+        let installs = self.ctx.installs();
+        let Ok(install) = newest(&installs) else {
             return;
         };
         for parent in [self.ctx.home.clones_dir(), self.ctx.home.templates_dir()] {
@@ -57,7 +58,7 @@ impl Drop for TestEnv {
                 continue;
             };
             for entry in rd.flatten() {
-                let _ = stop(install, &entry.path(), Duration::from_secs(5));
+                let _ = stop(install, &entry.path(), None, Duration::from_secs(5));
             }
         }
     }
@@ -65,7 +66,8 @@ impl Drop for TestEnv {
 
 /// Runs `sql` with the newest install's `psql` against `url`; returns trimmed unaligned output.
 pub fn psql_url(env: &TestEnv, url: &str, sql: &str) -> String {
-    let install = newest(&env.ctx.installs).expect("postgres installed");
+    let installs = env.ctx.installs();
+    let install = newest(&installs).expect("postgres installed");
     let out = Command::new(install.bin("psql"))
         .arg(url)
         .args(["-v", "ON_ERROR_STOP=1", "-X", "-Atc", sql])
@@ -96,6 +98,7 @@ pub fn seed(sql: &str) -> TemplateSource {
             sh_quote(sql)
         ),
         cwd: None,
+        path: None,
     }
 }
 

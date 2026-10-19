@@ -6,6 +6,8 @@ use std::fmt;
 pub enum ErrorCode {
     NotApfs,
     CrossVolume,
+    /// `MITOSIS_HOME` points at an existing folder that Mitosis did not create.
+    ForeignHome,
     NoMatchingPostgres,
     MissingExtension,
     TemplateNotFound,

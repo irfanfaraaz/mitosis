@@ -118,10 +118,13 @@ pub fn find_major(installs: &[PgInstall], major: u32) -> Result<&PgInstall> {
     })
 }
 
+/// Newest Postgres major; used only for the install hint when none is found.
+pub const LATEST_PG_MAJOR: u32 = 18;
+
 pub fn newest(installs: &[PgInstall]) -> Result<&PgInstall> {
     installs.first().ok_or_else(|| {
         MitosisError::new(ErrorCode::NoMatchingPostgres, "no Postgres found")
-            .with_hint("brew install postgresql")
+            .with_hint(format!("brew install postgresql@{LATEST_PG_MAJOR}"))
     })
 }
 
@@ -207,7 +210,7 @@ mod tests {
         assert_eq!(e.hint.as_deref(), Some("brew install postgresql@16"));
         let e = newest(&[]).unwrap_err();
         assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
-        assert_eq!(e.hint.as_deref(), Some("brew install postgresql"));
+        assert_eq!(e.hint.as_deref(), Some("brew install postgresql@18"));
     }
 
     #[test]

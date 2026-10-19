@@ -2,6 +2,8 @@ use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// True when a process with this pid exists (zombies count as alive).
@@ -42,6 +44,47 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
         )
     };
     (n == size).then_some(info.pbi_start_tvsec)
+}
+
+/// The current directory of `pid` as (device, inode, path), from `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
+/// Fails with ESRCH when the process is gone and EPERM when it belongs to another user.
+pub fn process_cwd(pid: i32) -> std::io::Result<(u64, u64, PathBuf)> {
+    if pid <= 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n != size {
+        let e = std::io::Error::last_os_error();
+        return Err(if e.raw_os_error() == Some(0) {
+            std::io::Error::other("short proc_pidinfo reply")
+        } else {
+            e
+        });
+    }
+    let cdir = &info.pvi_cdir;
+    let raw: Vec<u8> = cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|c| *c as u8)
+        .take_while(|b| *b != 0)
+        .collect();
+    let st = &cdir.vip_vi.vi_stat;
+    Ok((
+        u64::from(st.vst_dev),
+        st.vst_ino,
+        PathBuf::from(std::ffi::OsString::from_vec(raw)),
+    ))
 }
 
 /// Resident memory in bytes of `pid` plus its direct children. Postgres backends call
@@ -103,6 +146,24 @@ mod tests {
         assert_eq!(sum_rss(ps, 502), Some(40 * 1024));
         assert_eq!(sum_rss(ps, 999), None);
         assert!(rss_bytes(std::process::id() as i32).unwrap() > 0);
+    }
+
+    #[test]
+    fn cwd_of_a_child() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let (dev, ino, path) = process_cwd(child.id() as i32).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        assert_eq!((dev, ino), (meta.dev(), meta.ino()));
+        assert!(path.ends_with(dir.path().file_name().unwrap()), "{path:?}");
+        assert!(process_cwd(i32::MAX).is_err());
     }
 
     #[test]

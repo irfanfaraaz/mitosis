@@ -4,7 +4,7 @@ use crate::client;
 use crate::error::{self, ErrorCode, MitosisError};
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
-use crate::protocol::{CloneCreateArgs, Request, Response};
+use crate::protocol::{CloneCreateArgs, CloneInfo, Request, Response};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
@@ -60,39 +60,87 @@ impl Mitosis {
         text(self.create(p).await)
     }
 
-    #[tool(description = "List all Mitosis clones as JSON.")]
+    #[tool(description = "List the clones this session created, as JSON.")]
     async fn clone_list(&self) -> Result<String, String> {
         text(
             async {
-                match client::request(&self.home, Request::CloneList).await? {
-                    Response::Clones { clones } => Ok(serde_json::to_string_pretty(&clones)?),
-                    _ => Err(unexpected()),
-                }
+                let mine: Vec<CloneInfo> = self
+                    .all_clones()
+                    .await?
+                    .into_iter()
+                    .filter(is_mine)
+                    .collect();
+                Ok(serde_json::to_string_pretty(&mine)?)
             }
             .await,
         )
     }
 
-    #[tool(description = "Destroy a clone by id or name.")]
+    #[tool(description = "Destroy a clone this session created, by id or name.")]
     async fn clone_destroy(
         &self,
         Parameters(p): Parameters<CloneDestroyParams>,
     ) -> Result<String, String> {
-        text(
-            async {
-                match client::request(&self.home, Request::CloneDestroy { id_or_name: p.id })
-                    .await?
-                {
-                    Response::Destroyed { id } => Ok(format!("destroyed {id}")),
-                    _ => Err(unexpected()),
-                }
-            }
-            .await,
-        )
+        text(self.destroy(p.id).await)
     }
 }
 
+/// Clones made through this MCP server name this process as their parent.
+fn is_mine(c: &CloneInfo) -> bool {
+    c.parent_pid == Some(std::process::id() as i32)
+}
+
+/// The clone `id_or_name` names, matched as the daemon does: an id wins over a name.
+fn find<'a>(clones: &'a [CloneInfo], id_or_name: &str) -> Option<&'a CloneInfo> {
+    clones.iter().find(|c| c.id == id_or_name).or_else(|| {
+        clones
+            .iter()
+            .find(|c| c.name.as_deref() == Some(id_or_name))
+    })
+}
+
 impl Mitosis {
+    async fn all_clones(&self) -> error::Result<Vec<CloneInfo>> {
+        match client::request(&self.home, Request::CloneList).await? {
+            Response::Clones { clones } => Ok(clones),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Destroys a clone of this session; another session's clone (or a CLI one) is refused.
+    async fn destroy(&self, id_or_name: String) -> error::Result<String> {
+        let clones = self.all_clones().await?;
+        let c = find(&clones, &id_or_name).ok_or_else(|| {
+            MitosisError::new(
+                ErrorCode::CloneNotFound,
+                format!("clone {id_or_name} not found"),
+            )
+            .with_hint("see this session's clones with the clone_list tool")
+        })?;
+        if !is_mine(c) {
+            return Err(MitosisError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "clone {} was not created by this session; it may be another agent's database",
+                    c.id
+                ),
+            )
+            .with_hint("this tool only destroys clones from clone_create in this session; a person can run `mitosis destroy <id>`"));
+        }
+        // By id, so a name reused meanwhile cannot redirect the destroy.
+        match client::request(
+            &self.home,
+            Request::CloneDestroy {
+                id_or_name: c.id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::Destroyed { id } => Ok(format!("destroyed {id}")),
+            _ => Err(unexpected()),
+        }
+    }
+
     async fn create(&self, p: CloneCreateParams) -> error::Result<String> {
         let template = p.template.unwrap_or_else(|| "main".into());
         validate_name("template", &template)?;
@@ -135,7 +183,7 @@ impl Mitosis {
 
 #[tool_handler(
     name = "mitosis",
-    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL; clone_list shows all clones; clone_destroy deletes one. Clones are deleted when this session ends or their TTL passes."
+    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL; clone_list shows the clones this session made; clone_destroy deletes one of them. Clones are deleted when this session ends or their TTL passes."
 )]
 impl ServerHandler for Mitosis {}
 

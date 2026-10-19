@@ -125,11 +125,13 @@ async fn reconcile_adopts_live_clone() {
 async fn reconcile_removes_orphan_folder() {
     let tmp = tmp_home();
     let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
-    let zzz = ctx.home.clones_dir().join("zzz");
-    std::fs::create_dir(&zzz).unwrap();
-    std::fs::write(zzz.join("file"), "x").unwrap();
+    let orphan = ctx.home.clones_dir().join("cdead01");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("file"), "x").unwrap();
     let sock = ctx.home.sockets_dir().join("cdead00");
     std::fs::create_dir(&sock).unwrap();
+    let build_sock = ctx.home.sockets_dir().join("build-54321");
+    std::fs::create_dir(&build_sock).unwrap();
     let building = ctx.home.templates_dir().join(".main.building-1");
     let old = ctx.home.templates_dir().join(".main.old-1");
     let template = ctx.home.templates_dir().join("main");
@@ -138,7 +140,7 @@ async fn reconcile_removes_orphan_folder() {
     }
 
     let report = reconcile(ctx.clone(), now()).await.unwrap();
-    for p in [&zzz, &sock, &building, &old] {
+    for p in [&orphan, &sock, &build_sock, &building, &old] {
         assert!(
             report.orphan_folders_removed.contains(p),
             "{} not reported: {:?}",
@@ -152,7 +154,64 @@ async fn reconcile_removes_orphan_folder() {
         report.adopted.is_empty()
             && report.destroyed.is_empty()
             && report.records_dropped.is_empty()
+            && report.failed.is_empty()
     );
+}
+
+/// Needs no Postgres. gc only removes names Mitosis creates; a user's files survive.
+#[tokio::test]
+async fn gc_leaves_foreign_entries_alone() {
+    let tmp = tmp_home();
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let repo = ctx.home.clones_dir().join("my-repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join("README.md"), "mine").unwrap();
+    let file = ctx.home.clones_dir().join("notes.txt");
+    std::fs::write(&file, "mine").unwrap();
+    let sock_file = ctx.home.sockets_dir().join("other.sock");
+    std::fs::write(&sock_file, "").unwrap();
+    let hidden = ctx.home.templates_dir().join(".main.backup-1");
+    std::fs::create_dir(&hidden).unwrap();
+
+    let report = reconcile(ctx.clone(), now()).await.unwrap();
+    assert!(report.orphan_folders_removed.is_empty(), "{report:?}");
+    for p in [&repo.join("README.md"), &file, &sock_file, &hidden] {
+        assert!(p.exists(), "{} was removed", p.display());
+    }
+    let log = std::fs::read_to_string(ctx.home.logs_dir().join("daemon.log")).unwrap();
+    assert!(log.contains("my-repo") && log.contains("left"), "{log}");
+}
+
+/// Needs no Postgres. A crash between a swap's two renames leaves only `.<name>.old-*`.
+#[tokio::test]
+async fn reconcile_restores_template_from_old_folder() {
+    let tmp = tmp_home();
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let t = ctx.home.templates_dir();
+    for (dir, content) in [(".main.old-5", "older"), (".main.old-9", "newest")] {
+        std::fs::create_dir(t.join(dir)).unwrap();
+        std::fs::write(t.join(dir).join("PG_VERSION"), content).unwrap();
+    }
+    std::fs::create_dir(t.join(".main.building-9")).unwrap();
+    // A template that still has its folder keeps it; its old copy is just debris.
+    std::fs::create_dir(t.join("other")).unwrap();
+    std::fs::create_dir(t.join(".other.old-3")).unwrap();
+
+    let report = reconcile(ctx.clone(), now()).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(t.join("main/PG_VERSION")).unwrap(),
+        "newest"
+    );
+    for gone in [
+        ".main.old-5",
+        ".main.old-9",
+        ".main.building-9",
+        ".other.old-3",
+    ] {
+        assert!(!t.join(gone).exists(), "{gone} still exists");
+    }
+    assert!(t.join("other").is_dir());
+    assert!(report.failed.is_empty(), "{report:?}");
 }
 
 #[tokio::test]
@@ -162,8 +221,9 @@ async fn reconcile_drops_record_without_folder() {
     let a = create(&env.ctx, args("main")).await.unwrap();
     let dir = env.ctx.home.clones_dir().join(&a.id);
     stop(
-        newest(&env.ctx.installs).unwrap(),
+        newest(&env.ctx.installs()).unwrap(),
         &dir,
+        None,
         Duration::from_secs(5),
     )
     .unwrap();

@@ -179,7 +179,7 @@ async fn refresh_while_clone_runs() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
     let a = create(&env.ctx, args("main")).await.unwrap();
-    templates::refresh(&env.ctx, "main").await.unwrap();
+    templates::refresh(&env.ctx, "main", None).await.unwrap();
     assert_eq!(psql_url(&env, &a.url, "select count(*) from t"), "1");
 }
 

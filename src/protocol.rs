@@ -15,6 +15,10 @@ pub enum TemplateSource {
         /// Folder the command runs in; the daemon's own cwd when absent.
         #[serde(default)]
         cwd: Option<PathBuf>,
+        /// The caller's `PATH`, so the command finds the same tools as in the caller's shell;
+        /// the daemon's own `PATH` when absent.
+        #[serde(default)]
+        path: Option<String>,
     },
 }
 
@@ -41,11 +45,18 @@ pub struct CloneCreateArgs {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     TemplateInit(TemplateInitArgs),
-    TemplateRefresh { name: String },
+    TemplateRefresh {
+        name: String,
+        /// The refreshing caller's `PATH`; for a seed template it replaces the recorded one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     TemplateList,
     CloneCreate(CloneCreateArgs),
     CloneList,
-    CloneDestroy { id_or_name: String },
+    CloneDestroy {
+        id_or_name: String,
+    },
     Gc,
     Status,
     Shutdown,
@@ -86,6 +97,16 @@ pub struct GcReport {
     pub destroyed: Vec<String>,
     pub orphan_folders_removed: Vec<PathBuf>,
     pub records_dropped: Vec<String>,
+    /// Entries gc could not clean up; they are retried on the next gc.
+    #[serde(default)]
+    pub failed: Vec<GcFailure>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GcFailure {
+    /// Clone id or folder path.
+    pub item: String,
+    pub error: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -243,17 +264,31 @@ mod tests {
             s,
             TemplateSource::Seed {
                 command: "make seed".into(),
-                cwd: None
+                cwd: None,
+                path: None
             }
         );
         let s = TemplateSource::Seed {
             command: "x".into(),
             cwd: Some("/w".into()),
+            path: Some("/usr/bin:/bin".into()),
         };
         assert_eq!(
             serde_json::from_str::<TemplateSource>(&serde_json::to_string(&s).unwrap()).unwrap(),
             s
         );
+    }
+
+    #[test]
+    fn refresh_path_is_optional() {
+        let r: Request =
+            serde_json::from_str(r#"{"type":"template_refresh","name":"main"}"#).unwrap();
+        assert!(matches!(r, Request::TemplateRefresh { path: None, .. }));
+        let r: GcReport = serde_json::from_str(
+            r#"{"adopted":[],"destroyed":[],"orphan_folders_removed":[],"records_dropped":[]}"#,
+        )
+        .unwrap();
+        assert!(r.failed.is_empty());
     }
 
     #[test]

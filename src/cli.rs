@@ -127,6 +127,10 @@ fn fail(e: &MitosisError) -> ExitCode {
     if let Some(hint) = &e.hint {
         eprintln!("hint: {hint}");
     }
+    // Only `mitosis daemon` returns AlreadyRunning; `client::ensure_daemon` looks for this status.
+    if e.code == ErrorCode::AlreadyRunning {
+        return ExitCode::from(client::EXIT_ALREADY_RUNNING);
+    }
     ExitCode::FAILURE
 }
 
@@ -144,7 +148,7 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::from_env()?;
     match cli.command {
-        Cmd::Daemon { command: None } => daemon::run(home, Config::default()).await?,
+        Cmd::Daemon { command: None } => daemon::run(home, Config::from_env()?).await?,
         Cmd::Mcp => mcp::serve_stdio(home).await?,
         Cmd::Template { command } => template(&home, command).await?,
         Cmd::Clone {
@@ -164,6 +168,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 name,
                 ttl_secs,
                 durable,
+                // The CLI exits right after printing the URL, so watching it would destroy the
+                // clone at once: CLI clones live until their TTL or `mitosis destroy`.
                 parent_pid: None,
             };
             let info = match client::request(&home, Request::CloneCreate(args)).await? {
@@ -206,13 +212,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Cmd::Gc => match client::request(&home, Request::Gc).await? {
-            Response::Gc(r) => println!(
-                "adopted {}, destroyed {}, orphan folders removed {}, records dropped {}",
-                r.adopted.len(),
-                r.destroyed.len(),
-                r.orphan_folders_removed.len(),
-                r.records_dropped.len()
-            ),
+            Response::Gc(r) => {
+                println!(
+                    "adopted {}, destroyed {}, orphan folders removed {}, records dropped {}, failed {}",
+                    r.adopted.len(),
+                    r.destroyed.len(),
+                    r.orphan_folders_removed.len(),
+                    r.records_dropped.len(),
+                    r.failed.len()
+                );
+                for f in &r.failed {
+                    println!("failed: {}: {}", f.item, f.error);
+                }
+            }
             other => return Err(unexpected(other)),
         },
         Cmd::Daemon {
@@ -284,9 +296,11 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 .transpose()?;
             let source = match (from_url, seed) {
                 (Some(url), _) => TemplateSource::Url { url },
+                // The seed runs where and with the PATH it would in this shell.
                 (None, Some(command)) => TemplateSource::Seed {
                     command,
                     cwd: Some(std::env::current_dir()?),
+                    path: std::env::var("PATH").ok(),
                 },
                 (None, None) => unreachable!("clap requires --from-url or --seed"),
             };
@@ -305,7 +319,8 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         }
         TemplateCmd::Refresh { name } => {
             validate_name("template", &name)?;
-            match client::request(home, Request::TemplateRefresh { name }).await? {
+            let path = std::env::var("PATH").ok();
+            match client::request(home, Request::TemplateRefresh { name, path }).await? {
                 Response::TemplateBuilt(t) => print_built(&t),
                 other => return Err(unexpected(other)),
             }
@@ -324,7 +339,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 print_json(&templates)?;
             } else {
                 print_table(
-                    &["NAME", "PG", "DATABASE", "SIZE", "AGE"],
+                    &["NAME", "PG", "DATABASE", "SIZE", "AGE", "SOURCE"],
                     templates
                         .iter()
                         .map(|t| {
@@ -334,6 +349,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                                 t.database.clone(),
                                 human_bytes(t.size_bytes),
                                 format_duration(Duration::from_secs(t.age_secs)),
+                                source_cell(&t.source),
                             ]
                         })
                         .collect(),
@@ -342,6 +358,26 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The template's source for the table: the URL (the daemon already masked its password) or
+/// the seed command, cut to one short line.
+fn source_cell(source: &TemplateSource) -> String {
+    const MAX: usize = 48;
+    let text = match source {
+        TemplateSource::Url { url } => url.clone(),
+        TemplateSource::Seed { command, .. } => {
+            format!(
+                "seed: {}",
+                command.split_whitespace().collect::<Vec<_>>().join(" ")
+            )
+        }
+    };
+    if text.chars().count() <= MAX {
+        return text;
+    }
+    let cut: String = text.chars().take(MAX - 1).collect();
+    format!("{cut}…")
 }
 
 fn print_built(t: &TemplateInfo) {
@@ -446,6 +482,26 @@ mod tests {
         assert_eq!(human_bytes(3_400), "3.4 kB");
         assert_eq!(human_bytes(34_000_000), "34 MB");
         assert_eq!(human_bytes(1_200_000_000), "1.2 GB");
+    }
+
+    #[test]
+    fn source_cells_are_short() {
+        let url = TemplateSource::Url {
+            url: "postgres://u:***@h/db".into(),
+        };
+        assert_eq!(source_cell(&url), "postgres://u:***@h/db");
+        let seed = TemplateSource::Seed {
+            command: format!("psql \"$DATABASE_URL\"\n  -f {}", "x".repeat(80)),
+            cwd: None,
+            path: None,
+        };
+        let cell = source_cell(&seed);
+        assert!(
+            cell.starts_with("seed: psql \"$DATABASE_URL\" -f xx"),
+            "{cell}"
+        );
+        assert_eq!(cell.chars().count(), 48);
+        assert!(cell.ends_with('…') && !cell.contains('\n'));
     }
 
     #[test]

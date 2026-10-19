@@ -1,10 +1,10 @@
 use crate::clone_backend::{free_space, private_size};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
-use crate::names::{random_hex, validate_name};
+use crate::names::{new_clone_id, random_hex, validate_name};
 use crate::pg::{
-    check_extensions, find_major, newest, psql, read_pg_version, read_postmaster_pid, start, stop,
-    wait_ready, PgInstall, StartOptions,
+    check_extensions, find_major, newest, psql, read_pg_version, running_server, start, stop,
+    wait_ready, PgInstall, RunningPg, StartOptions,
 };
 use crate::ports::pick_port;
 use crate::proc_util::{is_alive, process_start_time, rss_bytes};
@@ -78,8 +78,9 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
             args.template
         ))
     })?;
-    let install = find_major(&ctx.installs, tpl.pg_major)?.clone();
-    check_extensions(&install, &tpl.extensions)?;
+    let install = ctx.install_major(tpl.pg_major).await?;
+    let (i, ext) = (install.clone(), tpl.extensions.clone());
+    blocking(move || check_extensions(&i, &ext)).await?;
     let parent_start_time = match args.parent_pid {
         Some(pid) => Some(
             process_start_time(pid)
@@ -163,7 +164,9 @@ fn reserve<'a>(
                 active.join(", ")
             ),
         )
-        .with_hint("destroy one with: mitosis clone destroy <id>"));
+        .with_hint(
+            "destroy one with `mitosis destroy <id-or-name>` (or the clone_destroy tool), or raise MITOSIS_MAX_CLONES",
+        ));
     }
     let clones_dir = ctx.home.clones_dir();
     let free = free_space(&clones_dir)?;
@@ -179,7 +182,7 @@ fn reserve<'a>(
         .with_hint("free disk space, or destroy unused clones"));
     }
     let id = loop {
-        let id = format!("c{}", random_hex(3));
+        let id = new_clone_id();
         let marked = ctx
             .in_flight
             .lock()
@@ -232,7 +235,11 @@ async fn bring_up(
     row: &mut CloneRow,
 ) -> Result<CloneInfo> {
     let (backend, src, dst) = (ctx.backend.clone(), tpl.dir.clone(), row.dir.clone());
-    blocking(move || backend.clone_dir(&src, &dst)).await?;
+    {
+        // A template refresh cannot move or delete the folder while it is being cloned.
+        let _swap = ctx.template_swap.read().await;
+        blocking(move || backend.clone_dir(&src, &dst)).await?;
+    }
     set_status(ctx, row, CloneStatus::Starting)?;
 
     let log_file = ctx.home.logs_dir().join(format!("{}.log", row.id));
@@ -248,12 +255,15 @@ async fn bring_up(
             log_file: log_file.clone(),
         };
         let pg = start(install, &row.dir, &opts)?;
+        // Recorded at once, so a failed create stops exactly this server.
+        row.pg_pid = Some(pg.pid);
+        row.pg_start_time = Some(pg.start_time);
         match wait_ready(install, &pg, &opts, ctx.config.ready_timeout).await {
             Ok(()) => break pg,
             // Template builds use ports the store does not know about, so a pick can still collide.
             Err(e) if e.code == ErrorCode::PortInUse && tries < START_TRIES => {
                 let (i, d, t) = (install.clone(), row.dir.clone(), ctx.config.stop_timeout);
-                blocking(move || stop(&i, &d, t)).await?;
+                blocking(move || stop(&i, &d, Some(pg), t)).await?;
                 tried.insert(row.port);
                 let store = ctx.store();
                 row.port = pick_port(
@@ -268,8 +278,10 @@ async fn bring_up(
     };
 
     // PG 12/13 default to md5; initdb set host auth to scram-sha-256, so store a SCRAM hash.
+    // log_min_error_statement=panic keeps a failing statement (with the password) out of the log.
     let sql = format!(
-        "SET password_encryption = 'scram-sha-256'; ALTER ROLE postgres PASSWORD '{}'",
+        "SET log_min_error_statement = panic; SET password_encryption = 'scram-sha-256'; \
+         ALTER ROLE postgres PASSWORD '{}'",
         row.password
     );
     let (i, s, p) = (install.clone(), row.socket_dir.clone(), row.port);
@@ -292,7 +304,7 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
             ErrorCode::CloneNotFound,
             format!("clone {id_or_name} not found"),
         )
-        .with_hint("see existing clones with: mitosis clone list")
+        .with_hint("see existing clones with `mitosis list` (or the clone_list tool)")
     })?;
     let starting = || {
         invalid(format!(
@@ -315,10 +327,11 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
 
 /// The install whose `pg_ctl` stops the cluster in `dir`: its own major, else the newest.
 pub(crate) fn install_for(ctx: &Ctx, dir: &Path) -> Option<PgInstall> {
+    let installs = ctx.installs();
     read_pg_version(dir)
         .ok()
-        .and_then(|m| find_major(&ctx.installs, m).ok())
-        .or_else(|| newest(&ctx.installs).ok())
+        .and_then(|m| find_major(&installs, m).ok())
+        .or_else(|| newest(&installs).ok())
         .cloned()
 }
 
@@ -347,15 +360,19 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
     let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
     let install = install_for(ctx, &dir);
     let timeout = ctx.config.stop_timeout;
+    let expected = row
+        .pg_pid
+        .zip(row.pg_start_time)
+        .map(|(pid, start_time)| RunningPg { pid, start_time });
     blocking(move || {
-        if read_postmaster_pid(&dir)?.is_some() {
+        if running_server(&dir, expected)?.is_some() {
             let install = install.ok_or_else(|| {
                 internal(format!(
                     "no Postgres install found to stop the server in {}",
                     dir.display()
                 ))
             })?;
-            stop(&install, &dir, timeout)?;
+            stop(&install, &dir, expected, timeout)?;
         }
         remove_if_present(&dir, true)?;
         remove_if_present(&sock, true)?;

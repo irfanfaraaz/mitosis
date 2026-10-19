@@ -1,11 +1,12 @@
 use crate::clones::{destroy, install_for, mark, stop_and_remove};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
-use crate::pg::{read_postmaster_pid, stop, PostmasterInfo};
-use crate::proc_util::{is_alive, process_start_time};
-use crate::protocol::GcReport;
+use crate::names::is_clone_id;
+use crate::pg::{running_server, stop};
+use crate::proc_util::{has_exited, is_alive, process_start_time};
+use crate::protocol::{GcFailure, GcReport};
 use crate::state::{CloneRow, CloneStatus};
-use crate::templates::now;
+use crate::templates::{is_build_socket_name, now, parse_leftover, Leftover};
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use std::fs::OpenOptions;
@@ -46,23 +47,20 @@ pub fn parent_alive(pid: i32, start_time: Option<u64>) -> bool {
     is_alive(pid) && start_time.is_none_or(|t| start_matches(pid, t))
 }
 
-/// The postmaster named by `dir/postmaster.pid` when it is alive and really serves `dir`.
-fn live_postmaster(dir: &Path) -> Option<PostmasterInfo> {
-    let info = read_postmaster_pid(dir).ok()??;
-    let same_dir =
-        matches!((info.data_dir.canonicalize(), dir.canonicalize()), (Ok(a), Ok(b)) if a == b);
-    // Same slack as `cluster::stop` uses for the pid file's own start time.
-    let same_proc = process_start_time(info.pid).is_some_and(|t| t.abs_diff(info.start_time) <= 2);
-    (same_dir && same_proc && is_alive(info.pid)).then_some(info)
+/// True while the clone's recorded postmaster still runs: same pid, exactly the same kernel start
+/// time (both recorded from the kernel at create). A dead child is reaped, not counted.
+fn postmaster_running(row: &CloneRow) -> bool {
+    match (row.pg_pid, row.pg_start_time) {
+        (Some(pid), Some(t)) => !has_exited(pid) && process_start_time(pid) == Some(t),
+        _ => false,
+    }
 }
 
-/// Removes a `postmaster.pid` that names no live server for `dir`. `cluster::stop` refuses a pid
-/// that another process reused (after a reboot), which would leave the clone stuck in every gc.
-fn clear_stale_pid(dir: &Path) {
-    let file = dir.join("postmaster.pid");
-    if file.exists() && live_postmaster(dir).is_none() {
-        let _ = std::fs::remove_file(file);
-    }
+fn failed(report: &mut GcReport, item: impl Into<String>, e: &MitosisError) {
+    report.failed.push(GcFailure {
+        item: item.into(),
+        error: e.message.clone(),
+    });
 }
 
 fn in_flight(ctx: &Ctx, id: &str) -> bool {
@@ -289,6 +287,7 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
         };
         if let Err(e) = reconcile_clone(&ctx, &row, now, &mut report).await {
             log(&ctx, &format!("gc: clone {id}: {e}"));
+            failed(&mut report, id, &e);
         }
     }
     remove_orphans(&ctx, &mut report).await;
@@ -311,11 +310,7 @@ async fn reconcile_clone(
         report.records_dropped.push(row.id.clone());
         return Ok(());
     }
-    let running = row.status == CloneStatus::Ready
-        && live_postmaster(&dir).is_some_and(|pm| {
-            row.pg_pid == Some(pm.pid)
-                && row.pg_start_time.is_some_and(|t| start_matches(pm.pid, t))
-        });
+    let running = row.status == CloneStatus::Ready && postmaster_running(row);
     let keep = running
         && row.expires_at > now
         && row
@@ -325,7 +320,7 @@ async fn reconcile_clone(
         let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
             return Ok(());
         };
-        clear_stale_pid(&dir);
+        // Stops only a server identified exactly (recorded pid + start time, or cwd in `dir`).
         stop_and_remove(ctx, row).await?;
         report.destroyed.push(row.id.clone());
         return Ok(());
@@ -365,14 +360,15 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     let install = install_for(ctx, &dir);
     let timeout = ctx.config.stop_timeout;
     tokio::task::spawn_blocking(move || {
-        if live_postmaster(&dir).is_some() {
+        // No row, so the server (if any) is the process whose cwd is this folder.
+        if running_server(&dir, None)?.is_some() {
             let install = install.ok_or_else(|| {
                 internal(format!(
                     "no Postgres install found to stop the server in {}",
                     dir.display()
                 ))
             })?;
-            stop(&install, &dir, timeout)?;
+            stop(&install, &dir, None, timeout)?;
         }
         remove_path(&dir)
     })
@@ -380,14 +376,33 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     .map_err(|e| internal(format!("background task failed: {e}")))?
 }
 
+/// Leaves an entry gc does not recognise alone, with one log line.
+fn foreign(ctx: &Ctx, path: &Path) {
+    log(
+        ctx,
+        &format!(
+            "gc: left {} alone: Mitosis did not create it",
+            path.display()
+        ),
+    );
+}
+
 /// Step 6: folders in `clones/`, `sockets/` and `templates/` that nothing owns any more.
+/// Only names Mitosis itself creates are touched; anything else is logged and left alone.
 async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
-    let mut done = |path: PathBuf, res: Result<()>| match res {
+    let done = |report: &mut GcReport, path: PathBuf, res: Result<()>| match res {
         Ok(()) => report.orphan_folders_removed.push(path),
-        Err(e) => log(ctx, &format!("gc: orphan {}: {e}", path.display())),
+        Err(e) => {
+            log(ctx, &format!("gc: orphan {}: {e}", path.display()));
+            failed(report, path.display().to_string(), &e);
+        }
     };
 
     for (id, path) in entries(&ctx.home.clones_dir()) {
+        if !is_clone_id(&id) {
+            foreign(ctx, &path);
+            continue;
+        }
         // Store and in-flight set are read under the store lock, as `clones::reserve` writes them.
         let owned = {
             let store = ctx.store();
@@ -407,18 +422,18 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
             }
         }
         let res = remove_data_dir(ctx, path.clone()).await;
-        done(path, res);
+        done(report, path, res);
     }
 
     for (name, path) in entries(&ctx.home.sockets_dir()) {
-        let res = if name.starts_with("build-") {
+        let res = if is_build_socket_name(&name) {
             // Holding the build set keeps a new build from taking its guard and reusing this folder.
             let building = ctx.building.lock().unwrap_or_else(|e| e.into_inner());
             if !building.is_empty() {
                 continue;
             }
             remove_path(&path)
-        } else {
+        } else if is_clone_id(&name) {
             // Under the store lock so a concurrent create cannot claim this id meanwhile.
             let store = ctx.store();
             match store.get_clone(&name) {
@@ -427,28 +442,92 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
                 Ok(None) => remove_path(&path),
                 Err(e) => Err(e),
             }
-        };
-        done(path, res);
-    }
-
-    for (name, path) in entries(&ctx.home.templates_dir()) {
-        // Leftovers are `.<name>.building-<ts>` and `.<name>.old-<ts>`; template names have no dots.
-        let Some(rest) = name.strip_prefix('.') else {
+        } else {
+            foreign(ctx, &path);
             continue;
         };
-        let leftover = match rest.split_once('.') {
-            Some((tpl, suffix)) if suffix.starts_with("building-") => !ctx
-                .building
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(tpl),
-            Some((_, suffix)) => suffix.starts_with("old-"),
-            None => false,
-        };
-        if leftover {
-            let res = remove_data_dir(ctx, path.clone()).await;
-            done(path, res);
+        done(report, path, res);
+    }
+
+    let templates_dir = ctx.home.templates_dir();
+    let mut leftovers = Vec::new();
+    for (file, path) in entries(&templates_dir) {
+        match parse_leftover(&file) {
+            Some(l) => leftovers.push((l, path)),
+            // Built templates have plain names; dot-names that are not leftovers are not ours.
+            None if file.starts_with('.') => foreign(ctx, &path),
+            None => {}
         }
+    }
+    restore_old_templates(ctx, &templates_dir, &mut leftovers, report);
+    for (l, path) in leftovers {
+        // A running build owns its own leftovers (its swap may still need the old copy).
+        let tpl = match &l {
+            Leftover::Building(tpl) | Leftover::Old(tpl, _) => tpl,
+        };
+        let remove = !ctx
+            .building
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(tpl);
+        if remove {
+            let res = remove_data_dir(ctx, path.clone()).await;
+            done(report, path, res);
+        }
+    }
+}
+
+/// A crash between a swap's two renames leaves `.<name>.old-*` but no `templates/<name>`: the newest
+/// such folder is moved back (and dropped from `leftovers`) before the rest are removed.
+fn restore_old_templates(
+    ctx: &Ctx,
+    templates_dir: &Path,
+    leftovers: &mut Vec<(Leftover, PathBuf)>,
+    report: &mut GcReport,
+) {
+    let mut newest: std::collections::HashMap<String, (i64, usize)> = Default::default();
+    for (i, (l, _)) in leftovers.iter().enumerate() {
+        if let Leftover::Old(name, ts) = l {
+            let e = newest.entry(name.clone()).or_insert((*ts, i));
+            if *ts > e.0 {
+                *e = (*ts, i);
+            }
+        }
+    }
+    let mut handled = Vec::new();
+    for (name, (_, i)) in newest {
+        let final_dir = templates_dir.join(&name);
+        // The build set is held across the rename, so no build can swap this template meanwhile.
+        let building = ctx.building.lock().unwrap_or_else(|e| e.into_inner());
+        if building.contains(&name) || final_dir.exists() {
+            continue;
+        }
+        let old = &leftovers[i].1;
+        match std::fs::rename(old, &final_dir) {
+            Ok(()) => {
+                drop(building);
+                log(
+                    ctx,
+                    &format!("gc: restored template {name} from {}", old.display()),
+                );
+                handled.push(i);
+            }
+            Err(e) => {
+                drop(building);
+                let e = internal(format!(
+                    "restore {} to {}: {e}",
+                    old.display(),
+                    final_dir.display()
+                ));
+                log(ctx, &format!("gc: {e}"));
+                failed(report, old.display().to_string(), &e);
+                handled.push(i); // keep it on disk: it may be the only copy
+            }
+        }
+    }
+    handled.sort_unstable_by(|a, b| b.cmp(a));
+    for i in handled {
+        leftovers.remove(i);
     }
 }
 

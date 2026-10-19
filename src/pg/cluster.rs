@@ -1,10 +1,11 @@
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::pg::binaries::PgInstall;
-use crate::proc_util::{has_exited, is_alive, process_start_time};
+use crate::proc_util::{has_exited, is_alive, process_cwd, process_start_time};
 use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -261,44 +262,109 @@ fn wait_exited(pid: i32, wait: Duration) -> bool {
     true
 }
 
-/// Stops the cluster; a cluster with no `postmaster.pid`, or whose pid is gone, is already stopped.
-/// Refuses (without signalling anything) when the pid now belongs to another process.
-/// Blocks (up to the timeout plus a few seconds): callers in async code use `spawn_blocking`.
-pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<()> {
+/// True while `pg` still runs as the same process: same pid and exactly the same kernel start
+/// time. A dead child (zombie) is reaped and counts as gone.
+fn is_same_process(pg: RunningPg) -> bool {
+    pg.start_time != 0 && !has_exited(pg.pid) && process_start_time(pg.pid) == Some(pg.start_time)
+}
+
+/// Whether `pid` serves `data_dir`. Postgres chdirs into its data dir, so its cwd names it exactly.
+/// `Some(false)` when it provably does not (gone, another user's process, another folder);
+/// `None` when that cannot be told.
+fn serves_dir(pid: i32, data_dir: &Path) -> Option<bool> {
+    match process_cwd(pid) {
+        Ok((dev, ino, path)) => {
+            let same_inode =
+                std::fs::metadata(data_dir).is_ok_and(|m| (m.dev(), m.ino()) == (dev, ino));
+            let same_path = data_dir.canonicalize().is_ok_and(|d| d == path);
+            Some(same_inode || same_path)
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// The postmaster now serving `data_dir`, identified exactly: `expected` (the server we started,
+/// as recorded) while it still runs, else the pid in `postmaster.pid` when that process runs in
+/// `data_dir`. `None` when no server of this folder runs; an error when a live pid cannot be told apart.
+pub fn running_server(data_dir: &Path, expected: Option<RunningPg>) -> Result<Option<RunningPg>> {
+    if let Some(pg) = expected.filter(|pg| is_same_process(*pg)) {
+        return Ok(Some(pg));
+    }
     let Some(info) = read_postmaster_pid(data_dir)? else {
-        return Ok(());
+        return Ok(None);
     };
-    if !is_alive(info.pid) {
-        // Stale file from a crash or reboot.
-        match std::fs::remove_file(data_dir.join("postmaster.pid")) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => return Ok(()),
+    if has_exited(info.pid) {
+        return Ok(None);
+    }
+    // Start time read on both sides of the cwd check, so a pid reused in between is caught.
+    let before = process_start_time(info.pid);
+    match serves_dir(info.pid, data_dir) {
+        Some(true) => {}
+        Some(false) => return Ok(None),
+        None => {
+            return Err(internal(format!(
+                "cannot tell whether pid {} (from postmaster.pid) serves {}",
+                info.pid,
+                data_dir.display()
+            )))
         }
     }
-    // Checked before pg_ctl, which signals whatever pid the file names (stale file + reused pid).
-    let ours = process_start_time(info.pid).is_some_and(|t| t.abs_diff(info.start_time) <= 2);
-    if !ours {
-        return Err(internal(format!(
-            "postmaster.pid at {} points to pid {} which is not this cluster's postgres",
-            data_dir.display(),
-            info.pid
-        )));
+    match (before, process_start_time(info.pid)) {
+        (Some(a), Some(b)) if a == b => Ok(Some(RunningPg {
+            pid: info.pid,
+            start_time: a,
+        })),
+        _ => Ok(None), // exited (or replaced) during the check
     }
-    let secs = timeout.as_secs().max(1);
-    let out = Command::new(install.bin("pg_ctl"))
-        .arg("stop")
-        .arg("-D")
-        .arg(data_dir)
-        .args(["-m", "fast", "-t", &secs.to_string()])
-        .output()?;
-    if out.status.success() {
-        wait_exited(info.pid, Duration::from_secs(5)); // reap our child; pg_ctl already confirmed shutdown
+}
+
+/// Removes `postmaster.pid` when the pid it names is no longer alive (a crash or reboot).
+fn remove_dead_pid_file(data_dir: &Path) -> Result<()> {
+    let Some(info) = read_postmaster_pid(data_dir).ok().flatten() else {
         return Ok(());
+    };
+    if is_alive(info.pid) {
+        return Ok(()); // a live process that is not this cluster's server: leave its file alone
     }
-    if !is_alive(info.pid) {
-        return Ok(()); // exited while pg_ctl gave up
+    match std::fs::remove_file(data_dir.join("postmaster.pid")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
-    let pid = Pid::from_raw(info.pid);
+}
+
+/// Stops the cluster's server, identified by `running_server` (pass the recorded identity when
+/// there is one). Nothing running is success; a pid that is not this cluster's server is never
+/// signalled. Blocks (up to the timeout plus a few seconds): async callers use `spawn_blocking`.
+pub fn stop(
+    install: &PgInstall,
+    data_dir: &Path,
+    expected: Option<RunningPg>,
+    timeout: Duration,
+) -> Result<()> {
+    let Some(pg) = running_server(data_dir, expected)? else {
+        return remove_dead_pid_file(data_dir);
+    };
+    // pg_ctl signals whatever pid the file names, so it is used only when that is our server.
+    let file_pid = read_postmaster_pid(data_dir).ok().flatten().map(|i| i.pid);
+    if file_pid == Some(pg.pid) {
+        let secs = timeout.as_secs().max(1);
+        let out = Command::new(install.bin("pg_ctl"))
+            .arg("stop")
+            .arg("-D")
+            .arg(data_dir)
+            .args(["-m", "fast", "-t", &secs.to_string()])
+            .output()?;
+        if out.status.success() {
+            wait_exited(pg.pid, Duration::from_secs(5)); // reap our child; pg_ctl already confirmed shutdown
+            return Ok(());
+        }
+    }
+    // Re-checked right before the kill: the pid may have exited and been reused meanwhile.
+    if !is_same_process(pg) {
+        return remove_dead_pid_file(data_dir);
+    }
+    let pid = Pid::from_raw(pg.pid);
     // The postmaster leads its own group when we started it; otherwise hit just the pid.
     let mut res = killpg(pid, Signal::SIGKILL);
     if res == Err(Errno::ESRCH) {
@@ -309,21 +375,22 @@ pub fn stop(install: &PgInstall, data_dir: &Path, timeout: Duration) -> Result<(
         Err(e) => {
             return Err(internal(format!(
                 "could not kill postgres pid {}: {e}",
-                info.pid
+                pg.pid
             )))
         }
     }
-    if !wait_exited(info.pid, Duration::from_secs(5)) {
+    if !wait_exited(pg.pid, Duration::from_secs(5)) {
         return Err(internal(format!(
             "postgres pid {} for {} is still alive after SIGKILL",
-            info.pid,
+            pg.pid,
             data_dir.display()
         )));
     }
-    Ok(())
+    remove_dead_pid_file(data_dir)
 }
 
-/// Reads lines 1 (pid), 2 (data dir) and 4 (port) of `postmaster.pid`; `None` if the file is absent.
+/// Reads lines 1 (pid), 2 (data dir), 3 (start time) and 4 (port) of `postmaster.pid`;
+/// `None` if the file is absent.
 pub fn read_postmaster_pid(data_dir: &Path) -> Result<Option<PostmasterInfo>> {
     let text = match std::fs::read_to_string(data_dir.join("postmaster.pid")) {
         Ok(t) => t,
@@ -398,18 +465,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("postmaster.pid");
 
+        // A live process that does not run in the data dir (this test) is not its server:
+        // nothing is signalled and its pid file stays.
         let me = std::process::id();
         std::fs::write(&pid_file, format!("{me}\n/tmp/data\n1000\n54321\n")).unwrap();
-        let e = stop(&install, dir.path(), Duration::from_secs(1)).unwrap_err();
-        assert!(e.message.contains("not this cluster's postgres"), "{e}");
+        assert_eq!(running_server(dir.path(), None).unwrap(), None);
+        stop(&install, dir.path(), None, Duration::from_secs(1)).unwrap();
         assert!(pid_file.exists() && is_alive(me as i32));
+
+        // A recorded identity with the wrong start time is not trusted either.
+        let wrong = RunningPg {
+            pid: me as i32,
+            start_time: process_start_time(me as i32).unwrap() - 100,
+        };
+        stop(&install, dir.path(), Some(wrong), Duration::from_secs(1)).unwrap();
+        assert!(is_alive(me as i32));
 
         let mut child = Command::new("true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
         std::fs::write(&pid_file, format!("{dead}\n/tmp/data\n1000\n54321\n")).unwrap();
-        stop(&install, dir.path(), Duration::from_secs(1)).unwrap();
-        assert!(!pid_file.exists(), "a stale pid file is removed");
+        stop(&install, dir.path(), None, Duration::from_secs(1)).unwrap();
+        assert!(
+            !pid_file.exists(),
+            "a pid file whose pid is dead is removed"
+        );
+    }
+
+    #[test]
+    fn a_process_running_in_the_data_dir_is_its_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::fs::write(
+            dir.path().join("postmaster.pid"),
+            format!("{pid}\n/tmp/data\n1\n54321\n"),
+        )
+        .unwrap();
+        let found = running_server(dir.path(), None).unwrap();
+        let start = process_start_time(pid);
+        let other = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            dir.path().join("postmaster.pid"),
+            other.path().join("postmaster.pid"),
+        )
+        .unwrap();
+        let elsewhere = running_server(other.path(), None).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            found,
+            Some(RunningPg {
+                pid,
+                start_time: start.unwrap()
+            }),
+            "the recorded start time is the kernel's, not line 3 of the pid file"
+        );
+        assert_eq!(
+            elsewhere, None,
+            "same pid file, other folder: not its server"
+        );
+        assert_eq!(running_server(dir.path(), None).unwrap(), None, "exited");
     }
 
     #[test]

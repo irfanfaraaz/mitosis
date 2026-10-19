@@ -4,18 +4,21 @@ use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::{random_hex, validate_name};
 use crate::pg::{
-    find_major, initdb, newest, psql, read_pg_version, start, stop, wait_ready, PgInstall,
-    StartOptions,
+    initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
 };
 use crate::ports::pick_port;
 use crate::protocol::{TemplateInfo, TemplateInitArgs, TemplateSource};
 use crate::state::TemplateRow;
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SEED_DATABASE: &str = "app";
@@ -67,7 +70,8 @@ pub async fn init(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     build(ctx, args).await
 }
 
-pub async fn refresh(ctx: &Ctx, name: &str) -> Result<TemplateInfo> {
+/// Rebuilds `name` from its recorded source. `path`, when given, replaces a seed's recorded `PATH`.
+pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
     validate_name("template", name)?;
     let row = ctx.store().get_template(name)?.ok_or_else(|| {
         MitosisError::new(
@@ -76,9 +80,21 @@ pub async fn refresh(ctx: &Ctx, name: &str) -> Result<TemplateInfo> {
         )
         .with_hint("see existing templates with: mitosis template list")
     })?;
+    let source = match row.source {
+        TemplateSource::Seed {
+            command,
+            cwd,
+            path: recorded,
+        } => TemplateSource::Seed {
+            command,
+            cwd,
+            path: path.or(recorded),
+        },
+        url => url,
+    };
     let args = TemplateInitArgs {
         name: row.name,
-        source: row.source,
+        source,
         database: Some(row.database),
         migrations: row.migrations,
         max_age_secs: Some(row.max_age_secs),
@@ -115,9 +131,10 @@ pub fn info(row: &TemplateRow, now: i64) -> TemplateInfo {
         TemplateSource::Url { url } => TemplateSource::Url {
             url: redact_url(url),
         },
-        TemplateSource::Seed { command, cwd } => TemplateSource::Seed {
+        TemplateSource::Seed { command, cwd, path } => TemplateSource::Seed {
             command: redact_url(command),
             cwd: cwd.clone(),
+            path: path.clone(),
         },
     };
     TemplateInfo {
@@ -444,9 +461,64 @@ async fn run_psql(
     blocking(move || psql(&i, &s, p, &d, &sql)).await
 }
 
+type Groups = Arc<Mutex<HashSet<i32>>>;
+
+/// Lists a build tool's process group in `Ctx::build_groups` until dropped, so daemon shutdown
+/// can kill it; `kill` ends whatever the tool left running in its group.
+struct GroupGuard {
+    groups: Groups,
+    pgid: i32,
+}
+
+impl GroupGuard {
+    fn new(groups: &Groups, pgid: i32) -> GroupGuard {
+        groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pgid);
+        GroupGuard {
+            groups: groups.clone(),
+            pgid,
+        }
+    }
+
+    fn kill(&self) {
+        let _ = killpg(Pid::from_raw(self.pgid), Signal::SIGKILL);
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.pgid);
+    }
+}
+
+/// Kills every running seed command and dump/restore; the daemon calls it as it shuts down.
+pub(crate) fn kill_build_groups(ctx: &Ctx) {
+    let groups: Vec<i32> = ctx
+        .build_groups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .collect();
+    for pgid in groups.into_iter().filter(|p| *p > 1) {
+        let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+    }
+}
+
 /// `pg_dump -Fc <url> | pg_restore` into the build server, both stderrs to the log.
 /// The password goes in `PGPASSWORD`, never in argv, so neither `ps` nor libpq errors show it.
-fn dump_restore(install: &PgInstall, url: &str, opts: &StartOptions, db: &str) -> Result<()> {
+/// Without one in the URL, pg_dump reads `~/.pgpass` or `PGPASSWORD` from the daemon's environment.
+fn dump_restore(
+    install: &PgInstall,
+    url: &str,
+    opts: &StartOptions,
+    db: &str,
+    groups: &Groups,
+) -> Result<()> {
     let split = split_password(url)?;
     let log = || OpenOptions::new().append(true).open(&opts.log_file);
     let (dump_err, restore_out, restore_err) = (log()?, log()?, log()?);
@@ -458,22 +530,31 @@ fn dump_restore(install: &PgInstall, url: &str, opts: &StartOptions, db: &str) -
         .args(["-Fc", "--no-owner", "--no-acl"])
         .arg(&split.url)
         .env("PGCONNECT_TIMEOUT", "10")
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(dump_err)
         .spawn()
         .map_err(|e| internal(format!("could not run pg_dump: {e}")))?;
+    let _dump_group = GroupGuard::new(groups, dump.id() as i32);
     let dump_out = dump.stdout.take().expect("pg_dump stdout is piped");
     // If pg_restore cannot start, the pipe closes and pg_dump exits, so the wait below cannot hang.
     let restore = Command::new(install.bin("pg_restore"))
         .args(["--no-owner", "--no-acl", "-h"])
         .arg(&opts.socket_dir)
         .args(["-p", &opts.port.to_string(), "-U", "postgres", "-d", db])
+        .process_group(0)
         .stdin(dump_out)
         .stdout(restore_out)
         .stderr(restore_err)
-        .status()
+        .spawn()
         .map_err(|e| internal(format!("could not run pg_restore: {e}")));
+    let restore = restore.and_then(|mut child| {
+        let _restore_group = GroupGuard::new(groups, child.id() as i32);
+        child
+            .wait()
+            .map_err(|e| internal(format!("waiting for pg_restore: {e}")))
+    });
     let dump_status = dump
         .wait()
         .map_err(|e| internal(format!("waiting for pg_dump: {e}")))?;
@@ -492,18 +573,23 @@ fn dump_restore(install: &PgInstall, url: &str, opts: &StartOptions, db: &str) -
     }
 }
 
-/// Runs the seed command against the build server over TCP.
+/// Runs the seed command against the build server over TCP, in its own process group.
+#[allow(clippy::too_many_arguments)]
 async fn run_seed(
     install: &PgInstall,
     opts: &StartOptions,
     db: &str,
     command: &str,
     cwd: Option<&Path>,
+    path: Option<&str>,
+    groups: &Groups,
 ) -> Result<()> {
     // initdb sets host auth to scram-sha-256, so TCP needs a password: a throwaway one, cleared afterwards.
+    // log_min_error_statement=panic keeps a failing statement (with the password) out of the log.
     let password = random_hex(16);
     let sql = format!(
-        "SET password_encryption = 'scram-sha-256'; ALTER ROLE postgres PASSWORD '{password}'"
+        "SET log_min_error_statement = panic; SET password_encryption = 'scram-sha-256'; \
+         ALTER ROLE postgres PASSWORD '{password}'"
     );
     run_psql(install, opts, "postgres", sql).await?;
     let url = format!(
@@ -512,26 +598,39 @@ async fn run_seed(
         url_encode(db)
     );
     let log = || OpenOptions::new().append(true).open(&opts.log_file);
-    let mut cmd = tokio::process::Command::new("sh");
+    // An absolute shell, so a caller's PATH without /bin still runs it.
+    let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(command)
         .env("DATABASE_URL", &url)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(log()?)
         .stderr(log()?);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let status = cmd.status().await.map_err(|e| match cwd {
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
+    let spawn_err = |e: std::io::Error| match cwd {
         Some(dir) => internal(format!(
             "could not run the seed command in {}: {e}",
             dir.display()
         )),
         None => internal(format!("could not run the seed command: {e}")),
-    })?;
+    };
+    let mut child = cmd.spawn().map_err(spawn_err)?;
+    let group = child.id().map(|pid| GroupGuard::new(groups, pid as i32));
+    let status = child.wait().await.map_err(spawn_err)?;
     if !status.success() {
+        // Background jobs the seed left behind would otherwise outlive the build.
+        if let Some(g) = &group {
+            g.kill();
+        }
         return Err(internal(format!("seed command failed ({status})")));
     }
+    drop(group);
     run_psql(
         install,
         opts,
@@ -548,6 +647,45 @@ fn build_socket_dir(ctx: &Ctx, port: u16) -> PathBuf {
     ctx.home.sockets_dir().join(format!("build-{port}"))
 }
 
+/// True for the names `build_socket_dir` makes; gc touches no other non-clone name in `sockets/`.
+pub(crate) fn is_build_socket_name(name: &str) -> bool {
+    name.strip_prefix("build-").is_some_and(|p| {
+        !p.is_empty() && p.parse::<u16>().is_ok() && p.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// A leftover folder `build` makes in `templates/`: `.<name>.building-<ts>` or `.<name>.old-<ts>`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Leftover {
+    Building(String),
+    Old(String, i64),
+}
+
+fn build_dir_name(name: &str, ts: i64) -> String {
+    format!(".{name}.building-{ts}")
+}
+
+fn old_dir_name(name: &str, ts: i64) -> String {
+    format!(".{name}.old-{ts}")
+}
+
+/// Parses the names `build_dir_name` and `old_dir_name` make; anything else is `None`.
+pub(crate) fn parse_leftover(file_name: &str) -> Option<Leftover> {
+    let (name, suffix) = file_name.strip_prefix('.')?.split_once('.')?;
+    validate_name("template", name).ok()?;
+    let ts = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
+    if let Some(t) = suffix.strip_prefix("building-") {
+        ts(t).map(|_| Leftover::Building(name.into()))
+    } else {
+        ts(suffix.strip_prefix("old-")?).map(|t| Leftover::Old(name.into(), t))
+    }
+}
+
 async fn run_steps(
     ctx: &Ctx,
     install: &PgInstall,
@@ -562,10 +700,10 @@ async fn run_steps(
         .map_err(at("initdb"))?;
 
     let mut tried = HashSet::new();
-    loop {
+    let pg: RunningPg = loop {
         let pg = start(install, data_dir, opts).map_err(at("start"))?;
         match wait_ready(install, &pg, opts, ctx.config.ready_timeout).await {
-            Ok(()) => break,
+            Ok(()) => break pg,
             // Another process can take the picked port before postgres binds it.
             Err(e) if e.code == ErrorCode::PortInUse && tried.len() + 1 < START_TRIES => {
                 let (i, d, t) = (
@@ -573,7 +711,7 @@ async fn run_steps(
                     data_dir.to_path_buf(),
                     ctx.config.stop_timeout,
                 );
-                blocking(move || stop(&i, &d, t))
+                blocking(move || stop(&i, &d, Some(pg), t))
                     .await
                     .map_err(at("start"))?;
                 let _ = std::fs::remove_dir(&opts.socket_dir);
@@ -585,7 +723,7 @@ async fn run_steps(
             }
             Err(e) => return Err(("start", e)),
         }
-    }
+    };
 
     if database != "postgres" {
         let sql = format!("CREATE DATABASE {}", quote_ident(database));
@@ -596,20 +734,29 @@ async fn run_steps(
 
     match source {
         TemplateSource::Url { url } => {
-            let (i, u, o, db) = (
+            let (i, u, o, db, g) = (
                 install.clone(),
                 url.clone(),
                 opts.clone(),
                 database.to_string(),
+                ctx.build_groups.clone(),
             );
-            blocking(move || dump_restore(&i, &u, &o, &db))
+            blocking(move || dump_restore(&i, &u, &o, &db, &g))
                 .await
                 .map_err(at("restore"))?;
         }
-        TemplateSource::Seed { command, cwd } => {
-            run_seed(install, opts, database, command, cwd.as_deref())
-                .await
-                .map_err(at("seed"))?;
+        TemplateSource::Seed { command, cwd, path } => {
+            run_seed(
+                install,
+                opts,
+                database,
+                command,
+                cwd.as_deref(),
+                path.as_deref(),
+                &ctx.build_groups,
+            )
+            .await
+            .map_err(at("seed"))?;
         }
     }
 
@@ -633,7 +780,7 @@ async fn run_steps(
         data_dir.to_path_buf(),
         ctx.config.stop_timeout,
     );
-    blocking(move || stop(&i, &d, t))
+    blocking(move || stop(&i, &d, Some(pg), t))
         .await
         .map_err(at("stop"))?;
     Ok(extensions)
@@ -662,7 +809,7 @@ async fn fail(
     );
     let cleanup = blocking(move || {
         // A server that would not stop keeps its folder; gc deals with it later.
-        stop(&i, &d, t)?;
+        stop(&i, &d, None, t)?;
         match std::fs::remove_dir_all(&d) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
@@ -717,10 +864,9 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let database = database_for(&args)?;
     let _guard = BuildGuard::take(ctx, &name)?;
     let install = match args.pg_major {
-        Some(major) => find_major(&ctx.installs, major)?,
-        None => newest(&ctx.installs)?,
-    }
-    .clone();
+        Some(major) => ctx.install_major(major).await?,
+        None => ctx.newest_install().await?,
+    };
     let migrations_hash = match args.migrations.as_deref() {
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
         _ => None,
@@ -730,7 +876,7 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
 
     let ts = now();
     let templates_dir = ctx.home.templates_dir();
-    let build_dir = templates_dir.join(format!(".{name}.building-{ts}"));
+    let build_dir = templates_dir.join(build_dir_name(&name, ts));
     let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
     std::fs::File::create(&log)?; // truncate, so the error tail belongs to this build
     let leased = ctx.store().leased_ports()?;
@@ -761,15 +907,20 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
 
     // Step 7: measure, swap, record.
     let final_dir = templates_dir.join(&name);
-    let old_dir = templates_dir.join(format!(".{name}.old-{ts}"));
-    let (b, f, o, l) = (build_dir.clone(), final_dir.clone(), old_dir, log.clone());
-    let swapped = blocking(move || {
-        let pg_major = read_pg_version(&b)?;
-        let size_bytes = apparent_size(&b)?;
-        swap(&b, &f, &o, &l)?;
-        Ok((pg_major, size_bytes))
-    })
-    .await;
+    let old_dir = templates_dir.join(old_dir_name(&name, ts));
+    let b = build_dir.clone();
+    let measured = blocking(move || Ok((read_pg_version(&b)?, apparent_size(&b)?))).await;
+    let swapped = match measured {
+        Ok(m) => {
+            // No clone may copy the template folder while it is renamed and the old one removed.
+            let _swap = ctx.template_swap.write().await;
+            let (b, f, l) = (build_dir.clone(), final_dir.clone(), log.clone());
+            blocking(move || swap(&b, &f, &old_dir, &l))
+                .await
+                .map(|()| m)
+        }
+        Err(e) => Err(e),
+    };
     let (pg_major, size_bytes) = match swapped {
         Ok(v) => v,
         Err(e) => return Err(fail(ctx, &install, &build_dir, &log, &secrets, "swap", e).await),
@@ -818,6 +969,7 @@ mod tests {
         let seed = TemplateSource::Seed {
             command: "true".into(),
             cwd: None,
+            path: None,
         };
         assert_eq!(database_for(&args(seed.clone(), None)).unwrap(), "app");
         assert_eq!(database_for(&args(seed.clone(), Some("x"))).unwrap(), "x");
@@ -934,9 +1086,38 @@ mod tests {
         );
         assert!(source_secrets(&TemplateSource::Seed {
             command: "x".into(),
-            cwd: None
+            cwd: None,
+            path: None
         })
         .is_empty());
+    }
+
+    #[test]
+    fn leftover_names_round_trip() {
+        assert_eq!(
+            parse_leftover(&build_dir_name("main", 17)),
+            Some(Leftover::Building("main".into()))
+        );
+        assert_eq!(
+            parse_leftover(&old_dir_name("my-db", 42)),
+            Some(Leftover::Old("my-db".into(), 42))
+        );
+        for bad in [
+            "main",
+            ".DS_Store",
+            ".main.old-",
+            ".main.old-1x",
+            ".main.building-",
+            ".Main.old-1",
+            ".main.backup-1",
+            ".git",
+        ] {
+            assert_eq!(parse_leftover(bad), None, "{bad}");
+        }
+        assert!(is_build_socket_name("build-54321"));
+        for bad in ["build-", "build-x", "build-99999", "build-+1", "cabc123"] {
+            assert!(!is_build_socket_name(bad), "{bad}");
+        }
     }
 
     #[test]
@@ -961,6 +1142,6 @@ mod tests {
     fn futures_are_send(ctx: &'static Ctx, args: TemplateInitArgs) {
         fn send<T: Send>(_: T) {}
         send(init(ctx, args));
-        send(refresh(ctx, "main"));
+        send(refresh(ctx, "main", None));
     }
 }
