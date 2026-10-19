@@ -853,9 +853,6 @@ fn swap(build_dir: &Path, final_dir: &Path, old_dir: &Path, log: &Path) -> Resul
         }
         return Err(e.into());
     }
-    if had_old {
-        let _ = std::fs::remove_dir_all(old_dir); // a leftover .old- folder is removed by gc
-    }
     Ok(())
 }
 
@@ -912,12 +909,22 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let measured = blocking(move || Ok((read_pg_version(&b)?, apparent_size(&b)?))).await;
     let swapped = match measured {
         Ok(m) => {
-            // No clone may copy the template folder while it is renamed and the old one removed.
-            let _swap = ctx.template_swap.write().await;
-            let (b, f, l) = (build_dir.clone(), final_dir.clone(), log.clone());
-            blocking(move || swap(&b, &f, &old_dir, &l))
-                .await
-                .map(|()| m)
+            // No clone may copy the template folder while it is renamed.
+            let swap_guard = ctx.template_swap.write().await;
+            let (b, f, o, l) = (
+                build_dir.clone(),
+                final_dir.clone(),
+                old_dir.clone(),
+                log.clone(),
+            );
+            let swapped = blocking(move || swap(&b, &f, &o, &l)).await;
+            drop(swap_guard);
+            // No clone reads the renamed old folder, so it is removed outside the lock;
+            // a leftover .old- folder is removed by gc.
+            if swapped.is_ok() && old_dir.exists() {
+                let _ = blocking(move || Ok(std::fs::remove_dir_all(&old_dir)?)).await;
+            }
+            swapped.map(|()| m)
         }
         Err(e) => Err(e),
     };
