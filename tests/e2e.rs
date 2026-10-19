@@ -133,8 +133,16 @@ type McpClient = RunningService<RoleClient, ()>;
 
 /// Starts `mitosis mcp` on `home` as a child process and completes the MCP handshake.
 async fn mcp_client(home: &Path) -> McpClient {
+    mcp_client_in(home, None).await
+}
+
+/// Like `mcp_client`, with the server's working folder set (relative `env_file` paths resolve there).
+async fn mcp_client_in(home: &Path, cwd: Option<&Path>) -> McpClient {
     let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mitosis")).configure(|c| {
         c.arg("mcp").env("MITOSIS_HOME", home);
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
     });
     ().serve(TokioChildProcess::new(cmd).expect("spawn mitosis mcp"))
         .await
@@ -276,6 +284,65 @@ async fn mcp_tools_roundtrip() {
         list(home).iter().any(|c| c.id == other.id),
         "the CLI clone is not tied to the session"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_named_clone_with_env_file() {
+    if discover().is_empty() {
+        println!("skipping: no Postgres installed");
+        return;
+    }
+    let tmp = tmp_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let TemplateSource::Seed { command, .. } = seed(SEED) else {
+        unreachable!()
+    };
+    ok(home, &["template", "init", "--seed", &command]);
+
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join(".env"), "KEEP=1\n").unwrap();
+    let client = mcp_client_in(home, Some(cwd.path())).await;
+    let r = call(
+        &client,
+        "clone_create",
+        json!({"name": "api-db", "env_file": ".env"}),
+    )
+    .await;
+    let text = result_text(&r);
+    assert_ne!(r.is_error, Some(true), "{text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let info: CloneInfo = serde_json::from_str(&text).unwrap();
+    assert!(v["generation"].as_u64().unwrap() >= 1, "{text}");
+    assert_eq!(v["name"], "api-db");
+    let env = std::fs::read_to_string(cwd.path().join(".env")).unwrap();
+    assert!(env.contains("KEEP=1"), "{env}");
+    assert!(env.contains(&format!("DATABASE_URL={}", info.url)), "{env}");
+    client.cancel().await.expect("stop mcp client");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_clone_destroy_tool() {
+    if discover().is_empty() {
+        println!("skipping: no Postgres installed");
+        return;
+    }
+    let tmp = tmp_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let TemplateSource::Seed { command, .. } = seed(SEED) else {
+        unreachable!()
+    };
+    ok(home, &["template", "init", "--seed", &command]);
+
+    let client = mcp_client(home).await;
+    let r = call(&client, "clone_create", json!({})).await;
+    let c: CloneInfo = serde_json::from_str(&result_text(&r)).expect("clone");
+    assert!(list(home).iter().any(|x| x.id == c.id));
+    let r = call(&client, "clone_destroy", json!({ "id": c.id })).await;
+    assert_ne!(r.is_error, Some(true), "{}", result_text(&r));
+    assert!(list(home).is_empty(), "clone still listed");
+    client.cancel().await.expect("stop mcp client");
 }
 
 /// A daemon from release 0.1: answers every v2 request with the v1 `protocol_mismatch` error and

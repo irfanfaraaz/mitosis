@@ -1,6 +1,7 @@
 //! `mitosis mcp`: the clone tools served over MCP on stdio. stdout carries only MCP frames.
 
 use crate::client;
+use crate::envfile;
 use crate::error::{self, ErrorCode, MitosisError};
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
@@ -9,6 +10,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Deserialize, JsonSchema)]
@@ -16,12 +18,25 @@ use std::time::Duration;
 pub struct CloneCreateParams {
     /// Template to clone. Default "main".
     pub template: Option<String>,
-    /// Optional clone name: a-z, 0-9, '_' or '-'.
+    /// Give the clone a stable name (a-z, 0-9, '_' or '-'). Use it when the same database must keep
+    /// its URL across sessions: asking again for a running clone of that name returns it
+    /// (`existing: true`) instead of a new one. Omit for a throwaway clone.
     pub name: Option<String>,
     /// How long the clone lives, like 30m, 2h or 1d. Default "2h".
     pub ttl: Option<String>,
     /// Keep crash-safe writes (slower). Default false.
     pub durable: Option<bool>,
+    /// With `name`: destroy the running clone of that name and make a new one from the current
+    /// template, so the data is reset. Default false.
+    pub fresh: Option<bool>,
+    /// A `.env` file to point at the clone: its URL is written there. A relative path is resolved
+    /// against the folder the MCP server runs in. Default: no file is touched.
+    pub env_file: Option<String>,
+    /// Variable to set in `env_file`. Default "DATABASE_URL".
+    pub env_var: Option<String>,
+    /// Seconds to wait for room when the clone limits are full. 0 fails at once. Default: the
+    /// daemon's setting.
+    pub wait_secs: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -155,26 +170,29 @@ impl Mitosis {
             name: p.name,
             ttl_secs,
             durable: p.durable.unwrap_or(false),
-            fresh: false,
+            fresh: p.fresh.unwrap_or(false),
+            // Agents must not make undeletable clones.
             protect: false,
             env: None,
-            wait_secs: None,
+            wait_secs: p.wait_secs,
             // This process is the parent: when the MCP session ends, the daemon destroys the clone.
             parent_pid: Some(std::process::id() as i32),
         };
-        let info = match client::request(&self.home, Request::CloneCreate(args)).await? {
-            Response::CloneCreated(info) => info,
-            _ => return Err(unexpected()),
-        };
+        // Also finishes pending `.env` restores first, and resolves a relative path against our cwd.
+        let info =
+            envfile::create_clone(&self.home, args, p.env_file.map(PathBuf::from), p.env_var)
+                .await?;
         // Warnings are best effort: the clone already exists.
-        let warnings: Vec<String> = match client::request(&self.home, Request::TemplateList).await {
-            Ok(Response::Templates { templates }) => templates
-                .into_iter()
-                .filter(|t| t.name == template)
-                .flat_map(|t| t.warnings)
-                .collect(),
-            _ => Vec::new(),
-        };
+        let mut warnings: Vec<String> =
+            match client::request(&self.home, Request::TemplateList).await {
+                Ok(Response::Templates { templates }) => templates
+                    .into_iter()
+                    .filter(|t| t.name == template)
+                    .flat_map(|t| t.warnings)
+                    .collect(),
+                _ => Vec::new(),
+            };
+        warnings.extend(info.warnings.iter().cloned());
         let mut out = serde_json::to_value(&info)?;
         if let Some(obj) = out.as_object_mut() {
             obj.insert(
@@ -196,6 +214,10 @@ impl ServerHandler for Mitosis {}
 /// Serves the clone tools on stdin/stdout until stdin closes.
 pub async fn serve_stdio(home: Home) -> error::Result<()> {
     let internal = |e: String| MitosisError::new(ErrorCode::Internal, format!("mcp: {e}"));
+    // Restores a dead clone's `.env` value; warnings are best effort and stdout is MCP-only.
+    for w in envfile::finish_pending(&home).await {
+        eprintln!("mitosis: {w}");
+    }
     let service = Mitosis { home }
         .serve(rmcp::transport::stdio())
         .await
