@@ -132,6 +132,8 @@ impl Mitosis {
             &self.home,
             Request::CloneDestroy {
                 id_or_name: c.id.clone(),
+                force: false,
+                forget: false,
             },
         )
         .await?
@@ -153,6 +155,8 @@ impl Mitosis {
             name: p.name,
             ttl_secs,
             durable: p.durable.unwrap_or(false),
+            fresh: false,
+            protect: false,
             // This process is the parent: when the MCP session ends, the daemon destroys the clone.
             parent_pid: Some(std::process::id() as i32),
         };

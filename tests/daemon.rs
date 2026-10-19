@@ -175,6 +175,8 @@ fn clone_args() -> CloneCreateArgs {
         ttl_secs: 7200,
         durable: false,
         parent_pid: None,
+        fresh: false,
+        protect: false,
     }
 }
 
@@ -206,6 +208,8 @@ async fn clone_roundtrip_over_socket() {
     match conn
         .ok(Request::CloneDestroy {
             id_or_name: info.id.clone(),
+            force: false,
+            forget: false,
         })
         .await
     {

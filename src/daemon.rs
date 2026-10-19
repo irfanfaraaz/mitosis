@@ -320,10 +320,13 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         Request::TemplateRollback { name, to } => {
             Response::TemplateBuilt(templates::rollback(&ctx, &name, to).await?)
         }
+        Request::TemplateUpgrade { name, to, as_name } => Response::TemplateBuilt(
+            crate::upgrade::upgrade(&ctx, &name, to, as_name.as_deref()).await?,
+        ),
         Request::CloneCreate(args) => {
-            let parent = args.parent_pid;
             let info = clones::create(&ctx, args).await?;
-            if let Some(pid) = parent {
+            // The stored parent: none for a protected clone, the first creator's for a reused one.
+            if let Some(pid) = info.parent_pid {
                 lifecycle::watch_parent(ctx.clone(), info.id.clone(), pid);
             }
             Response::CloneCreated(info)
@@ -331,8 +334,12 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         Request::CloneList => Response::Clones {
             clones: blocking(&ctx, clones::list).await?,
         },
-        Request::CloneDestroy { id_or_name } => Response::Destroyed {
-            id: clones::destroy(&ctx, &id_or_name).await?,
+        Request::CloneDestroy {
+            id_or_name,
+            force,
+            forget,
+        } => Response::Destroyed {
+            id: clones::destroy_with(&ctx, &id_or_name, force, forget).await?,
         },
         Request::ClonePromote {
             id_or_name,

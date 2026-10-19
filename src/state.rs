@@ -127,6 +127,16 @@ pub struct CloneRow {
     pub suspect: bool,
 }
 
+/// A clone name's sticky port and password; kept after the clone is destroyed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReservationRow {
+    pub name: String,
+    pub port: u16,
+    pub password: String,
+    pub template: String,
+    pub last_used: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -206,6 +216,17 @@ INSERT INTO templates (name, database, source, migrations, max_age_secs, current
 INSERT INTO generations (template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes)
     SELECT name, 1, 'full', dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes FROM templates_v1;
 DROP TABLE templates_v1;
+";
+
+/// Runs on every open: a v2 store made before reservations existed gains the table too.
+const RESERVATIONS: &str = "
+CREATE TABLE IF NOT EXISTS reservations (
+    name TEXT PRIMARY KEY,
+    port INTEGER NOT NULL,
+    password TEXT NOT NULL,
+    template TEXT NOT NULL,
+    last_used INTEGER NOT NULL
+);
 ";
 
 const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at";
@@ -372,6 +393,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         )
         .with_hint("run a newer mitosis"));
     }
+    conn.execute_batch(RESERVATIONS)?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
@@ -622,6 +644,59 @@ impl Store {
         self.conn
             .execute("DELETE FROM clones WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    pub fn get_reservation(&self, name: &str) -> Result<Option<ReservationRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name, port, password, template, last_used FROM reservations WHERE name = ?1",
+                [name],
+                |r| {
+                    Ok(ReservationRow {
+                        name: r.get(0)?,
+                        port: r.get::<_, i64>(1)? as u16,
+                        password: r.get(2)?,
+                        template: r.get(3)?,
+                        last_used: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn upsert_reservation(&self, r: &ReservationRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO reservations (name, port, password, template, last_used) VALUES (?1,?2,?3,?4,?5)",
+            params![r.name, i64::from(r.port), r.password, r.template, r.last_used],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_reservation(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM reservations WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Every reserved port, whether or not a clone of that name runs.
+    pub fn reserved_ports(&self) -> Result<HashSet<u16>> {
+        let mut stmt = self.conn.prepare("SELECT port FROM reservations")?;
+        let ports = stmt
+            .query_map([], |r| Ok(r.get::<_, i64>(0)? as u16))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(ports)
+    }
+
+    /// Deletes reservations last used before `before`; returns their names.
+    pub fn drop_stale_reservations(&self, before: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM reservations WHERE last_used < ?1 RETURNING name")?;
+        let names = stmt
+            .query_map([before], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names)
     }
 
     /// The clone row is the port lease.

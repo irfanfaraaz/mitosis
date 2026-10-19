@@ -44,6 +44,12 @@ enum Cmd {
         /// Keep fsync on (slower, survives a crash).
         #[arg(long)]
         durable: bool,
+        /// Destroy a running clone of this name first (same URL, fresh data).
+        #[arg(long)]
+        fresh: bool,
+        /// Never expire; needs --name. Destroy it with `mitosis destroy <name> --force`.
+        #[arg(long)]
+        protect: bool,
         #[arg(long)]
         json: bool,
     },
@@ -53,7 +59,15 @@ enum Cmd {
         json: bool,
     },
     /// Destroy a clone by id or name.
-    Destroy { id_or_name: String },
+    Destroy {
+        id_or_name: String,
+        /// Needed for a protected clone.
+        #[arg(long)]
+        force: bool,
+        /// Also release the name's reserved port and password.
+        #[arg(long)]
+        forget: bool,
+    },
     /// Make a running clone the newest generation of its template (or of --template).
     Promote {
         clone: String,
@@ -149,6 +163,16 @@ enum TemplateCmd {
         /// Generation number; the newest one older than the current by default.
         #[arg(long)]
         to: Option<u32>,
+    },
+    /// Move a template to a newer Postgres major with pg_upgrade.
+    Upgrade {
+        name: String,
+        /// Target Postgres major, like 18.
+        #[arg(long)]
+        to: u32,
+        /// Make a new template with this name instead; the original stays as it is.
+        #[arg(long = "as")]
+        as_name: Option<String>,
     },
 }
 
@@ -307,6 +331,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             name,
             ttl,
             durable,
+            fresh,
+            protect,
             json,
         } => {
             validate_name("template", &template)?;
@@ -319,6 +345,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 name,
                 ttl_secs,
                 durable,
+                fresh,
+                protect,
                 // The CLI exits right after printing the URL, so watching it would destroy the
                 // clone at once: CLI clones live until their TTL or `mitosis destroy`.
                 parent_pid: None,
@@ -327,6 +355,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 Response::CloneCreated(info) => info,
                 other => return Err(unexpected(other)),
             };
+            for w in &info.warnings {
+                eprintln!("warning: {w}");
+            }
+            if info.existing {
+                eprintln!("note: clone {} was already running", info.id);
+            }
             // Warnings are best effort: the clone already exists.
             if let Ok(Response::Templates { templates }) =
                 client::request(&home, Request::TemplateList).await
@@ -356,8 +390,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_clones(&clones);
             }
         }
-        Cmd::Destroy { id_or_name } => {
-            match client::request(&home, Request::CloneDestroy { id_or_name }).await? {
+        Cmd::Destroy {
+            id_or_name,
+            force,
+            forget,
+        } => {
+            let req = Request::CloneDestroy {
+                id_or_name,
+                force,
+                forget,
+            };
+            match client::request(&home, req).await? {
                 Response::Destroyed { id } => println!("{id}"),
                 other => return Err(unexpected(other)),
             }
@@ -622,6 +665,27 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 other => return Err(unexpected(other)),
             }
         }
+        TemplateCmd::Upgrade { name, to, as_name } => {
+            validate_name("template", &name)?;
+            if let Some(n) = &as_name {
+                validate_name("template", n)?;
+            }
+            let req = Request::TemplateUpgrade {
+                name: name.clone(),
+                to,
+                as_name,
+            };
+            match client::request(home, req).await? {
+                Response::TemplateBuilt(t) => println!(
+                    "upgraded {name} to Postgres {}: template {} generation {} ({})",
+                    t.pg_major,
+                    t.name,
+                    t.current_gen,
+                    human_bytes(t.size_bytes)
+                ),
+                other => return Err(unexpected(other)),
+            }
+        }
     }
     Ok(())
 }
@@ -676,6 +740,7 @@ fn print_clones(clones: &[CloneInfo]) {
             "TTL LEFT",
             "RAM",
             "EXTRA DISK",
+            "FLAGS",
         ],
         clones
             .iter()
@@ -686,9 +751,14 @@ fn print_clones(clones: &[CloneInfo]) {
                     c.template.clone(),
                     c.port.to_string(),
                     secs(now - c.created_at),
-                    secs(c.expires_at - now),
+                    if c.protected {
+                        "never".into()
+                    } else {
+                        secs(c.expires_at - now)
+                    },
                     opt_bytes(c.rss_bytes),
                     opt_bytes(c.own_disk_bytes),
+                    if c.protected { "protected" } else { "" }.into(),
                 ]
             })
             .collect(),

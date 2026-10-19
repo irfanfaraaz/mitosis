@@ -3,15 +3,17 @@ use std::collections::HashSet;
 use std::net::TcpListener;
 use std::ops::RangeInclusive;
 
-/// Lowest port in `range` that is not leased, not skipped, and binds on 127.0.0.1 right now.
+/// Lowest port in `range` that is not leased, not skipped, not reserved by a name, and binds on
+/// 127.0.0.1 right now.
 pub fn pick_port(
     range: RangeInclusive<u16>,
     leased: &HashSet<u16>,
     skip: &HashSet<u16>,
+    reserved: &HashSet<u16>,
 ) -> Result<u16> {
     let (lo, hi) = (*range.start(), *range.end());
     range
-        .filter(|p| !leased.contains(p) && !skip.contains(p))
+        .filter(|p| !leased.contains(p) && !skip.contains(p) && !reserved.contains(p))
         .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
         .ok_or_else(|| {
             MitosisError::new(
@@ -31,11 +33,17 @@ mod tests {
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
         let p = busy.local_addr().unwrap().port();
         assert_ne!(
-            pick_port(p..=p.saturating_add(5), &HashSet::new(), &HashSet::new()).unwrap(),
+            pick_port(
+                p..=p.saturating_add(5),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .unwrap(),
             p
         );
         assert_eq!(
-            pick_port(p..=p, &HashSet::new(), &HashSet::new())
+            pick_port(p..=p, &HashSet::new(), &HashSet::new(), &HashSet::new())
                 .unwrap_err()
                 .code,
             ErrorCode::PortsExhausted
@@ -51,11 +59,21 @@ mod tests {
             .port();
         let leased: HashSet<u16> = [p].into();
         assert_eq!(
-            pick_port(p..=p, &leased, &HashSet::new()).unwrap_err().code,
+            pick_port(p..=p, &leased, &HashSet::new(), &HashSet::new())
+                .unwrap_err()
+                .code,
             ErrorCode::PortsExhausted
         );
         assert_eq!(
-            pick_port(p..=p, &HashSet::new(), &leased).unwrap_err().code,
+            pick_port(p..=p, &HashSet::new(), &leased, &HashSet::new())
+                .unwrap_err()
+                .code,
+            ErrorCode::PortsExhausted
+        );
+        assert_eq!(
+            pick_port(p..=p, &HashSet::new(), &HashSet::new(), &leased)
+                .unwrap_err()
+                .code,
             ErrorCode::PortsExhausted
         );
     }

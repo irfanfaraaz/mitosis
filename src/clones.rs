@@ -10,13 +10,15 @@ use crate::ports::pick_port;
 use crate::proc_util::{is_alive, process_start_time, rss_bytes};
 use crate::protocol::{CloneCreateArgs, CloneInfo, OnStale};
 use crate::scheduler;
-use crate::state::{CloneRow, CloneStatus, GenerationRow, TemplateRow};
+use crate::state::{CloneRow, CloneStatus, GenerationRow, ReservationRow, TemplateRow};
 use crate::templates::{age_secs, now};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Start attempts when the chosen port turns out to be taken.
 pub(crate) const START_TRIES: usize = 3;
@@ -63,15 +65,115 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         generation: row.generation,
         stale: false,
         refreshing: false,
+        existing: false,
+        protected: row.protected,
+        warnings: Vec::new(),
+        duration_ms: 0,
     }
 }
 
 pub async fn create(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> {
+    let started = Instant::now();
+    let mut info = create_inner(ctx, args).await?;
+    info.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(info)
+}
+
+/// A named create when a clone of that name exists: its info if it can be reused (`existing`),
+/// an error if not, `None` after `--fresh` destroyed it.
+async fn reuse_named(
+    ctx: &Arc<Ctx>,
+    name: &str,
+    args: &CloneCreateArgs,
+) -> Result<Option<CloneInfo>> {
+    let found = ctx
+        .store()
+        .list_clones()?
+        .into_iter()
+        .find(|c| c.name.as_deref() == Some(name));
+    let Some(mut row) = found else {
+        return Ok(None);
+    };
+    if row.status == CloneStatus::Stopping {
+        return Err(invalid(format!(
+            "clone {name} is being destroyed; try again in a moment"
+        )));
+    }
+    if args.parent_pid.is_some() && row.parent_pid != args.parent_pid {
+        return Err(
+            invalid(format!("a clone named {name} belongs to another session"))
+                .with_hint("use another name"),
+        );
+    }
+    if args.fresh {
+        if row.protected && !args.protect {
+            return Err(invalid(format!("clone {name} is protected"))
+                .with_hint(format!("mitosis destroy {name} --force")));
+        }
+        destroy(ctx, &row.id).await?;
+        return Ok(None);
+    }
+    if row.template != args.template {
+        return Err(invalid(format!(
+            "clone {name} is from template {}, not {}",
+            row.template, args.template
+        ))
+        .with_hint("use another name, or --fresh"));
+    }
+    if row.durable != args.durable || row.protected != args.protect {
+        return Err(invalid(format!(
+            "clone {name} is already running with different durable/protect settings"
+        ))
+        .with_hint("use --fresh"));
+    }
+    let busy = ctx
+        .in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&row.id);
+    if busy || row.status != CloneStatus::Ready {
+        return Err(invalid(format!(
+            "clone {name} is busy; try again in a moment"
+        )));
+    }
+    let t = now();
+    if !row.protected {
+        let wanted = t.saturating_add(i64::try_from(args.ttl_secs).unwrap_or(i64::MAX));
+        if wanted > row.expires_at {
+            row.expires_at = wanted;
+            ctx.store().update_clone(&row)?;
+        }
+    }
+    let age = {
+        let store = ctx.store();
+        if let Some(mut r) = store.get_reservation(name)? {
+            r.last_used = t;
+            store.upsert_reservation(&r)?;
+        }
+        store
+            .current(&row.template)?
+            .map_or(0, |(_, g)| age_secs(g.built_at, t))
+    };
+    let mut info = to_info(&row, age);
+    info.existing = true;
+    Ok(Some(info))
+}
+
+async fn create_inner(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
         validate_name("clone", name)?;
     }
-    if args.ttl_secs == 0 {
+    if args.protect && args.name.is_none() {
+        return Err(invalid("a protected clone needs a name")
+            .with_hint("mitosis clone --name <name> --protect"));
+    }
+    if args.ttl_secs == 0 && !args.protect {
         return Err(invalid("ttl must be greater than zero"));
+    }
+    if let Some(name) = &args.name {
+        if let Some(info) = reuse_named(ctx, name, &args).await? {
+            return Ok(info);
+        }
     }
     // Held from reading the current generation until its folder is cloned, so no commit or prune
     // moves that folder in between.
@@ -89,7 +191,8 @@ pub async fn create(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> 
     let install = ctx.install_major(gen.pg_major).await?;
     let (i, ext) = (install.clone(), gen.extensions.clone());
     blocking(move || check_extensions(&i, &ext)).await?;
-    let parent_start_time = match args.parent_pid {
+    // A protected clone has no parent.
+    let parent_start_time = match args.parent_pid.filter(|_| !args.protect) {
         Some(pid) => Some(
             process_start_time(pid)
                 .filter(|_| is_alive(pid))
@@ -98,11 +201,27 @@ pub async fn create(ctx: &Arc<Ctx>, args: CloneCreateArgs) -> Result<CloneInfo> 
         None => None,
     };
 
-    let (mut row, _in_flight) = reserve(ctx, &tpl, &gen, &args, parent_start_time)?;
+    let (mut row, _in_flight, mut warnings) = reserve(ctx, &tpl, &gen, &args, parent_start_time)?;
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, swap, &gen, &mut row).await {
         Ok(mut info) => {
             (info.stale, info.refreshing) = stale_while_refresh(ctx, &tpl, &gen);
+            // The port moved during start-up (it was taken after the pick): keep the reservation.
+            if let Some(name) = &row.name {
+                let store = ctx.store();
+                // Best effort: the clone is up; a failed write only leaves the old port reserved.
+                if let Some(mut r) = store
+                    .get_reservation(name)
+                    .ok()
+                    .flatten()
+                    .filter(|r| r.port != row.port)
+                {
+                    warnings.push(format!("port {} was taken; the URL changed", r.port));
+                    r.port = row.port;
+                    let _ = store.upsert_reservation(&r);
+                }
+            }
+            info.warnings = warnings;
             Ok(info)
         }
         Err(e) => {
@@ -176,7 +295,7 @@ fn reserve<'a>(
     gen: &GenerationRow,
     args: &CloneCreateArgs,
     parent_start_time: Option<u64>,
-) -> Result<(CloneRow, InFlight<'a>)> {
+) -> Result<(CloneRow, InFlight<'a>, Vec<String>)> {
     let cfg = ctx.config();
     let store = ctx.store();
     let active: Vec<String> = store
@@ -222,8 +341,48 @@ fn reserve<'a>(
             break id;
         }
     };
-    let port = pick_port(cfg.port_range, &store.leased_ports()?, &HashSet::new())?;
     let created_at = now();
+    let leased = store.leased_ports()?;
+    let mut reserved = store.reserved_ports()?;
+    let mut warnings = Vec::new();
+    // A named clone keeps the port and password of its reservation while that port is free.
+    let (port, password) = match &args.name {
+        None => (
+            pick_port(cfg.port_range.clone(), &leased, &HashSet::new(), &reserved)?,
+            random_hex(16),
+        ),
+        Some(name) => {
+            let res = store.get_reservation(name)?;
+            if let Some(r) = &res {
+                reserved.remove(&r.port);
+            }
+            let (port, password) = match res {
+                Some(r)
+                    if cfg.port_range.contains(&r.port)
+                        && !leased.contains(&r.port)
+                        && TcpListener::bind(("127.0.0.1", r.port)).is_ok() =>
+                {
+                    (r.port, r.password)
+                }
+                other => {
+                    let port =
+                        pick_port(cfg.port_range.clone(), &leased, &HashSet::new(), &reserved)?;
+                    if let Some(r) = &other {
+                        warnings.push(format!("port {} was taken; the URL changed", r.port));
+                    }
+                    (port, other.map_or_else(|| random_hex(16), |r| r.password))
+                }
+            };
+            store.upsert_reservation(&ReservationRow {
+                name: name.clone(),
+                port,
+                password: password.clone(),
+                template: tpl.name.clone(),
+                last_used: created_at,
+            })?;
+            (port, password)
+        }
+    };
     let row = CloneRow {
         id: id.clone(),
         name: args.name.clone(),
@@ -231,24 +390,28 @@ fn reserve<'a>(
         dir: clones_dir.join(&id),
         port,
         socket_dir: ctx.home.sockets_dir().join(&id),
-        password: random_hex(16),
+        password,
         database: tpl.database.clone(),
         pg_pid: None,
         pg_start_time: None,
-        parent_pid: args.parent_pid,
+        parent_pid: args.parent_pid.filter(|_| !args.protect),
         parent_start_time,
         created_at,
-        expires_at: created_at.saturating_add(i64::try_from(args.ttl_secs).unwrap_or(i64::MAX)),
+        expires_at: if args.protect {
+            i64::MAX
+        } else {
+            created_at.saturating_add(i64::try_from(args.ttl_secs).unwrap_or(i64::MAX))
+        },
         durable: args.durable,
         status: CloneStatus::Creating,
         generation: gen.gen,
-        protected: false,
+        protected: args.protect,
         suspect: false,
     };
     store.insert_clone(&row)?;
     let mark = mark(ctx, &id, InFlightOp::Create)
         .map_err(|_| internal(format!("clone {id} is already in use")))?;
-    Ok((row, mark))
+    Ok((row, mark, warnings))
 }
 
 fn set_status(ctx: &Ctx, row: &mut CloneRow, status: CloneStatus) -> Result<()> {
@@ -295,7 +458,12 @@ async fn bring_up(
                 blocking(move || stop(&i, &d, Some(pg), t)).await?;
                 tried.insert(row.port);
                 let store = ctx.store();
-                row.port = pick_port(ctx.config().port_range, &store.leased_ports()?, &tried)?;
+                row.port = pick_port(
+                    ctx.config().port_range,
+                    &store.leased_ports()?,
+                    &tried,
+                    &store.reserved_ports()?,
+                )?;
                 store.update_clone(row)?;
             }
             Err(e) => return Err(e),
@@ -323,6 +491,45 @@ async fn bring_up(
     Ok(to_info(row, age_secs(gen.built_at, now())))
 }
 
+/// Destroy as a user asks for it: a protected clone needs `force`; `forget` also drops the
+/// name's reservation (even when no clone of that name is left).
+pub async fn destroy_with(
+    ctx: &Ctx,
+    id_or_name: &str,
+    force: bool,
+    forget: bool,
+) -> Result<String> {
+    let row = ctx.store().get_clone(id_or_name)?;
+    if let Some(r) = row.as_ref().filter(|r| r.protected && !force) {
+        return Err(invalid(format!(
+            "clone {} is protected",
+            r.name.as_deref().unwrap_or(&r.id)
+        ))
+        .with_hint(format!(
+            "mitosis destroy {} --force",
+            r.name.as_deref().unwrap_or(&r.id)
+        )));
+    }
+    match destroy(ctx, id_or_name).await {
+        Ok(id) => {
+            if let Some(name) = row.and_then(|r| r.name).filter(|_| forget) {
+                ctx.store().delete_reservation(&name)?;
+            }
+            Ok(id)
+        }
+        Err(e)
+            if forget
+                && e.code == ErrorCode::CloneNotFound
+                && ctx.store().get_reservation(id_or_name)?.is_some() =>
+        {
+            ctx.store().delete_reservation(id_or_name)?;
+            Ok(id_or_name.to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Destroys regardless of protection (the reaper, the parent watcher and `--fresh` use it).
 pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
     let row = ctx.store().get_clone(id_or_name)?.ok_or_else(|| {
         MitosisError::new(

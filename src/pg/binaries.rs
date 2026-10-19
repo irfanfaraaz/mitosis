@@ -14,6 +14,11 @@ impl PgInstall {
     pub fn bin(&self, name: &str) -> PathBuf {
         self.bin_dir.join(name)
     }
+
+    /// Not required by `discover`; callers check it exists before an upgrade.
+    pub fn pg_upgrade(&self) -> PathBuf {
+        self.bin("pg_upgrade")
+    }
 }
 
 /// Parses `postgres --version` output, e.g. "postgres (PostgreSQL) 16.4" -> (16, "16.4").

@@ -18,3 +18,4 @@ pub mod protocol;
 pub mod scheduler;
 pub mod state;
 pub mod templates;
+pub mod upgrade;

@@ -1096,8 +1096,8 @@ async fn start_build_server(
                 let _ = std::fs::remove_dir(&opts.socket_dir);
                 tried.insert(opts.port);
                 let leased = ctx.store().leased_ports().map_err(at("start"))?;
-                opts.port =
-                    pick_port(ctx.config().port_range, &leased, &tried).map_err(at("start"))?;
+                opts.port = pick_port(ctx.config().port_range, &leased, &tried, &HashSet::new())
+                    .map_err(at("start"))?;
                 opts.socket_dir = build_socket_dir(ctx, opts.port);
             }
             Err(e) => return Err(("start", e)),
@@ -1383,7 +1383,12 @@ fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
     let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
     std::fs::File::create(&log)?;
     let leased = ctx.store().leased_ports()?;
-    let port = pick_port(ctx.config().port_range, &leased, &HashSet::new())?;
+    let port = pick_port(
+        ctx.config().port_range,
+        &leased,
+        &HashSet::new(),
+        &HashSet::new(),
+    )?;
     Ok(StartOptions {
         port,
         socket_dir: build_socket_dir(ctx, port),

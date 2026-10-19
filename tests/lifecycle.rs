@@ -22,6 +22,8 @@ fn args(template: &str) -> CloneCreateArgs {
         ttl_secs: 7200,
         durable: false,
         parent_pid: None,
+        fresh: false,
+        protect: false,
     }
 }
 
@@ -79,6 +81,8 @@ async fn parent_exit_reaps() {
         &env.ctx,
         CloneCreateArgs {
             parent_pid: Some(pid),
+            fresh: false,
+            protect: false,
             ..args("main")
         },
     )
@@ -304,6 +308,8 @@ async fn reconcile_destroys_clone_of_dead_parent() {
         &env.ctx,
         CloneCreateArgs {
             parent_pid: Some(pid),
+            fresh: false,
+            protect: false,
             ..args("main")
         },
     )

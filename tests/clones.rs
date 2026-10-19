@@ -19,6 +19,8 @@ fn args(template: &str) -> CloneCreateArgs {
         ttl_secs: 7200,
         durable: false,
         parent_pid: None,
+        fresh: false,
+        protect: false,
     }
 }
 
@@ -81,16 +83,17 @@ async fn destroy_by_name() {
 }
 
 #[tokio::test]
-async fn duplicate_clone_name_rejected() {
+async fn duplicate_clone_name_returns_existing() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
     let named = || CloneCreateArgs {
         name: Some("dup".into()),
         ..args("main")
     };
-    create(&env.ctx, named()).await.unwrap();
-    let e = create(&env.ctx, named()).await.unwrap_err();
-    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    let a = create(&env.ctx, named()).await.unwrap();
+    // A repeat create of a running name returns that clone (see tests/named.rs).
+    let b = create(&env.ctx, named()).await.unwrap();
+    assert_eq!((a.id.as_str(), b.existing), (b.id.as_str(), true));
     assert_eq!(list(&env.ctx).unwrap().len(), 1);
 }
 

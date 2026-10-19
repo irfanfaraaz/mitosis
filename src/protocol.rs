@@ -129,6 +129,12 @@ pub struct CloneCreateArgs {
     pub ttl_secs: u64,
     pub durable: bool,
     pub parent_pid: Option<i32>,
+    /// Destroy a running clone of this name first (its reservation is kept), then create it.
+    #[serde(default)]
+    pub fresh: bool,
+    /// Needs a name; no parent, no TTL, and `destroy` needs `force`.
+    #[serde(default)]
+    pub protect: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -155,10 +161,24 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<u32>,
     },
+    /// Moves the template to Postgres `to` with pg_upgrade: a new generation, or with `as_name`
+    /// a new template (same database and settings, schedule off).
+    TemplateUpgrade {
+        name: String,
+        to: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_name: Option<String>,
+    },
     CloneCreate(CloneCreateArgs),
     CloneList,
     CloneDestroy {
         id_or_name: String,
+        /// Needed to destroy a protected clone.
+        #[serde(default)]
+        force: bool,
+        /// Also drop the name's reserved port and password.
+        #[serde(default)]
+        forget: bool,
     },
     /// Makes a running clone the newest generation of its template, or of `template`.
     ClonePromote {
@@ -231,6 +251,17 @@ pub struct CloneInfo {
     /// A background refresh of the template was running (or was started) when this clone was made.
     #[serde(default)]
     pub refreshing: bool,
+    /// A named clone that was already running was returned instead of a new one.
+    #[serde(default)]
+    pub existing: bool,
+    /// Never expires and is not destroyed with a parent; `destroy` needs `--force`.
+    #[serde(default)]
+    pub protected: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Wall time of the create request.
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -321,6 +352,8 @@ mod tests {
                 ttl_secs: 7200,
                 durable: false,
                 parent_pid: Some(42),
+                fresh: false,
+                protect: false,
             }),
         };
         let line = serde_json::to_string(&env).unwrap();
@@ -397,6 +430,10 @@ mod tests {
             generation: 2,
             stale: true,
             refreshing: true,
+            existing: false,
+            protected: false,
+            warnings: Vec::new(),
+            duration_ms: 0,
         }
     }
 

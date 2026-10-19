@@ -214,6 +214,8 @@ async fn stale_clone_is_served_and_refresh_starts() {
             ttl_secs: 7200,
             durable: false,
             parent_pid: None,
+            fresh: false,
+            protect: false,
         },
     )
     .await

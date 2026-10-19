@@ -71,6 +71,9 @@ fn in_flight(ctx: &Ctx, id: &str) -> bool {
         .contains_key(id)
 }
 
+/// A name's port and password are kept this long after its last create.
+const RESERVATION_KEEP_SECS: i64 = 30 * 24 * 3600;
+
 /// Destroys Ready clones whose TTL has run out; returns the ids destroyed.
 pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
     let rows = ctx.store().list_clones()?;
@@ -78,7 +81,7 @@ pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
     // Creating/Starting rows belong to an in-flight create; the next pass gets them.
     for row in rows
         .iter()
-        .filter(|r| r.status == CloneStatus::Ready && r.expires_at <= now)
+        .filter(|r| r.status == CloneStatus::Ready && !r.protected && r.expires_at <= now)
     {
         if in_flight(ctx, &row.id) {
             continue;
@@ -292,6 +295,17 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
         }
     }
     remove_orphans(&ctx, &mut report).await;
+    match ctx
+        .store()
+        .drop_stale_reservations(now.saturating_sub(RESERVATION_KEEP_SECS))
+    {
+        Ok(names) if !names.is_empty() => log(
+            &ctx,
+            &format!("gc: dropped unused reservations: {}", names.join(", ")),
+        ),
+        Err(e) => log(&ctx, &format!("gc: reservations: {e}")),
+        _ => {}
+    }
     Ok(report)
 }
 
