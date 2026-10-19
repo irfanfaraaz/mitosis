@@ -7,8 +7,8 @@ use mitosis::lifecycle::{parent_alive, reap_expired, reconcile, watch_parent};
 use mitosis::paths::Home;
 use mitosis::pg::{newest, stop};
 use mitosis::proc_util::process_start_time;
-use mitosis::protocol::CloneCreateArgs;
-use mitosis::state::{CloneRow, CloneStatus};
+use mitosis::protocol::{CloneCreateArgs, GenKind, TemplateSource};
+use mitosis::state::{CloneRow, CloneStatus, GenerationRow, TemplateRow};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -176,12 +176,38 @@ async fn gc_leaves_foreign_entries_alone() {
     assert!(log.contains("my-repo") && log.contains("left"), "{log}");
 }
 
-/// Needs no Postgres. A crash between a swap's two renames leaves only `.<name>.old-*`.
+/// Needs no Postgres. A v0.1 swap that crashed between its two renames leaves only
+/// `.<name>.old-*`; after the upgrade, generation 1 still names `templates/<name>`.
 #[tokio::test]
 async fn reconcile_restores_template_from_old_folder() {
     let tmp = tmp_home();
     let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
     let t = ctx.home.templates_dir();
+    {
+        let store = ctx.store();
+        let source = TemplateSource::Url {
+            url: "postgres://h/db".into(),
+        };
+        store
+            .insert_template(&TemplateRow::new("main", "db", source, None, 1))
+            .unwrap();
+        store
+            .insert_generation(&GenerationRow {
+                template: "main".into(),
+                gen: 1,
+                kind: GenKind::Full,
+                dir: t.join("main"),
+                pg_major: 16,
+                bin_dir: "/opt/pg/bin".into(),
+                extensions: vec![],
+                migrations_hash: None,
+                built_at: 1,
+                size_bytes: 1,
+                from_clone: None,
+                from_gen: None,
+            })
+            .unwrap();
+    }
     for (dir, content) in [(".main.old-5", "older"), (".main.old-9", "newest")] {
         std::fs::create_dir(t.join(dir)).unwrap();
         std::fs::write(t.join(dir).join("PG_VERSION"), content).unwrap();
@@ -252,11 +278,14 @@ async fn reconcile_undoes_half_created() {
         expires_at: t + 7200,
         durable: false,
         status: CloneStatus::Creating,
+        generation: 1,
+        protected: false,
+        suspect: false,
     };
     env.ctx.store().insert_clone(&row).unwrap();
     env.ctx
         .backend
-        .clone_dir(&env.ctx.home.templates_dir().join("main"), &dir)
+        .clone_dir(&env.ctx.home.templates_dir().join("main@1"), &dir)
         .unwrap();
 
     let report = reconcile(restarted(&env), now()).await.unwrap();

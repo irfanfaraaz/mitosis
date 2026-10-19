@@ -6,8 +6,8 @@ use mitosis::ctx::{Config, Ctx};
 use mitosis::error::ErrorCode;
 use mitosis::paths::Home;
 use mitosis::pg::newest;
-use mitosis::protocol::{CloneCreateArgs, TemplateSource};
-use mitosis::state::TemplateRow;
+use mitosis::protocol::{CloneCreateArgs, GenKind, TemplateSource};
+use mitosis::state::{GenerationRow, TemplateRow};
 use mitosis::templates::{self, hash_dir, info, redact_url};
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -33,21 +33,26 @@ fn leftovers(ctx: &Ctx, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn row(name: &str, source: TemplateSource) -> TemplateRow {
-    TemplateRow {
-        name: name.into(),
+/// A template whose current generation is 1.
+fn row(name: &str, source: TemplateSource) -> (TemplateRow, GenerationRow) {
+    let mut t = TemplateRow::new(name, "app", source, None, 7 * 86_400);
+    t.current_gen = 1;
+    t.next_gen = 2;
+    let g = GenerationRow {
+        template: name.into(),
+        gen: 1,
+        kind: GenKind::Full,
         dir: PathBuf::from("/tmp/none"),
         pg_major: 16,
         bin_dir: PathBuf::from("/opt/pg/bin"),
         extensions: vec!["plpgsql".into()],
-        database: "app".into(),
-        source,
-        migrations: None,
         migrations_hash: None,
-        max_age_secs: 7 * 86_400,
         built_at: 1_700_000_000,
         size_bytes: 1,
-    }
+        from_clone: None,
+        from_gen: None,
+    };
+    (t, g)
 }
 
 #[tokio::test]
@@ -62,15 +67,17 @@ async fn seed_template_builds_and_records_metadata() {
     assert_eq!(t.database, "app");
     assert!(t.pg_major >= 12);
     assert!(t.size_bytes > 0);
-    let dir = env.ctx.home.templates_dir().join("main");
+    assert_eq!((t.current_gen, t.generations), (1, 1));
+    let dir = env.ctx.home.templates_dir().join("main@1");
     assert!(dir.join("PG_VERSION").exists());
     assert!(
         !dir.join("postmaster.pid").exists(),
         "build server must be stopped"
     );
     assert!(leftovers(&env.ctx, "main").is_empty());
-    let row = env.ctx.store().get_template("main").unwrap().unwrap();
-    assert!(row.extensions.iter().any(|e| e == "plpgsql"));
+    let (_, gen) = env.ctx.store().current("main").unwrap().unwrap();
+    assert_eq!(gen.dir, dir);
+    assert!(gen.extensions.iter().any(|e| e == "plpgsql"));
     assert_eq!(templates::list(&env.ctx).unwrap().len(), 1);
 }
 
@@ -78,7 +85,7 @@ async fn seed_template_builds_and_records_metadata() {
 async fn failing_seed_leaves_old_template_intact() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", "create table t(id int)").await;
-    let before = env.ctx.store().get_template("main").unwrap().unwrap();
+    let before = env.ctx.store().current("main").unwrap().unwrap();
     let e = templates::init(&env.ctx, template_args("main", seed("select * from nope")))
         .await
         .unwrap_err();
@@ -93,13 +100,11 @@ async fn failing_seed_leaves_old_template_intact() {
         .ctx
         .home
         .templates_dir()
-        .join("main/PG_VERSION")
+        .join("main@1/PG_VERSION")
         .exists());
     assert!(leftovers(&env.ctx, "main").is_empty());
-    assert_eq!(
-        env.ctx.store().get_template("main").unwrap().unwrap(),
-        before
-    );
+    assert_eq!(env.ctx.store().current("main").unwrap().unwrap(), before);
+    assert_eq!(env.ctx.store().list_generations("main").unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -155,6 +160,8 @@ async fn seed_uses_the_callers_path() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::TemplateBuildFailed);
+    // A failed first build leaves no template row behind.
+    assert!(env.ctx.store().get_template("other").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -217,12 +224,16 @@ async fn refresh_reuses_source_and_updates_built_at() {
     assert_eq!(t2.source, t1.source);
     assert_eq!(t2.database, t1.database);
     assert_eq!(t2.pg_major, t1.pg_major);
-    assert!(env
-        .ctx
-        .home
-        .templates_dir()
-        .join("main/PG_VERSION")
-        .exists());
+    assert_eq!((t2.current_gen, t2.generations), (2, 2));
+    for dir in ["main@1", "main@2"] {
+        assert!(env
+            .ctx
+            .home
+            .templates_dir()
+            .join(dir)
+            .join("PG_VERSION")
+            .exists());
+    }
     assert!(leftovers(&env.ctx, "main").is_empty());
 }
 
@@ -247,9 +258,9 @@ fn list_masks_url_password() {
     assert_eq!(redact_url("postgres://h/db"), "postgres://h/db");
     let (_tmp, ctx) = bare_ctx();
     let url = pg_url("u", "secret", "h:5432/db");
-    ctx.store()
-        .upsert_template(&row("main", TemplateSource::Url { url }))
-        .unwrap();
+    let (t, g) = row("main", TemplateSource::Url { url });
+    ctx.store().insert_template(&t).unwrap();
+    ctx.store().insert_generation(&g).unwrap();
     let list = templates::list(&ctx).unwrap();
     assert_eq!(
         list[0].source,
@@ -268,7 +279,7 @@ fn stale_and_migrations_warnings() {
     std::fs::write(mig.join("001.sql"), "create table a(id int);").unwrap();
     std::fs::write(mig.join("sub/002.sql"), "create table b(id int);").unwrap();
     let now = 1_800_000_000;
-    let mut r = row(
+    let (mut r, mut g) = row(
         "main",
         TemplateSource::Seed {
             command: "true".into(),
@@ -276,23 +287,23 @@ fn stale_and_migrations_warnings() {
             path: None,
         },
     );
-    r.built_at = now - 8 * 86_400;
+    g.built_at = now - 8 * 86_400;
     r.migrations = Some(mig.clone());
-    r.migrations_hash = Some(hash_dir(&mig).unwrap());
+    g.migrations_hash = Some(hash_dir(&mig).unwrap());
 
-    let i = info(&r, now);
+    let i = info(&r, &g, 1, now);
     assert_eq!(i.age_secs, 8 * 86_400);
     assert_eq!(
         i.warnings,
         vec!["template is 8 days old; run: mitosis template refresh main".to_string()]
     );
 
-    r.built_at = now - 60;
-    assert!(info(&r, now).warnings.is_empty());
+    g.built_at = now - 60;
+    assert!(info(&r, &g, 1, now).warnings.is_empty());
 
     std::fs::write(mig.join("sub/002.sql"), "create table b(id bigint);").unwrap();
     assert_eq!(
-        info(&r, now).warnings,
+        info(&r, &g, 1, now).warnings,
         vec![format!(
             "migrations in {} changed since the template was built",
             mig.display()
@@ -302,7 +313,7 @@ fn stale_and_migrations_warnings() {
     std::fs::remove_dir_all(&mig).unwrap();
     assert!(hash_dir(&mig).is_err());
     assert!(
-        info(&r, now).warnings.is_empty(),
+        info(&r, &g, 1, now).warnings.is_empty(),
         "a missing migrations folder gives no warning"
     );
 }

@@ -299,6 +299,13 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         Request::TemplateList => Response::Templates {
             templates: blocking(&ctx, templates::list).await?,
         },
+        Request::TemplateHistory { name } => Response::Generations {
+            generations: templates::history(&ctx, &name)?,
+            template: name,
+        },
+        Request::TemplateRollback { name, to } => {
+            Response::TemplateBuilt(templates::rollback(&ctx, &name, to).await?)
+        }
         Request::CloneCreate(args) => {
             let parent = args.parent_pid;
             let info = clones::create(&ctx, args).await?;

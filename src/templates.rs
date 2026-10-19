@@ -7,8 +7,8 @@ use crate::pg::{
     initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
 };
 use crate::ports::pick_port;
-use crate::protocol::{TemplateInfo, TemplateInitArgs, TemplateSource};
-use crate::state::TemplateRow;
+use crate::protocol::{GenKind, GenerationInfo, TemplateInfo, TemplateInitArgs, TemplateSource};
+use crate::state::{GenerationRow, TemplateRow};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use std::collections::HashSet;
@@ -49,7 +49,7 @@ where
         .map_err(|e| internal(format!("background task failed: {e}")))?
 }
 
-pub async fn init(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
+pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo> {
     validate_name("template", &args.name)?;
     if let TemplateSource::Url { url } = &args.source {
         if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
@@ -67,19 +67,38 @@ pub async fn init(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
             )));
         }
     }
+    // An existing template gets a new generation from the new source, on the same database.
+    if let Some(t) = ctx.store().get_template(&args.name)? {
+        if args.database.is_none() && matches!(args.source, TemplateSource::Seed { .. }) {
+            args.database = Some(t.database.clone());
+        }
+        let db = database_for(&args)?;
+        if db != t.database {
+            return Err(invalid(format!(
+                "template {} uses database {}, not {db}",
+                t.name, t.database
+            ))
+            .with_hint(format!(
+                "use another template name, or keep the database {}",
+                t.database
+            )));
+        }
+    }
     build(ctx, args).await
+}
+
+fn not_found(name: &str) -> MitosisError {
+    MitosisError::new(
+        ErrorCode::TemplateNotFound,
+        format!("template {name} not found"),
+    )
+    .with_hint("see existing templates with: mitosis template list")
 }
 
 /// Rebuilds `name` from its recorded source. `path`, when given, replaces a seed's recorded `PATH`.
 pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
     validate_name("template", name)?;
-    let row = ctx.store().get_template(name)?.ok_or_else(|| {
-        MitosisError::new(
-            ErrorCode::TemplateNotFound,
-            format!("template {name} not found"),
-        )
-        .with_hint("see existing templates with: mitosis template list")
-    })?;
+    let (row, cur) = ctx.store().current(name)?.ok_or_else(|| not_found(name))?;
     let source = match row.source {
         TemplateSource::Seed {
             command,
@@ -98,19 +117,39 @@ pub async fn refresh(ctx: &Ctx, name: &str, path: Option<String>) -> Result<Temp
         database: Some(row.database),
         migrations: row.migrations,
         max_age_secs: Some(row.max_age_secs),
-        pg_major: Some(row.pg_major),
+        pg_major: Some(cur.pg_major),
     };
     build(ctx, args).await
 }
 
+/// Templates with a current generation; one still building its first is left out.
 pub fn list(ctx: &Ctx) -> Result<Vec<TemplateInfo>> {
-    let rows = ctx.store().list_templates()?;
+    let store = ctx.store();
     let now = now();
-    Ok(rows.iter().map(|r| info(r, now)).collect())
+    let mut out = Vec::new();
+    for t in store.list_templates()? {
+        let gens = store.list_generations(&t.name)?;
+        if let Some(cur) = gens.iter().find(|g| g.gen == t.current_gen) {
+            out.push(info(&t, cur, gens.len() as u32, now));
+        }
+    }
+    Ok(out)
 }
 
-pub fn info(row: &TemplateRow, now: i64) -> TemplateInfo {
-    let age_secs = now.saturating_sub(row.built_at).max(0) as u64;
+/// The template with its current generation `cur`, out of `generations` kept.
+fn template_info(ctx: &Ctx, name: &str) -> Result<TemplateInfo> {
+    let store = ctx.store();
+    let (t, cur) = store.current(name)?.ok_or_else(|| not_found(name))?;
+    let n = store.list_generations(name)?.len() as u32;
+    Ok(info(&t, &cur, n, now()))
+}
+
+pub(crate) fn age_secs(built_at: i64, now: i64) -> u64 {
+    now.saturating_sub(built_at).max(0) as u64
+}
+
+pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) -> TemplateInfo {
+    let age_secs = age_secs(cur.built_at, now);
     let mut warnings = Vec::new();
     if age_secs > row.max_age_secs {
         warnings.push(format!(
@@ -120,7 +159,7 @@ pub fn info(row: &TemplateRow, now: i64) -> TemplateInfo {
         ));
     }
     if let Some(dir) = row.migrations.as_deref().filter(|d| d.is_dir()) {
-        if hash_dir(dir).ok() != row.migrations_hash {
+        if hash_dir(dir).ok() != cur.migrations_hash {
             warnings.push(format!(
                 "migrations in {} changed since the template was built",
                 dir.display()
@@ -139,14 +178,80 @@ pub fn info(row: &TemplateRow, now: i64) -> TemplateInfo {
     };
     TemplateInfo {
         name: row.name.clone(),
-        pg_major: row.pg_major,
+        pg_major: cur.pg_major,
         source,
         database: row.database.clone(),
-        size_bytes: row.size_bytes,
-        built_at: row.built_at,
+        size_bytes: cur.size_bytes,
+        built_at: cur.built_at,
         age_secs,
         warnings,
+        current_gen: row.current_gen,
+        generations,
+        paused: row.paused,
+        last_error: row.last_error.clone(),
     }
+}
+
+pub fn history(ctx: &Ctx, name: &str) -> Result<Vec<GenerationInfo>> {
+    validate_name("template", name)?;
+    let store = ctx.store();
+    let t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+    Ok(store
+        .list_generations(name)?
+        .into_iter()
+        .map(|g| GenerationInfo {
+            gen: g.gen,
+            kind: g.kind,
+            built_at: g.built_at,
+            pg_major: g.pg_major,
+            size_bytes: g.size_bytes,
+            current: g.gen == t.current_gen,
+            from_clone: g.from_clone,
+            from_gen: g.from_gen,
+        })
+        .collect())
+}
+
+/// Points `name` at generation `to` (default: the newest older than the current one) and pauses
+/// scheduled refreshes, so the rollback sticks.
+pub async fn rollback(ctx: &Ctx, name: &str, to: Option<u32>) -> Result<TemplateInfo> {
+    validate_name("template", name)?;
+    let (cur, gens) = {
+        let store = ctx.store();
+        let (_, cur) = store.current(name)?.ok_or_else(|| not_found(name))?;
+        (cur, store.list_generations(name)?)
+    };
+    let hint = || format!("see generations with: mitosis template history {name}");
+    let target = match to {
+        Some(n) => gens.into_iter().find(|g| g.gen == n).ok_or_else(|| {
+            invalid(format!("template {name} has no generation {n}")).with_hint(hint())
+        })?,
+        None => gens
+            .into_iter()
+            .rev()
+            .find(|g| g.gen < cur.gen)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "template {name} has no generation older than {}",
+                    cur.gen
+                ))
+                .with_hint(hint())
+            })?,
+    };
+    // Clones of the target need its Postgres major.
+    ctx.install_major(target.pg_major).await?;
+    {
+        let store = ctx.store();
+        if !store.set_current(name, target.gen, Some(cur.gen))? {
+            return Err(invalid(format!(
+                "template {name} changed during the rollback; try again"
+            )));
+        }
+        let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+        t.paused = true;
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, name)
 }
 
 /// Masks the password of every `scheme://user:password@host` and every `?password=` query value as `***`.
@@ -669,6 +774,21 @@ fn old_dir_name(name: &str, ts: i64) -> String {
     format!(".{name}.old-{ts}")
 }
 
+/// The folder of generation `gen` of template `name`, in `templates/`.
+fn gen_dir_name(name: &str, gen: u32) -> String {
+    format!("{name}@{gen}")
+}
+
+/// Parses the names `gen_dir_name` makes; anything else is `None`.
+pub(crate) fn parse_gen_dir(file_name: &str) -> Option<(String, u32)> {
+    let (name, gen) = file_name.split_once('@')?;
+    validate_name("template", name).ok()?;
+    if gen.is_empty() || !gen.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((name.into(), gen.parse().ok()?))
+}
+
 /// Parses the names `build_dir_name` and `old_dir_name` make; anything else is `None`.
 pub(crate) fn parse_leftover(file_name: &str) -> Option<Leftover> {
     let (name, suffix) = file_name.strip_prefix('.')?.split_once('.')?;
@@ -832,30 +952,6 @@ async fn fail(
     .with_hint(format!("full log: {}", log.display()))
 }
 
-/// Puts `build_dir` at `final_dir`, keeping the previous template if the rename fails.
-fn swap(build_dir: &Path, final_dir: &Path, old_dir: &Path, log: &Path) -> Result<()> {
-    let had_old = final_dir.exists();
-    if had_old {
-        std::fs::rename(final_dir, old_dir)?;
-    }
-    if let Err(e) = std::fs::rename(build_dir, final_dir) {
-        if had_old {
-            if let Err(re) = std::fs::rename(old_dir, final_dir) {
-                append_log(
-                    log,
-                    &format!(
-                        "mitosis: could not move the previous template back from {} to {}: {re}",
-                        old_dir.display(),
-                        final_dir.display()
-                    ),
-                );
-            }
-        }
-        return Err(e.into());
-    }
-    Ok(())
-}
-
 async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let name = args.name.clone();
     let database = database_for(&args)?;
@@ -871,11 +967,66 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
     let max_age_secs = args
         .max_age_secs
         .unwrap_or(ctx.config().default_max_age_secs);
-    let secrets = source_secrets(&args.source);
+    // The commit expects the pointer read here; a new template starts at 0 (no generation).
+    let (created, expected, gen) = {
+        let store = ctx.store();
+        let (created, expected) = match store.get_template(&name)? {
+            Some(t) => (false, t.current_gen),
+            None => {
+                store.insert_template(&TemplateRow::new(
+                    &name,
+                    &database,
+                    args.source.clone(),
+                    args.migrations.clone(),
+                    max_age_secs,
+                ))?;
+                (true, 0)
+            }
+        };
+        (created, expected, store.alloc_gen(&name)?)
+    };
+    let built = build_gen(
+        ctx,
+        &install,
+        &args,
+        &database,
+        migrations_hash,
+        gen,
+        expected,
+    )
+    .await;
+    let store = ctx.store();
+    if let Err(e) = built {
+        // A failed first build leaves no template behind.
+        if created && matches!(store.list_generations(&name), Ok(g) if g.is_empty()) {
+            let _ = store.delete_template(&name);
+        }
+        return Err(e);
+    }
+    let mut t = store.get_template(&name)?.ok_or_else(|| not_found(&name))?;
+    t.database = database;
+    t.source = args.source;
+    t.migrations = args.migrations;
+    t.max_age_secs = max_age_secs;
+    store.update_template_settings(&t)?;
+    drop(store);
+    template_info(ctx, &name)
+}
 
+/// Builds generation `gen` in a side folder and commits it as a `Full` generation.
+async fn build_gen(
+    ctx: &Ctx,
+    install: &PgInstall,
+    args: &TemplateInitArgs,
+    database: &str,
+    migrations_hash: Option<String>,
+    gen: u32,
+    expected: u32,
+) -> Result<()> {
+    let name = &args.name;
+    let secrets = source_secrets(&args.source);
     let ts = now();
-    let templates_dir = ctx.home.templates_dir();
-    let build_dir = templates_dir.join(build_dir_name(&name, ts));
+    let build_dir = ctx.home.templates_dir().join(build_dir_name(name, ts));
     let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
     std::fs::File::create(&log)?; // truncate, so the error tail belongs to this build
     let leased = ctx.store().leased_ports()?;
@@ -888,71 +1039,138 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
         log_file: log.clone(),
     };
 
-    let result = run_steps(
-        ctx,
-        &install,
-        &build_dir,
-        &mut opts,
-        &database,
-        &args.source,
-    )
-    .await;
+    let result = run_steps(ctx, install, &build_dir, &mut opts, database, &args.source).await;
     let result = match result {
         Ok(ext) => Ok(ext),
-        Err((step, e)) => Err(fail(ctx, &install, &build_dir, &log, &secrets, step, e).await),
+        Err((step, e)) => Err(fail(ctx, install, &build_dir, &log, &secrets, step, e).await),
     };
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let extensions = result?;
 
-    // Step 7: measure, swap, record.
-    let final_dir = templates_dir.join(&name);
-    let old_dir = templates_dir.join(old_dir_name(&name, ts));
+    // Step 7: measure, then commit.
     let b = build_dir.clone();
     let measured = blocking(move || Ok((read_pg_version(&b)?, apparent_size(&b)?))).await;
-    let swapped = match measured {
-        Ok(m) => {
-            // No clone may copy the template folder while it is renamed.
-            let swap_guard = ctx.template_swap.write().await;
-            let (b, f, o, l) = (
-                build_dir.clone(),
-                final_dir.clone(),
-                old_dir.clone(),
-                log.clone(),
-            );
-            let swapped = blocking(move || swap(&b, &f, &o, &l)).await;
-            drop(swap_guard);
-            // No clone reads the renamed old folder, so it is removed outside the lock;
-            // a leftover .old- folder is removed by gc.
-            if swapped.is_ok() && old_dir.exists() {
-                let _ = blocking(move || Ok(std::fs::remove_dir_all(&old_dir)?)).await;
-            }
-            swapped.map(|()| m)
-        }
-        Err(e) => Err(e),
-    };
-    let (pg_major, size_bytes) = match swapped {
+    let (pg_major, size_bytes) = match measured {
         Ok(v) => v,
-        Err(e) => return Err(fail(ctx, &install, &build_dir, &log, &secrets, "swap", e).await),
+        Err(e) => return Err(fail(ctx, install, &build_dir, &log, &secrets, "measure", e).await),
     };
-    let row = TemplateRow {
-        name,
-        dir: final_dir,
+    let row = GenerationRow {
+        template: name.clone(),
+        gen,
+        kind: GenKind::Full,
+        dir: build_dir.clone(),
         pg_major,
         bin_dir: install.bin_dir.clone(),
         extensions,
-        database,
-        source: args.source,
-        migrations: args.migrations,
         migrations_hash,
-        max_age_secs,
         built_at: ts,
         size_bytes,
+        from_clone: None,
+        from_gen: None,
     };
-    let upserted = ctx.store().upsert_template(&row);
-    if let Err(e) = upserted {
-        return Err(fail(ctx, &install, &build_dir, &log, &secrets, "swap", e).await);
+    if let Err(e) = commit_generation(ctx, row, Some(expected)).await {
+        return Err(fail(ctx, install, &build_dir, &log, &secrets, "commit", e).await);
     }
-    Ok(info(&row, now()))
+    Ok(())
+}
+
+/// Moves the built folder `gen.dir` to `templates/<name>@<gen>`, records the generation and, when
+/// the current pointer still equals `expected_current`, makes it current; then prunes.
+/// True when it became current; otherwise it is kept as a non-current generation.
+pub async fn commit_generation(
+    ctx: &Ctx,
+    mut gen: GenerationRow,
+    expected_current: Option<u32>,
+) -> Result<bool> {
+    let side = gen.dir.clone();
+    let final_dir = ctx
+        .home
+        .templates_dir()
+        .join(gen_dir_name(&gen.template, gen.gen));
+    let current = {
+        // Under the write guard, gc and clone creation never see the folder without its row.
+        let _swap = ctx.template_swap.write().await;
+        let (s, f) = (side.clone(), final_dir.clone());
+        blocking(move || Ok(std::fs::rename(&s, &f)?)).await?;
+        gen.dir = final_dir;
+        let store = ctx.store();
+        if let Err(e) = store.insert_generation(&gen) {
+            // Back to the side folder, which the failed build then removes.
+            let _ = std::fs::rename(&gen.dir, &side);
+            return Err(e);
+        }
+        store.set_current(&gen.template, gen.gen, expected_current)?
+    };
+    if !current {
+        crate::lifecycle::log(
+            ctx,
+            &format!(
+                "template {}: generation {} kept as non-current: the current generation changed during the build",
+                gen.template, gen.gen
+            ),
+        );
+    }
+    prune(ctx, &gen.template).await;
+    Ok(current)
+}
+
+/// Removes generations beyond the newest `keep`, never the current one: rows first, then the
+/// folders, renamed aside under the write guard (no clonefile reads them meanwhile) and deleted
+/// outside it. Failures are logged; gc removes what is left.
+async fn prune(ctx: &Ctx, name: &str) {
+    let doomed = match prune_rows(ctx, name) {
+        Ok(d) => d,
+        Err(e) => {
+            return crate::lifecycle::log(ctx, &format!("prune of template {name}: {e}"));
+        }
+    };
+    if doomed.is_empty() {
+        return;
+    }
+    let mut old = Vec::new();
+    {
+        let _swap = ctx.template_swap.write().await;
+        for dir in doomed {
+            let mut ts = now();
+            let to = loop {
+                let to = ctx.home.templates_dir().join(old_dir_name(name, ts));
+                if !to.exists() {
+                    break to;
+                }
+                ts += 1;
+            };
+            match std::fs::rename(&dir, &to) {
+                Ok(()) => old.push(to),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    crate::lifecycle::log(ctx, &format!("prune: move {} aside: {e}", dir.display()))
+                }
+            }
+        }
+    }
+    let _ = blocking(move || {
+        for dir in old {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        Ok(())
+    })
+    .await;
+}
+
+/// Deletes the rows of the generations to prune; returns their folders.
+fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<PathBuf>> {
+    let store = ctx.store();
+    let Some(t) = store.get_template(name)? else {
+        return Ok(Vec::new());
+    };
+    let gens = store.list_generations(name)?;
+    let cut = gens.len().saturating_sub(t.keep as usize);
+    let mut dirs = Vec::new();
+    for g in gens[..cut].iter().filter(|g| g.gen != t.current_gen) {
+        store.delete_generation(name, g.gen)?;
+        dirs.push(g.dir.clone());
+    }
+    Ok(dirs)
 }
 
 #[cfg(test)]
@@ -1146,6 +1364,15 @@ mod tests {
         for bad in ["build-", "build-x", "build-99999", "build-+1", "cabc123"] {
             assert!(!is_build_socket_name(bad), "{bad}");
         }
+        assert_eq!(
+            parse_gen_dir(&gen_dir_name("my-db", 12)),
+            Some(("my-db".into(), 12))
+        );
+        for bad in [
+            "main", "main@", "main@x", "main@+1", "Main@1", "@1", "main@1@2", ".main@1",
+        ] {
+            assert_eq!(parse_gen_dir(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1171,5 +1398,6 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(init(ctx, args));
         send(refresh(ctx, "main", None));
+        send(rollback(ctx, "main", None));
     }
 }

@@ -22,6 +22,55 @@ pub enum TemplateSource {
     },
 }
 
+/// How a template generation was made.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenKind {
+    Full,
+    Layered,
+    Promoted,
+    Upgraded,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshMode {
+    #[default]
+    Full,
+    Layered,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnStale {
+    #[default]
+    Warn,
+    Refresh,
+}
+
+/// A migration command run against a template, in `cwd`, with the caller's `PATH`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct MigrateCmd {
+    pub command: String,
+    pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GenerationInfo {
+    pub gen: u32,
+    pub kind: GenKind,
+    pub built_at: i64,
+    pub pg_major: u32,
+    pub size_bytes: u64,
+    pub current: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_gen: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TemplateInitArgs {
     pub name: String,
@@ -52,6 +101,15 @@ pub enum Request {
         path: Option<String>,
     },
     TemplateList,
+    TemplateHistory {
+        name: String,
+    },
+    /// Points the template at generation `to`, or the newest one older than the current.
+    TemplateRollback {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<u32>,
+    },
     CloneCreate(CloneCreateArgs),
     CloneList,
     CloneDestroy {
@@ -74,6 +132,15 @@ pub struct TemplateInfo {
     pub built_at: i64,
     pub age_secs: u64,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub current_gen: u32,
+    /// How many generations the template keeps on disk.
+    #[serde(default)]
+    pub generations: u32,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -91,6 +158,9 @@ pub struct CloneInfo {
     pub parent_pid: Option<i32>,
     pub rss_bytes: Option<u64>,
     pub own_disk_bytes: Option<u64>,
+    /// The template generation this clone was made from.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -124,10 +194,20 @@ pub struct DaemonStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     TemplateBuilt(TemplateInfo),
-    Templates { templates: Vec<TemplateInfo> },
+    Templates {
+        templates: Vec<TemplateInfo>,
+    },
+    Generations {
+        template: String,
+        generations: Vec<GenerationInfo>,
+    },
     CloneCreated(CloneInfo),
-    Clones { clones: Vec<CloneInfo> },
-    Destroyed { id: String },
+    Clones {
+        clones: Vec<CloneInfo>,
+    },
+    Destroyed {
+        id: String,
+    },
     Gc(GcReport),
     Status(DaemonStatus),
     Ok,
@@ -213,6 +293,10 @@ mod tests {
             built_at: 1_700_000_000,
             age_secs: 5,
             warnings: vec!["w".into()],
+            current_gen: 2,
+            generations: 2,
+            paused: true,
+            last_error: Some("boom".into()),
         }
     }
 
@@ -231,6 +315,7 @@ mod tests {
             parent_pid: Some(7),
             rss_bytes: None,
             own_disk_bytes: Some(9),
+            generation: 2,
         }
     }
 
@@ -257,6 +342,36 @@ mod tests {
         });
         round_trip(Response::TemplateBuilt(template_info()));
         round_trip(Response::CloneCreated(clone_info()));
+        round_trip(Response::Generations {
+            template: "main".into(),
+            generations: vec![GenerationInfo {
+                gen: 1,
+                kind: GenKind::Promoted,
+                built_at: 1,
+                pg_major: 16,
+                size_bytes: 2,
+                current: true,
+                from_clone: Some("feat".into()),
+                from_gen: Some(3),
+            }],
+        });
+    }
+
+    #[test]
+    fn v01_shapes_still_parse() {
+        let t: TemplateInfo = serde_json::from_str(
+            r#"{"name":"main","pg_major":16,"source":{"kind":"url","url":"postgres://h/db"},
+                "database":"db","size_bytes":1,"built_at":1,"age_secs":1,"warnings":[]}"#,
+        )
+        .unwrap();
+        assert_eq!((t.current_gen, t.paused, t.last_error), (0, false, None));
+        let r: Request =
+            serde_json::from_str(r#"{"type":"template_rollback","name":"main"}"#).unwrap();
+        assert!(matches!(r, Request::TemplateRollback { to: None, .. }));
+        assert_eq!(
+            serde_json::to_string(&GenKind::Upgraded).unwrap(),
+            r#""upgraded""#
+        );
     }
 
     #[test]

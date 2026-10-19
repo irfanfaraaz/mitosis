@@ -115,6 +115,21 @@ enum TemplateCmd {
         #[arg(long)]
         json: bool,
     },
+    /// List a template's generations; `*` marks the current one.
+    History {
+        #[arg(default_value = "main")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Point a template back at an older generation and pause its scheduled refreshes.
+    Rollback {
+        #[arg(default_value = "main")]
+        name: String,
+        /// Generation number; the newest one older than the current by default.
+        #[arg(long)]
+        to: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -388,17 +403,24 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 for w in &t.warnings {
                     eprintln!("warning: {}: {w}", t.name);
                 }
+                if let Some(e) = &t.last_error {
+                    eprintln!("last error: {}: {e}", t.name);
+                }
             }
             if json {
                 print_json(&templates)?;
             } else {
                 print_table(
-                    &["NAME", "PG", "DATABASE", "SIZE", "AGE", "SOURCE"],
+                    &[
+                        "NAME", "GEN", "PAUSED", "PG", "DATABASE", "SIZE", "AGE", "SOURCE",
+                    ],
                     templates
                         .iter()
                         .map(|t| {
                             vec![
                                 t.name.clone(),
+                                format!("{}/{}", t.current_gen, t.generations),
+                                if t.paused { "paused" } else { "-" }.to_string(),
                                 t.pg_major.to_string(),
                                 t.database.clone(),
                                 human_bytes(t.size_bytes),
@@ -408,6 +430,49 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                         })
                         .collect(),
                 );
+            }
+        }
+        TemplateCmd::History { name, json } => {
+            validate_name("template", &name)?;
+            let generations = match client::request(home, Request::TemplateHistory { name }).await?
+            {
+                Response::Generations { generations, .. } => generations,
+                other => return Err(unexpected(other)),
+            };
+            if json {
+                print_json(&generations)?;
+            } else {
+                let now = now();
+                print_table(
+                    &["GEN", "KIND", "BUILT", "PG", "SIZE", "CURRENT"],
+                    generations
+                        .iter()
+                        .map(|g| {
+                            let ago = u64::try_from(now - g.built_at).unwrap_or(0);
+                            vec![
+                                g.gen.to_string(),
+                                serde_json::to_value(g.kind)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_default(),
+                                format!("{} ago", format_duration(Duration::from_secs(ago))),
+                                g.pg_major.to_string(),
+                                human_bytes(g.size_bytes),
+                                if g.current { "*" } else { "" }.to_string(),
+                            ]
+                        })
+                        .collect(),
+                );
+            }
+        }
+        TemplateCmd::Rollback { name, to } => {
+            validate_name("template", &name)?;
+            match client::request(home, Request::TemplateRollback { name, to }).await? {
+                Response::TemplateBuilt(t) => println!(
+                    "template {} now uses generation {} (scheduled refreshes paused)",
+                    t.name, t.current_gen
+                ),
+                other => return Err(unexpected(other)),
             }
         }
     }

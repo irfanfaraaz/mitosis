@@ -6,9 +6,10 @@ use crate::pg::{running_server, stop};
 use crate::proc_util::{has_exited, is_alive, process_start_time};
 use crate::protocol::{GcFailure, GcReport};
 use crate::state::{CloneRow, CloneStatus};
-use crate::templates::{is_build_socket_name, now, parse_leftover, Leftover};
+use crate::templates::{is_build_socket_name, now, parse_gen_dir, parse_leftover, Leftover};
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -28,7 +29,7 @@ fn internal(msg: impl Into<String>) -> MitosisError {
 }
 
 /// Appends one line to `logs/daemon.log`; lifecycle work has no caller to report errors to.
-fn log(ctx: &Ctx, msg: &str) {
+pub(crate) fn log(ctx: &Ctx, msg: &str) {
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -450,18 +451,54 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
     }
 
     let templates_dir = ctx.home.templates_dir();
+    // Read guard: a commit renames a folder to `<name>@<gen>` and inserts its row under the write
+    // guard, so a generation folder is never seen here without its row.
+    let _swap = ctx.template_swap.read().await;
+    // By file name: every generation folder sits directly in templates/.
+    let gen_dirs: Result<HashSet<String>> = {
+        let store = ctx.store();
+        store.list_templates().and_then(|ts| {
+            let mut dirs = HashSet::new();
+            for t in ts {
+                dirs.extend(
+                    store
+                        .list_generations(&t.name)?
+                        .into_iter()
+                        .filter_map(|g| {
+                            g.dir.file_name().map(|f| f.to_string_lossy().into_owned())
+                        }),
+                );
+            }
+            Ok(dirs)
+        })
+    };
+    let gen_dirs = match gen_dirs {
+        Ok(d) => d,
+        Err(e) => {
+            // Without the rows nothing in templates/ can be judged; leave it all for the next gc.
+            log(ctx, &format!("gc: list generations: {e}"));
+            failed(report, templates_dir.display().to_string(), &e);
+            return;
+        }
+    };
     let mut leftovers = Vec::new();
     for (file, path) in entries(&templates_dir) {
-        match parse_leftover(&file) {
-            Some(l) => leftovers.push((l, path)),
-            // Built templates have plain names; dot-names that are not leftovers are not ours.
-            None if file.starts_with('.') => foreign(ctx, &path),
-            None => {}
+        if gen_dirs.contains(&file) {
+            continue;
+        }
+        if let Some(l) = parse_leftover(&file) {
+            leftovers.push((l, path));
+        } else if parse_gen_dir(&file).is_some() {
+            // A generation folder with no row: a commit that crashed, or a prune that did not finish.
+            let res = remove_data_dir(ctx, path.clone()).await;
+            done(report, path, res);
+        } else {
+            foreign(ctx, &path);
         }
     }
-    restore_old_templates(ctx, &templates_dir, &mut leftovers, report);
+    restore_old_templates(ctx, &templates_dir, &gen_dirs, &mut leftovers, report);
     for (l, path) in leftovers {
-        // A running build owns its own leftovers (its swap may still need the old copy).
+        // A running build owns its own leftovers (its side folder, the folders its prune removes).
         let tpl = match &l {
             Leftover::Building(tpl) | Leftover::Old(tpl, _) => tpl,
         };
@@ -477,11 +514,14 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
     }
 }
 
-/// A crash between a swap's two renames leaves `.<name>.old-*` but no `templates/<name>`: the newest
-/// such folder is moved back (and dropped from `leftovers`) before the rest are removed.
+/// A v0.1 swap that crashed between its two renames leaves `.<name>.old-*` but no `templates/<name>`.
+/// When an upgraded store still has a generation in `templates/<name>`, the newest such folder is
+/// moved back (and dropped from `leftovers`) before the rest are removed. v0.2 commits never move
+/// a live folder, so its `.old-` folders are only pruned generations, whose rows are gone.
 fn restore_old_templates(
     ctx: &Ctx,
     templates_dir: &Path,
+    gen_dirs: &HashSet<String>,
     leftovers: &mut Vec<(Leftover, PathBuf)>,
     report: &mut GcReport,
 ) {
@@ -499,7 +539,7 @@ fn restore_old_templates(
         let final_dir = templates_dir.join(&name);
         // The build set is held across the rename, so no build can swap this template meanwhile.
         let building = ctx.building.lock().unwrap_or_else(|e| e.into_inner());
-        if building.contains(&name) || final_dir.exists() {
+        if building.contains(&name) || final_dir.exists() || !gen_dirs.contains(&name) {
             continue;
         }
         let old = &leftovers[i].1;
@@ -570,6 +610,9 @@ mod tests {
             expires_at: t + 7200,
             durable: false,
             status,
+            generation: 1,
+            protected: false,
+            suspect: false,
         };
         ctx.store().insert_clone(&row).unwrap();
         std::fs::create_dir(&row.dir).unwrap();

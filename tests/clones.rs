@@ -130,13 +130,20 @@ async fn port_in_use_is_skipped() {
     assert_eq!(psql_url(&env, &a.url, "select count(*) from t"), "1");
 }
 
+/// Rewrites the current generation row of template `main`.
+fn set_current_gen(env: &TestEnv, f: impl FnOnce(&mut mitosis::state::GenerationRow)) {
+    let store = env.ctx.store();
+    let (_, mut g) = store.current("main").unwrap().unwrap();
+    f(&mut g);
+    store.delete_generation("main", g.gen).unwrap();
+    store.insert_generation(&g).unwrap();
+}
+
 #[tokio::test]
 async fn version_mismatch() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
-    let mut row = env.ctx.store().get_template("main").unwrap().unwrap();
-    row.pg_major = 99;
-    env.ctx.store().upsert_template(&row).unwrap();
+    set_current_gen(&env, |g| g.pg_major = 99);
     let e = create(&env.ctx, args("main")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
     assert_eq!(e.hint.as_deref(), Some("brew install postgresql@99"));
@@ -146,9 +153,7 @@ async fn version_mismatch() {
 async fn missing_extension() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
-    let mut row = env.ctx.store().get_template("main").unwrap().unwrap();
-    row.extensions.push("no_such_ext".into());
-    env.ctx.store().upsert_template(&row).unwrap();
+    set_current_gen(&env, |g| g.extensions.push("no_such_ext".into()));
     let e = create(&env.ctx, args("main")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::MissingExtension);
     assert!(e.message.contains("no_such_ext"), "{}", e.message);

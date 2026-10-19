@@ -9,8 +9,8 @@ use crate::pg::{
 use crate::ports::pick_port;
 use crate::proc_util::{is_alive, process_start_time, rss_bytes};
 use crate::protocol::{CloneCreateArgs, CloneInfo};
-use crate::state::{CloneRow, CloneStatus, TemplateRow};
-use crate::templates::{info, now};
+use crate::state::{CloneRow, CloneStatus, GenerationRow, TemplateRow};
+use crate::templates::{age_secs, now};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
@@ -58,6 +58,7 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         parent_pid: row.parent_pid,
         rss_bytes: None,
         own_disk_bytes: None,
+        generation: row.generation,
     }
 }
 
@@ -68,7 +69,10 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
     if args.ttl_secs == 0 {
         return Err(invalid("ttl must be greater than zero"));
     }
-    let tpl = ctx.store().get_template(&args.template)?.ok_or_else(|| {
+    // Held from reading the current generation until its folder is cloned, so no commit or prune
+    // moves that folder in between.
+    let swap = ctx.template_swap.read().await;
+    let (tpl, gen) = ctx.store().current(&args.template)?.ok_or_else(|| {
         MitosisError::new(
             ErrorCode::TemplateNotFound,
             format!("template {} not found", args.template),
@@ -78,8 +82,8 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
             args.template
         ))
     })?;
-    let install = ctx.install_major(tpl.pg_major).await?;
-    let (i, ext) = (install.clone(), tpl.extensions.clone());
+    let install = ctx.install_major(gen.pg_major).await?;
+    let (i, ext) = (install.clone(), gen.extensions.clone());
     blocking(move || check_extensions(&i, &ext)).await?;
     let parent_start_time = match args.parent_pid {
         Some(pid) => Some(
@@ -90,9 +94,9 @@ pub async fn create(ctx: &Ctx, args: CloneCreateArgs) -> Result<CloneInfo> {
         None => None,
     };
 
-    let (mut row, _in_flight) = reserve(ctx, &tpl, &args, parent_start_time)?;
+    let (mut row, _in_flight) = reserve(ctx, &tpl, &gen, &args, parent_start_time)?;
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
-    match bring_up(ctx, &install, &tpl, &mut row).await {
+    match bring_up(ctx, &install, swap, &gen, &mut row).await {
         Ok(info) => Ok(info),
         Err(e) => {
             // A failed cleanup leaves the row in Stopping for gc; the caller still gets the cause.
@@ -145,6 +149,7 @@ pub(crate) fn mark<'a>(
 fn reserve<'a>(
     ctx: &'a Ctx,
     tpl: &TemplateRow,
+    gen: &GenerationRow,
     args: &CloneCreateArgs,
     parent_start_time: Option<u64>,
 ) -> Result<(CloneRow, InFlight<'a>)> {
@@ -212,6 +217,9 @@ fn reserve<'a>(
         expires_at: created_at.saturating_add(i64::try_from(args.ttl_secs).unwrap_or(i64::MAX)),
         durable: args.durable,
         status: CloneStatus::Creating,
+        generation: gen.gen,
+        protected: false,
+        suspect: false,
     };
     store.insert_clone(&row)?;
     let mark = mark(ctx, &id, InFlightOp::Create)
@@ -224,19 +232,19 @@ fn set_status(ctx: &Ctx, row: &mut CloneRow, status: CloneStatus) -> Result<()> 
     ctx.store().update_clone(row)
 }
 
-/// Steps 5-6: clone the template folder, start Postgres, set the password. `row` tracks what was done.
+/// Steps 5-6: clone the generation folder, start Postgres, set the password. `row` tracks what was
+/// done. `swap` (the template read guard) is released once the folder is cloned.
 async fn bring_up(
     ctx: &Ctx,
     install: &PgInstall,
-    tpl: &TemplateRow,
+    swap: tokio::sync::RwLockReadGuard<'_, ()>,
+    gen: &GenerationRow,
     row: &mut CloneRow,
 ) -> Result<CloneInfo> {
-    let (backend, src, dst) = (ctx.backend.clone(), tpl.dir.clone(), row.dir.clone());
-    {
-        // A template refresh cannot move or delete the folder while it is being cloned.
-        let _swap = ctx.template_swap.read().await;
-        blocking(move || backend.clone_dir(&src, &dst)).await?;
-    }
+    let (backend, src, dst) = (ctx.backend.clone(), gen.dir.clone(), row.dir.clone());
+    let cloned = blocking(move || backend.clone_dir(&src, &dst)).await;
+    drop(swap);
+    cloned?;
     set_status(ctx, row, CloneStatus::Starting)?;
 
     let log_file = ctx.home.logs_dir().join(format!("{}.log", row.id));
@@ -288,7 +296,7 @@ async fn bring_up(
     row.pg_pid = Some(pg.pid);
     row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
     set_status(ctx, row, CloneStatus::Ready)?;
-    Ok(to_info(row, info(tpl, now()).age_secs))
+    Ok(to_info(row, age_secs(gen.built_at, now())))
 }
 
 pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
@@ -376,15 +384,17 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
 }
 
 pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
-    let (rows, templates) = {
-        let store = ctx.store();
-        (store.list_clones()?, store.list_templates()?)
-    };
     let now = now();
-    let ages: HashMap<&str, u64> = templates
-        .iter()
-        .map(|t| (t.name.as_str(), info(t, now).age_secs))
-        .collect();
+    let (rows, ages) = {
+        let store = ctx.store();
+        let mut ages: HashMap<String, u64> = HashMap::new();
+        for t in store.list_templates()? {
+            if let Some((_, cur)) = store.current(&t.name)? {
+                ages.insert(t.name, age_secs(cur.built_at, now));
+            }
+        }
+        (store.list_clones()?, ages)
+    };
     Ok(rows
         .iter()
         .map(|r| {
@@ -424,6 +434,9 @@ mod tests {
             expires_at: 20,
             durable: true,
             status: CloneStatus::Ready,
+            generation: 3,
+            protected: false,
+            suspect: false,
         };
         let i = to_info(&row, 5);
         assert_eq!(
@@ -438,6 +451,7 @@ mod tests {
             ("c0a1b2", 5, Some(3), true)
         );
         assert_eq!((i.rss_bytes, i.own_disk_bytes), (None, None));
+        assert_eq!(i.generation, 3);
     }
 
     #[test]
@@ -459,6 +473,9 @@ mod tests {
             expires_at: 0,
             durable: false,
             status: CloneStatus::Ready,
+            generation: 1,
+            protected: false,
+            suspect: false,
         };
         assert_eq!(
             to_info(&row, 0).url,
