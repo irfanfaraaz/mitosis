@@ -22,7 +22,8 @@ if ! command -v pgbench >/dev/null; then
 fi
 command -v pgbench >/dev/null || { echo "error: pgbench not found; put it on PATH (brew install postgresql@18)" >&2; exit 1; }
 
-MITOSIS_HOME="$(mktemp -d "${TMPDIR:-/tmp}/mitosis-bench.XXXXXX")"
+# /tmp, not $TMPDIR: macOS $TMPDIR is long enough to break the 103-byte socket path limit.
+MITOSIS_HOME="$(mktemp -d /tmp/mitosis-bench.XXXXXX)"
 BENCH_HOME="$MITOSIS_HOME"
 export MITOSIS_HOME
 
