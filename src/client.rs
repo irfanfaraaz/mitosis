@@ -101,7 +101,14 @@ async fn replace_old(home: &Home, v: u64) -> Result<()> {
     )
     .await;
     let deadline = Instant::now() + START_TIMEOUT;
-    while UnixStream::connect(home.daemon_sock()).await.is_ok() {
+    let probe = format!(r#"{{"v":{PROTOCOL_VERSION},"request":{{"type":"status"}}}}"#);
+    loop {
+        // Done when nothing answers, or a daemon of our version (a concurrent client replaced it).
+        match raw_exchange(home, &probe).await {
+            None => return Ok(()),
+            Some(r) if r["v"].as_u64() >= Some(u64::from(PROTOCOL_VERSION)) => return Ok(()),
+            Some(_) => {}
+        }
         if Instant::now() >= deadline {
             let pid = raw_exchange(
                 home,
@@ -119,7 +126,6 @@ async fn replace_old(home: &Home, v: u64) -> Result<()> {
         }
         tokio::time::sleep(POLL).await;
     }
-    Ok(())
 }
 
 /// Sends `req` only if a daemon is already listening; `None` when none is.

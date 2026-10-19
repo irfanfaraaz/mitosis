@@ -72,6 +72,8 @@ pub fn plist(binary: &Path, home: Option<&Path>, path_env: &str) -> String {
   <string>{log}</string>
   <key>StandardErrorPath</key>
   <string>{log}</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>
@@ -207,6 +209,7 @@ mod tests {
             "<string>/tmp/m&amp;h</string>",
             "/tmp/m&amp;h/logs/service.log",
             "Background",
+            "ThrottleInterval",
         ] {
             assert!(p.contains(want), "missing {want}:\n{p}");
         }

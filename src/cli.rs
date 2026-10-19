@@ -313,6 +313,10 @@ fn fail(e: &MitosisError) -> ExitCode {
     }
     // Only `mitosis daemon` returns AlreadyRunning; `client::ensure_daemon` looks for this status.
     if e.code == ErrorCode::AlreadyRunning {
+        // Under launchd a non-zero exit means "relaunch me": another daemon already serves, so stop quietly.
+        if std::env::var_os("MITOSIS_SERVICE").is_some_and(|v| v == "1") {
+            return ExitCode::SUCCESS;
+        }
         return ExitCode::from(client::EXIT_ALREADY_RUNNING);
     }
     ExitCode::FAILURE
@@ -418,11 +422,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 env: None,
             };
             let info = envfile::create_clone(&home, args, env_file, env_var).await?;
-            for w in info
-                .warnings
-                .iter()
-                .chain(&envfile::finish_pending(&home).await)
-            {
+            for w in &info.warnings {
                 eprintln!("warning: {w}");
             }
             if info.existing {
