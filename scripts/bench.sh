@@ -23,15 +23,25 @@ fi
 command -v pgbench >/dev/null || { echo "error: pgbench not found; put it on PATH (brew install postgresql@17)" >&2; exit 1; }
 
 MITOSIS_HOME="$(mktemp -d "${TMPDIR:-/tmp}/mitosis-bench.XXXXXX")"
+BENCH_HOME="$MITOSIS_HOME"
 export MITOSIS_HOME
 
 cleanup() {
+  # errexit/pipefail stay active in an EXIT trap; every step here must run regardless.
+  set +e +o pipefail
   # Clones run in their own process group, so destroy them before stopping the daemon.
-  "$MITOSIS" list --json 2>/dev/null | jq -r '.[].id' 2>/dev/null | while read -r id; do
-    "$MITOSIS" destroy "$id" >/dev/null 2>&1 || true
-  done
-  "$MITOSIS" daemon stop >/dev/null 2>&1 || true
-  trash "$MITOSIS_HOME"
+  # Skip when no daemon socket exists, so cleanup never auto-starts one.
+  if [ -S "$BENCH_HOME/daemon.sock" ]; then
+    ids=$("$MITOSIS" list --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
+    for id in $ids; do
+      "$MITOSIS" destroy "$id" >/dev/null 2>&1 || true
+    done
+    "$MITOSIS" daemon stop >/dev/null 2>&1 || true
+  fi
+  # Delete for real (not trash): trash would keep the ~10 GB template on disk in ~/.Trash.
+  if [ -n "$BENCH_HOME" ] && [ "$MITOSIS_HOME" = "$BENCH_HOME" ]; then
+    rm -rf -- "$BENCH_HOME" || true
+  fi
 }
 trap cleanup EXIT
 
@@ -54,13 +64,17 @@ for entry in "${SIZES[@]}"; do
     info=$("$MITOSIS" clone --template "$name" --json)
     t1=$(now)
     free_after=$(free_bytes)
-    id=$(jq -r '.id' <<<"$info")
+    id=$(jq -r '.id // empty' <<<"$info")
+    [ -n "$id" ] || { echo "error: clone --json returned no id: $info" >&2; exit 1; }
     sleep 5
     rss=$("$MITOSIS" list --json | jq -r --arg id "$id" '.[] | select(.id==$id) | .rss_bytes')
     "$MITOSIS" destroy "$id" >/dev/null
+    disk=$(( free_before - free_after ))
+    [[ $rss =~ ^[0-9]+$ ]] || { echo "error: clone $id: rss_bytes is '$rss', not a non-negative integer" >&2; exit 1; }
+    [[ $disk =~ ^[0-9]+$ ]] || { echo "error: clone $id: free-space delta is '$disk' (free space grew during the run?)" >&2; exit 1; }
 
     times+=("$(awk -v a="$t0" -v b="$t1" 'BEGIN{print (b-a)*1000}')")
-    disks+=("$(( free_before - free_after ))")
+    disks+=("$disk")
     rams+=("$rss")
   done
 
