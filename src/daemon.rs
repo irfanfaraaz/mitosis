@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
+const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(10);
 const REAP_EVERY: Duration = Duration::from_secs(30);
 /// Longest request line accepted; a longer one closes the connection.
 const MAX_LINE: usize = 1 << 20;
@@ -87,7 +88,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
             home.root.display()
         ),
     );
-    match lifecycle::reconcile(ctx.clone(), now()).await {
+    match lifecycle::reconcile(ctx.clone(), now(), crate::proc_util::boot_time()).await {
         Ok(r) => log(
             &home,
             &format!(
@@ -117,6 +118,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
     scheduler::run(ctx.clone(), shutdown_rx.clone());
 
+    let mut last_accept_log: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
@@ -125,7 +127,11 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
                     tokio::spawn(connection(shared.clone(), stream));
                 }
                 Err(e) => {
-                    log(&home, &format!("accept failed: {e}"));
+                    // EMFILE repeats every 100 ms: one line per 10 s is enough.
+                    if last_accept_log.is_none_or(|t| t.elapsed() >= ACCEPT_LOG_EVERY) {
+                        last_accept_log = Some(std::time::Instant::now());
+                        log(&home, &format!("accept failed: {e}"));
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
@@ -185,7 +191,12 @@ async fn connection(shared: Shared, stream: UnixStream) {
             .read_until(b'\n', &mut buf)
             .await
         {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            Err(e) => {
+                // The loop returns, so this is at most one line per connection.
+                log(&shared.ctx.home, &format!("connection read failed: {e}"));
+                return;
+            }
             Ok(_) => {}
         }
         let too_large = buf.len() > MAX_LINE && buf.last() != Some(&b'\n');
@@ -354,12 +365,15 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
             ctx.store().delete_pending_restore(id)?;
             Response::Ok
         }
-        Request::Gc => Response::Gc(lifecycle::reconcile(ctx.clone(), now()).await?),
+        Request::Gc => Response::Gc(
+            lifecycle::reconcile(ctx.clone(), now(), crate::proc_util::boot_time()).await?,
+        ),
         Request::Status => {
-            let (clones, templates) = {
+            let (clones, templates) = blocking(&ctx, |ctx| {
                 let store = ctx.store();
-                (store.list_clones()?.len(), store.list_templates()?.len())
-            };
+                Ok((store.list_clones()?.len(), store.list_templates()?.len()))
+            })
+            .await?;
             Response::Status(DaemonStatus {
                 pid: std::process::id(),
                 home: ctx.home.root.clone(),
@@ -370,9 +384,11 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
                 service: std::env::var_os("MITOSIS_SERVICE").is_some_and(|v| v == "1"),
             })
         }
+        Request::Usage => Response::Usage(crate::budget::usage(&ctx).await?),
         Request::ConfigReload => {
             let new = ctx.config().reloaded(&ctx.home)?;
             ctx.set_config(new);
+            ctx.room.notify_waiters(); // a raised limit may let queued creates in
             Response::Ok
         }
         Request::Shutdown => Response::Ok,

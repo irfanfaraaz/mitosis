@@ -24,6 +24,7 @@ fn clone_args(template: &str) -> CloneCreateArgs {
         fresh: false,
         protect: false,
         env: None,
+        wait_secs: None,
     }
 }
 

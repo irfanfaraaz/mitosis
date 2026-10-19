@@ -158,6 +158,7 @@ impl Mitosis {
             fresh: false,
             protect: false,
             env: None,
+            wait_secs: None,
             // This process is the parent: when the MCP session ends, the daemon destroys the clone.
             parent_pid: Some(std::process::id() as i32),
         };

@@ -98,7 +98,8 @@ pub fn discover() -> Vec<PgInstall> {
     let mut installs: Vec<PgInstall> = candidates()
         .into_iter()
         .filter_map(|dir| {
-            let canon = std::fs::canonicalize(&dir).ok()?;
+            // By the real `postgres` file: Homebrew links one install under several folders.
+            let canon = std::fs::canonicalize(dir.join("postgres")).ok()?;
             if !seen.insert(canon) {
                 return None;
             }
@@ -147,13 +148,19 @@ pub fn read_pg_version(data_dir: &Path) -> Result<u32> {
 }
 
 pub fn check_extensions(install: &PgInstall, extensions: &[String]) -> Result<()> {
-    let out = Command::new(install.bin("pg_config"))
-        .arg("--sharedir")
-        .output()?;
+    let pg_config = install.bin("pg_config");
+    let out = Command::new(&pg_config).arg("--sharedir").output()?;
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            format!("{}, no output", out.status)
+        } else {
+            stderr.to_string()
+        };
         return Err(MitosisError::new(
             ErrorCode::Internal,
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            format!("{} --sharedir failed: {detail}", pg_config.display()),
         ));
     }
     let share = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());

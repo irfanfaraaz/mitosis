@@ -5,6 +5,6 @@ pub use binaries::{
     check_extensions, discover, find_major, newest, parse_version, read_pg_version, PgInstall,
 };
 pub use cluster::{
-    initdb, psql, read_postmaster_pid, running_server, start, stop, wait_ready, PostmasterInfo,
-    RunningPg, StartOptions,
+    control_state, initdb, parse_control_state, psql, read_postmaster_pid, running_server, start,
+    stop, wait_ready, ControlState, PostmasterInfo, RunningPg, StartOptions,
 };

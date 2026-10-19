@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use mitosis::client;
 use mitosis::ctx::Config;
 use mitosis::daemon::run;
 use mitosis::error::{ErrorCode, Result};
@@ -133,7 +134,7 @@ async fn protocol_mismatch() {
     let e = reply.result.unwrap_err();
     assert_eq!(e.code, ErrorCode::ProtocolMismatch);
     assert!(
-        e.message.contains("99") && e.message.contains('1'),
+        e.message.contains("99") && e.message.contains(&PROTOCOL_VERSION.to_string()),
         "{}",
         e.message
     );
@@ -168,6 +169,76 @@ async fn second_daemon_refused() {
     shutdown(tmp.path(), handle).await;
 }
 
+#[tokio::test]
+async fn request_too_large_is_rejected() {
+    let tmp = short_home();
+    let handle = start(tmp.path(), Config::default()).await;
+    let mut conn = Conn::open(tmp.path()).await;
+    // Exactly one byte over the 1 MiB limit and no newline: the daemon reads no further.
+    conn.wr.write_all(&vec![b'x'; (1 << 20) + 1]).await.unwrap();
+    let mut reply = String::new();
+    conn.rd.read_line(&mut reply).await.unwrap();
+    let env: ResponseEnvelope = serde_json::from_str(&reply).unwrap();
+    let e = env.result.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.message.contains("too large"), "{}", e.message);
+    reply.clear();
+    assert_eq!(
+        conn.rd.read_line(&mut reply).await.unwrap(),
+        0,
+        "the connection is closed after an oversized request"
+    );
+    // The daemon itself is fine.
+    assert_eq!(status_clones(tmp.path()).await, 0);
+    shutdown(tmp.path(), handle).await;
+}
+
+#[tokio::test]
+async fn daemon_unavailable_when_socket_missing() {
+    let tmp = short_home();
+    let home = Home::at(tmp.path().to_path_buf());
+    // No daemon was ever started: a missing socket means "not running", and nothing is started.
+    assert!(client::request_if_running(&home, Request::Status)
+        .await
+        .unwrap()
+        .is_none());
+
+    // A socket path the OS cannot connect to (over the 104-byte limit) is daemon_unavailable.
+    let long = Home::at(tmp.path().join("x".repeat(120)));
+    let e = client::request_if_running(&long, Request::Status)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::DaemonUnavailable);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_running_request() {
+    let Some(env) = TestEnv::new() else { return };
+    let root = env.tmp.path();
+    let handle = start(root, env.ctx.config()).await;
+    let mut busy = Conn::open(root).await;
+    let build = tokio::spawn(async move {
+        busy.send(Request::TemplateInit(template_args("main", seed(SEED))))
+            .await
+    });
+    // Let the build get past the connection and into its first steps.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !build.is_finished(),
+        "the template build finished too early to test"
+    );
+    shutdown(root, handle).await; // returns only after the daemon finished waiting
+    let reply = tokio::time::timeout(Duration::from_secs(5), build)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(reply.result, Ok(Response::TemplateBuilt(_))),
+        "the running request must finish: {:?}",
+        reply.result
+    );
+}
+
 fn clone_args() -> CloneCreateArgs {
     CloneCreateArgs {
         template: "main".into(),
@@ -178,6 +249,7 @@ fn clone_args() -> CloneCreateArgs {
         fresh: false,
         protect: false,
         env: None,
+        wait_secs: None,
     }
 }
 

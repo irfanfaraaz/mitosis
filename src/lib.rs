@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod cli;
 pub mod client;
 pub mod clone_backend;

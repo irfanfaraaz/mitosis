@@ -5,6 +5,7 @@ use crate::paths::Home;
 use crate::pg::{discover, find_major, newest, PgInstall};
 use crate::state::Store;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
@@ -35,6 +36,13 @@ pub struct Ctx {
     pub(crate) template_swap: tokio::sync::RwLock<()>,
     /// Process groups of running seed commands and dump/restore pipes; killed on daemon shutdown.
     pub(crate) build_groups: Arc<Mutex<HashSet<i32>>>,
+    /// Woken whenever a clone goes away or the settings change, so queued creates look again.
+    pub room: tokio::sync::Notify,
+    /// Held by the one create at the head of the queue from its limit check until its row is
+    /// reserved; tokio's mutex hands it out in arrival order, which is the FIFO order.
+    pub(crate) admission: Arc<tokio::sync::Mutex<()>>,
+    /// Creates waiting for room (including the one at the head).
+    pub(crate) queued: AtomicUsize,
 }
 
 impl Ctx {
@@ -68,6 +76,9 @@ impl Ctx {
             watching: Mutex::new(HashSet::new()),
             template_swap: tokio::sync::RwLock::new(()),
             build_groups: Arc::new(Mutex::new(HashSet::new())),
+            room: tokio::sync::Notify::new(),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
+            queued: AtomicUsize::new(0),
         })
     }
 

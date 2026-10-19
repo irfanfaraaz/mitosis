@@ -1,3 +1,4 @@
+use crate::budget::admit;
 use crate::clone_backend::{free_space, private_size};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::envfile;
@@ -20,7 +21,7 @@ use std::io::{ErrorKind, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Start attempts when the chosen port turns out to be taken.
 pub(crate) const START_TRIES: usize = 3;
@@ -69,9 +70,25 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         refreshing: false,
         existing: false,
         protected: row.protected,
-        warnings: Vec::new(),
+        warnings: row
+            .suspect
+            .then(|| suspect_warning(row))
+            .into_iter()
+            .collect(),
         duration_ms: 0,
+        waited_ms: 0,
+        disk_warn: false,
+        suspect: row.suspect,
     }
+}
+
+/// Why a suspect clone should be replaced, and how.
+pub fn suspect_warning(row: &CloneRow) -> String {
+    let name = row.name.as_deref().unwrap_or(&row.id);
+    format!(
+        "clone {name} was restarted after an unclean shutdown with fsync off; recent writes may be \
+         lost or corrupt (hint: mitosis clone --name {name} --fresh)"
+    )
 }
 
 pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneInfo> {
@@ -202,6 +219,14 @@ async fn reuse_named(
     Ok(Some(info))
 }
 
+fn template_missing(name: &str) -> MitosisError {
+    MitosisError::new(
+        ErrorCode::TemplateNotFound,
+        format!("template {name} not found"),
+    )
+    .with_hint(format!("mitosis template init {name} --seed \"…\""))
+}
+
 async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
         validate_name("clone", name)?;
@@ -218,19 +243,24 @@ async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<Clon
             return Ok(info);
         }
     }
+    // Fail on a missing template before queueing, not after the wait.
+    if ctx.store().current(&args.template)?.is_none() {
+        return Err(template_missing(&args.template));
+    }
+    // Admission comes before the template guard and the store lock, and is held until the row is
+    // reserved, so no other create can pass the limits in between.
+    let wait = args
+        .wait_secs
+        .map_or(ctx.config().queue_wait, Duration::from_secs);
+    let admission = admit(ctx, wait).await?;
+    let waited_ms = u64::try_from(admission.waited.as_millis()).unwrap_or(u64::MAX);
     // Held from reading the current generation until its folder is cloned, so no commit or prune
     // moves that folder in between.
     let swap = ctx.template_swap.read().await;
-    let (tpl, gen) = ctx.store().current(&args.template)?.ok_or_else(|| {
-        MitosisError::new(
-            ErrorCode::TemplateNotFound,
-            format!("template {} not found", args.template),
-        )
-        .with_hint(format!(
-            "mitosis template init {} --seed \"…\"",
-            args.template
-        ))
-    })?;
+    let (tpl, gen) = ctx
+        .store()
+        .current(&args.template)?
+        .ok_or_else(|| template_missing(&args.template))?;
     let install = ctx.install_major(gen.pg_major).await?;
     let (i, ext) = (install.clone(), gen.extensions.clone());
     blocking(move || check_extensions(&i, &ext)).await?;
@@ -244,7 +274,9 @@ async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<Clon
         None => None,
     };
 
-    let (mut row, _in_flight, mut warnings) = reserve(ctx, &tpl, &gen, args, parent_start_time)?;
+    let reserved = reserve(ctx, &tpl, &gen, args, parent_start_time);
+    drop(admission);
+    let (mut row, _in_flight, mut warnings) = reserved?;
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, swap, &gen, &mut row).await {
         Ok(mut info) => {
@@ -265,6 +297,7 @@ async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<Clon
                 }
             }
             info.warnings = warnings;
+            info.waited_ms = waited_ms;
             Ok(info)
         }
         Err(e) => {
@@ -462,6 +495,12 @@ fn reserve<'a>(
     Ok((row, mark, warnings))
 }
 
+/// Test hook, called with (home root, port) right before each Postgres start in `bring_up`, so a
+/// test can occupy the port after `pick_port`'s pre-bind check. Always `None` outside tests.
+#[doc(hidden)]
+pub static PRE_START_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&Path, u16) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 fn set_status(ctx: &Ctx, row: &mut CloneRow, status: CloneStatus) -> Result<()> {
     row.status = status;
     ctx.store().update_clone(row)
@@ -494,6 +533,9 @@ async fn bring_up(
             durable: row.durable,
             log_file: log_file.clone(),
         };
+        if let Some(hook) = &*PRE_START_HOOK.lock().unwrap() {
+            hook(&ctx.home.root, row.port);
+        }
         let pg = start(install, &row.dir, &opts)?;
         // Recorded at once, so a failed create stops exactly this server.
         row.pg_pid = Some(pg.pid);
@@ -537,6 +579,93 @@ async fn bring_up(
     row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
     set_status(ctx, row, CloneStatus::Ready)?;
     Ok(to_info(row, age_secs(gen.built_at, now())))
+}
+
+/// Starts Postgres again on a clone whose server is gone (after a reboot): same folder, port,
+/// socket folder (recreated) and password. If the port is taken it moves, and the reservation and
+/// `.env` records follow; the returned warnings say so. On error the caller cleans up.
+pub async fn restart(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
+    let install = install_for(ctx, &row.dir).ok_or_else(|| {
+        internal(format!(
+            "no Postgres install found for {}",
+            row.dir.display()
+        ))
+    })?;
+    let (dir, sock) = (row.dir.clone(), row.socket_dir.clone());
+    blocking(move || {
+        // A stale pid file can name a pid that now belongs to another process after a reboot.
+        if running_server(&dir, None)?.is_none() {
+            remove_if_present(&dir.join("postmaster.pid"), false)?;
+        }
+        remove_if_present(&sock, true)
+    })
+    .await?;
+
+    let old_port = row.port;
+    let log_file = ctx.home.logs_dir().join(format!("{}.log", row.id));
+    let mut tried = HashSet::new();
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let opts = StartOptions {
+            port: row.port,
+            socket_dir: row.socket_dir.clone(),
+            listen_tcp: true,
+            durable: row.durable,
+            log_file: log_file.clone(),
+        };
+        let pg = start(&install, &row.dir, &opts)?;
+        // Recorded at once, so a later crash or cleanup stops exactly this server.
+        row.pg_pid = Some(pg.pid);
+        row.pg_start_time = Some(pg.start_time);
+        ctx.store().update_clone(row)?;
+        match wait_ready(&install, &pg, &opts, ctx.config().ready_timeout).await {
+            Ok(()) => break,
+            Err(e) if e.code == ErrorCode::PortInUse && tries < START_TRIES => {
+                let (i, d, t) = (install.clone(), row.dir.clone(), ctx.config().stop_timeout);
+                blocking(move || stop(&i, &d, Some(pg), t)).await?;
+                tried.insert(row.port);
+                let store = ctx.store();
+                row.port = pick_port(
+                    ctx.config().port_range,
+                    &store.leased_ports()?,
+                    &tried,
+                    &store.reserved_ports()?,
+                )?;
+                store.update_clone(row)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(pid) = row.pg_pid {
+        row.pg_start_time = process_start_time(pid).or(row.pg_start_time);
+    }
+    ctx.store().update_clone(row)?;
+    if row.port == old_port {
+        return Ok(Vec::new());
+    }
+    let mut warnings = vec![format!("port {old_port} was taken; the URL changed")];
+    let new_url = to_info(row, 0).url;
+    let store = ctx.store();
+    if let Some(name) = &row.name {
+        if let Some(mut r) = store.get_reservation(name)? {
+            r.port = row.port;
+            store.upsert_reservation(&r)?;
+        }
+    }
+    for mut rec in store.env_records(&row.id)? {
+        if let Err(e) = envfile::rewrite(&rec.file, &rec.var, &rec.url, &new_url) {
+            warnings.push(format!(
+                "could not update {} in {}: {}",
+                rec.var,
+                rec.file.display(),
+                e.message
+            ));
+        }
+        rec.url = new_url.clone();
+        store.add_env_record(&row.id, &rec)?;
+    }
+    Ok(warnings)
 }
 
 /// Destroy as a user asks for it: a protected clone needs `force`; `forget` also drops the
@@ -660,7 +789,10 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
     })
     .await?;
     restore_env(ctx, &row.id);
-    ctx.store().delete_clone(&row.id)
+    let deleted = ctx.store().delete_clone(&row.id);
+    // Every destroy path ends here (user, --fresh, reaper, parent watch, gc, failed create).
+    ctx.room.notify_waiters();
+    deleted
 }
 
 /// Puts back the `.env` values the clone replaced. A restore that fails (a read-only file, say)
@@ -696,6 +828,7 @@ fn restore_env(ctx: &Ctx, clone_id: &str) {
 
 pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
     let now = now();
+    let warn_at = ctx.config().clone_disk_warn;
     let (rows, ages) = {
         let store = ctx.store();
         let mut ages: HashMap<String, u64> = HashMap::new();
@@ -716,6 +849,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
                 .filter(|pid| process_start_time(*pid) == r.pg_start_time)
                 .and_then(rss_bytes);
             ci.own_disk_bytes = private_size(&r.dir);
+            ci.disk_warn = ci.own_disk_bytes.is_some_and(|b| b > warn_at);
             ci
         })
         .collect())
@@ -806,5 +940,6 @@ mod tests {
         send(create(ctx, args));
         send(destroy(ctx, "x"));
         send(stop_and_remove(ctx, row));
+        send(restart(ctx, Box::leak(Box::new(row.clone()))));
     }
 }

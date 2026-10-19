@@ -1,3 +1,4 @@
+use crate::budget;
 use crate::client;
 use crate::config::{Config, ConfigEntry};
 use crate::daemon;
@@ -58,6 +59,9 @@ enum Cmd {
         /// The variable to set in --env-file.
         #[arg(long, requires = "env_file")]
         env_var: Option<String>,
+        /// How long to wait for room under the limits, like 30s or 2m; 0 fails at once.
+        #[arg(long)]
+        wait: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -72,6 +76,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Live view of clones, memory and disk against the limits (q to quit).
+    Top,
     /// Destroy a clone by id or name.
     Destroy {
         id_or_name: String,
@@ -402,6 +408,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             protect,
             env_file,
             env_var,
+            wait,
             json,
         } => {
             validate_name("template", &template)?;
@@ -409,6 +416,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 validate_name("clone", n)?;
             }
             let ttl_secs = parse_duration(&ttl)?.as_secs();
+            let wait_secs = match wait.as_deref() {
+                None => None,
+                Some("0" | "0s") => Some(0),
+                Some(w) => Some(parse_duration(w)?.as_secs()),
+            };
             let args = CloneCreateArgs {
                 template: template.clone(),
                 name,
@@ -420,6 +432,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 // clone at once: CLI clones live until their TTL or `mitosis destroy`.
                 parent_pid: None,
                 env: None,
+                wait_secs,
             };
             let info = envfile::create_clone(&home, args, env_file, env_var).await?;
             for w in &info.warnings {
@@ -477,6 +490,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_clones(&clones);
             }
         }
+        Cmd::Top => top(&home).await?,
         Cmd::Destroy {
             id_or_name,
             force,
@@ -850,11 +864,146 @@ fn print_clones(clones: &[CloneInfo]) {
                     },
                     opt_bytes(c.rss_bytes),
                     opt_bytes(c.own_disk_bytes),
-                    if c.protected { "protected" } else { "" }.into(),
+                    flags(c),
                 ]
             })
             .collect(),
     );
+}
+
+/// `!` for a clone past its disk warning, then `protected`.
+fn flags(c: &CloneInfo) -> String {
+    let mut f = Vec::new();
+    if c.disk_warn {
+        f.push("!");
+    }
+    if c.protected {
+        f.push("protected");
+    }
+    f.join(" ")
+}
+
+/// Puts the terminal in no-echo, no-line-buffer mode on the alternate screen, and puts it back on
+/// drop, so every way out of `top` (q, Ctrl-C, an error, a panic) leaves a usable terminal.
+struct RawTerminal {
+    saved: nix::sys::termios::Termios,
+}
+
+impl RawTerminal {
+    fn enter() -> Result<RawTerminal> {
+        use nix::sys::termios::{
+            tcgetattr, tcsetattr, LocalFlags, SetArg, SpecialCharacterIndices as C,
+        };
+        let stdin = std::io::stdin();
+        let saved = tcgetattr(&stdin).map_err(|_| {
+            MitosisError::new(ErrorCode::InvalidRequest, "mitosis top needs a terminal")
+                .with_hint("run it in a terminal, or use `mitosis list --json`")
+        })?;
+        let mut raw = saved.clone();
+        // ISIG off: Ctrl-C arrives as a byte, so this process can clean up before it exits.
+        raw.local_flags
+            .remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG);
+        // A read returns after 2 s (in tenths of a second) or at the first key.
+        raw.control_chars[C::VMIN as usize] = 0;
+        raw.control_chars[C::VTIME as usize] = 20;
+        tcsetattr(&stdin, SetArg::TCSANOW, &raw)
+            .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("terminal: {e}")))?;
+        let term = RawTerminal { saved };
+        print!("\x1b[?1049h\x1b[?25l");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        Ok(term)
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        let _ = nix::sys::termios::tcsetattr(
+            std::io::stdin(),
+            nix::sys::termios::SetArg::TCSANOW,
+            &self.saved,
+        );
+        print!("\x1b[?25h\x1b[?1049l");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+/// Waits up to 2 s for a key; true when it asks to quit (`q` or Ctrl-C).
+fn quit_key() -> bool {
+    use std::io::Read;
+    let mut b = [0u8; 1];
+    matches!(std::io::stdin().read(&mut b), Ok(1) if matches!(b[0], b'q' | b'Q' | 3))
+}
+
+fn draw_top(u: &budget::Usage) {
+    let now = now();
+    let secs = |s: i64| format_duration(Duration::from_secs(u64::try_from(s).unwrap_or(0)));
+    let opt_bytes = |b: Option<u64>| b.map_or("-".to_string(), human_bytes);
+    let of = |used: String, cap: Option<u64>| match cap {
+        Some(c) => format!("{used} / {}", human_bytes(c)),
+        None => format!("{used} / no limit"),
+    };
+    print!("\x1b[H\x1b[2J");
+    println!("mitosis top    q to quit, refreshes every 2s\n");
+    print_table(
+        &[
+            "ID",
+            "NAME",
+            "TEMPLATE",
+            "TTL LEFT",
+            "RAM",
+            "EXTRA DISK",
+            "FLAGS",
+        ],
+        u.clones
+            .iter()
+            .map(|c| {
+                vec![
+                    c.id.clone(),
+                    c.name.clone().unwrap_or_else(|| "-".into()),
+                    c.template.clone(),
+                    if c.protected {
+                        "never".into()
+                    } else {
+                        secs(c.expires_at - now)
+                    },
+                    opt_bytes(c.rss_bytes),
+                    opt_bytes(c.own_disk_bytes),
+                    [(c.disk_warn, "!"), (c.protected, "protected")]
+                        .iter()
+                        .filter(|(on, _)| *on)
+                        .map(|(_, t)| *t)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ]
+            })
+            .collect(),
+    );
+    println!(
+        "\nclones  {} / {}\nram     {}\ndisk    {}\nfree    {}\nqueued  {}",
+        u.clones.len(),
+        u.max_clones,
+        of(human_bytes(u.ram_bytes), u.ram_budget),
+        of(human_bytes(u.disk_bytes), u.disk_budget),
+        human_bytes(u.free_disk_bytes),
+        u.queued
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+async fn top(home: &Home) -> Result<()> {
+    let _terminal = RawTerminal::enter()?;
+    loop {
+        match client::request(home, Request::Usage).await? {
+            Response::Usage(u) => draw_top(&u),
+            other => return Err(unexpected(other)),
+        }
+        let quit = tokio::task::spawn_blocking(quit_key)
+            .await
+            .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("terminal: {e}")))?;
+        if quit {
+            return Ok(());
+        }
+    }
 }
 
 /// Left-aligned columns separated by two spaces.

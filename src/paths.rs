@@ -85,15 +85,26 @@ impl Home {
     }
 
     /// Creates the layout. An existing root without the marker is adopted only when it is empty or
-    /// holds nothing but Mitosis's own entries; any other folder is refused, so gc never sees it.
+    /// holds `state.db` plus nothing but Mitosis's own entries; any other folder is refused, so gc
+    /// never sees it.
     pub fn ensure_dirs(&self) -> Result<()> {
         if !self.marker().exists() {
             std::fs::create_dir_all(&self.root)?;
-            let mut foreign: Vec<String> = std::fs::read_dir(&self.root)?
+            let names: Vec<String> = std::fs::read_dir(&self.root)?
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| !is_own_root_entry(n))
+                .filter(|n| n != ".DS_Store")
                 .collect();
+            // Own-named entries alone (say a stray `clones/`) don't prove the folder is ours.
+            let has_db = names.iter().any(|n| n == "state.db");
+            let mut foreign: Vec<String> = if !names.is_empty() && !has_db {
+                names
+            } else {
+                names
+                    .into_iter()
+                    .filter(|n| !is_own_root_entry(n))
+                    .collect()
+            };
             if !foreign.is_empty() {
                 foreign.sort();
                 if foreign.len() > 5 {
@@ -184,6 +195,7 @@ mod tests {
 
         // Only Mitosis's own entries (a home from before the marker existed): adopted.
         std::fs::remove_file(h.root.join("notes.txt")).unwrap();
+        std::fs::write(h.root.join("state.db"), "").unwrap();
         std::fs::write(h.root.join("state.db-wal"), "").unwrap();
         std::fs::write(h.root.join("daemon.lock"), "").unwrap();
         h.ensure_dirs().unwrap();
@@ -192,6 +204,17 @@ mod tests {
         // Once marked, other files in the root no longer matter.
         std::fs::write(h.root.join("notes.txt"), "mine").unwrap();
         h.ensure_dirs().unwrap();
+    }
+
+    #[test]
+    fn unmarked_root_without_state_db_is_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Home::at(tmp.path().join("m"));
+        std::fs::create_dir(&h.root).unwrap();
+        std::fs::create_dir(h.root.join("clones")).unwrap();
+        let e = h.ensure_dirs().unwrap_err();
+        assert_eq!(e.code, ErrorCode::ForeignHome);
+        assert!(!h.marker().exists());
     }
 
     #[test]

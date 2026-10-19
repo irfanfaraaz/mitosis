@@ -104,6 +104,7 @@ fn clone_args() -> CloneCreateArgs {
         fresh: false,
         protect: false,
         env: None,
+        wait_secs: None,
     }
 }
 

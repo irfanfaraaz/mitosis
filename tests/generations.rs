@@ -33,6 +33,7 @@ fn args(template: &str) -> CloneCreateArgs {
         fresh: false,
         protect: false,
         env: None,
+        wait_secs: None,
     }
 }
 
@@ -366,7 +367,7 @@ async fn stale_generation_folder_is_gc_orphan() {
     let live = t.join("main@1");
     std::fs::create_dir(&live).unwrap();
 
-    let report = reconcile(ctx.clone(), now()).await.unwrap();
+    let report = reconcile(ctx.clone(), now(), None).await.unwrap();
     assert_eq!(report.orphan_folders_removed, vec![stale.clone()]);
     assert!(!stale.exists());
     assert!(notes.is_dir() && live.is_dir());

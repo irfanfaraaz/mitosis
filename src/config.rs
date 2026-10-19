@@ -97,13 +97,13 @@ const KEYS: [KeySpec; 6] = [
     KeySpec {
         key: "ram_budget",
         env: "MITOSIS_RAM_BUDGET",
-        want: "a size like 4GB, or off",
+        want: "a size like 4GB (more than 0), or off",
         example: "4GB",
     },
     KeySpec {
         key: "disk_budget",
         env: "MITOSIS_DISK_BUDGET",
-        want: "a size like 50GB, or off",
+        want: "a size like 50GB (more than 0), or off",
         example: "50GB",
     },
     KeySpec {
@@ -185,7 +185,8 @@ fn parse_budget(v: &str) -> Option<Option<u64>> {
     if v.eq_ignore_ascii_case("off") {
         Some(None)
     } else {
-        parse_size(v).ok().map(Some)
+        // A zero budget would refuse every clone; `off` is the way to say no limit.
+        parse_size(v).ok().filter(|n| *n > 0).map(Some)
     }
 }
 
@@ -509,6 +510,22 @@ mod tests {
         let env = |k: &str| (k == "MITOSIS_QUEUE_WAIT").then(|| "2m".to_string());
         let (c, _) = Config::default().layered(&home, &env).unwrap();
         assert_eq!(c.queue_wait, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn zero_budgets_are_rejected() {
+        let (_tmp, home) = home();
+        for key in ["ram_budget", "disk_budget"] {
+            std::fs::write(home.config_file(), format!("{key} = \"0\"\n")).unwrap();
+            let e = Config::default().layered(&home, &no_env).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidRequest);
+            assert!(e.message.contains(key), "{}", e.message);
+            assert!(Config::set_in_file(&home, key, "0").is_err());
+            let env =
+                |k: &str| (k == format!("MITOSIS_{}", key.to_uppercase())).then(|| "0".to_string());
+            std::fs::remove_file(home.config_file()).unwrap();
+            assert!(Config::default().layered(&home, &env).is_err());
+        }
     }
 
     #[test]

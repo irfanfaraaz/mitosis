@@ -31,17 +31,27 @@ cleanup() {
   # errexit/pipefail stay active in an EXIT trap; every step here must run regardless.
   set +e +o pipefail
   # Clones run in their own process group, so destroy them before stopping the daemon.
-  # Skip when no daemon socket exists, so cleanup never auto-starts one.
+  # Skip the destroys when no daemon socket exists, so cleanup never auto-starts one.
   if [ -S "$BENCH_HOME/daemon.sock" ]; then
     ids=$("$MITOSIS" list --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
     for id in $ids; do
       "$MITOSIS" destroy "$id" >/dev/null 2>&1 || true
     done
-    "$MITOSIS" daemon stop >/dev/null 2>&1 || true
   fi
+  # Always try: a daemon can be running with its socket file gone. Errors are ignored.
+  "$MITOSIS" daemon stop >/dev/null 2>&1 || true
+  # Never delete the folder under a running clone Postgres: keep it and say where it is.
+  running=0
+  for pidfile in "$BENCH_HOME"/clones/*/postmaster.pid; do
+    [ -f "$pidfile" ] || continue
+    pid=$(head -n 1 "$pidfile" 2>/dev/null)
+    if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then running=1; break; fi
+  done
+  if [ "$running" = 1 ]; then
+    echo "warning: a clone Postgres is still running; left $BENCH_HOME in place (delete it by hand)" >&2
   # Delete for real (not trash): trash would keep the ~10 GB template on disk in ~/.Trash.
-  if [ -n "$BENCH_HOME" ] && [ "$MITOSIS_HOME" = "$BENCH_HOME" ]; then
-    rm -rf -- "$BENCH_HOME" || true
+  elif [ -n "$BENCH_HOME" ] && [ "$MITOSIS_HOME" = "$BENCH_HOME" ]; then
+    trash -- "$BENCH_HOME" || true
   fi
 }
 trap cleanup EXIT

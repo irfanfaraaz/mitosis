@@ -65,6 +65,7 @@ impl Fixture {
             fresh: false,
             protect: false,
             env: None,
+            wait_secs: None,
         };
         create_clone(&self.home, args, Some(file.to_path_buf()), None)
             .await

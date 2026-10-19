@@ -14,6 +14,8 @@ pub enum ErrorCode {
     TemplateBuildFailed,
     CloneNotFound,
     CapReached,
+    /// A RAM or disk budget is used up.
+    BudgetFull,
     LowDisk,
     PortsExhausted,
     PortInUse,

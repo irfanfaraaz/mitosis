@@ -46,6 +46,23 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
     (n == size).then_some(info.pbi_start_tvsec)
 }
 
+/// When the machine booted, in seconds since the Unix epoch (`sysctlbyname("kern.boottime")`).
+pub fn boot_time() -> Option<i64> {
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && size == std::mem::size_of::<libc::timeval>() && tv.tv_sec > 0)
+        .then_some(tv.tv_sec as i64)
+}
+
 /// The current directory of `pid` as (device, inode, path), from `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
 /// Fails with ESRCH when the process is gone and EPERM when it belongs to another user.
 pub fn process_cwd(pid: i32) -> std::io::Result<(u64, u64, PathBuf)> {
@@ -164,6 +181,13 @@ mod tests {
         assert_eq!((dev, ino), (meta.dev(), meta.ino()));
         assert!(path.ends_with(dir.path().file_name().unwrap()), "{path:?}");
         assert!(process_cwd(i32::MAX).is_err());
+    }
+
+    #[test]
+    fn boot_time_is_before_our_start() {
+        let me = process_start_time(std::process::id() as i32).unwrap() as i64;
+        let boot = boot_time().unwrap();
+        assert!(boot > 1_000_000_000 && boot <= me, "{boot} vs {me}");
     }
 
     #[test]

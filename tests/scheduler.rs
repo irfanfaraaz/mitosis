@@ -217,6 +217,7 @@ async fn stale_clone_is_served_and_refresh_starts() {
             fresh: false,
             protect: false,
             env: None,
+            wait_secs: None,
         },
     )
     .await
@@ -322,7 +323,7 @@ async fn crashed_build_leaves_no_generation() {
     drop(ctx); // the daemon dies mid-build
 
     let ctx = Arc::new(Ctx::open(home(), Config::default()).unwrap());
-    let report = reconcile(ctx.clone(), now()).await.unwrap();
+    let report = reconcile(ctx.clone(), now(), None).await.unwrap();
     assert!(report.orphan_folders_removed.contains(&side), "{report:?}");
     assert!(side_folders(&ctx).is_empty());
     let store = ctx.store();

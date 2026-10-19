@@ -22,6 +22,7 @@ fn args(template: &str) -> CloneCreateArgs {
         fresh: false,
         protect: false,
         env: None,
+        wait_secs: None,
     }
 }
 
@@ -131,6 +132,33 @@ async fn port_in_use_is_skipped() {
         return;
     };
     let a = create(&env.ctx, args("main")).await.unwrap();
+    assert_ne!(a.port, first);
+    assert_eq!(psql_url(&env, &a.url, "select count(*) from t"), "1");
+}
+
+/// Reaches the PortInUse retry loop: the first candidate port is occupied through
+/// `PRE_START_HOOK` after `pick_port`'s pre-bind check passed, so postgres itself hits the conflict.
+#[tokio::test]
+async fn port_in_use_retry_picks_next_port() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let first = *env.ctx.config().port_range.start();
+    let root = env.ctx.home.root.clone();
+    let held = Arc::new(std::sync::Mutex::new(None::<TcpListener>));
+    let h = held.clone();
+    *mitosis::clones::PRE_START_HOOK.lock().unwrap() = Some(Box::new(move |r, port| {
+        let mut slot = h.lock().unwrap();
+        if r == root && port == first && slot.is_none() {
+            *slot = TcpListener::bind(("127.0.0.1", port)).ok();
+        }
+    }));
+    let made = create(&env.ctx, args("main")).await;
+    *mitosis::clones::PRE_START_HOOK.lock().unwrap() = None;
+    if held.lock().unwrap().is_none() {
+        println!("skipping: could not occupy port {first}");
+        return;
+    }
+    let a = made.unwrap();
     assert_ne!(a.port, first);
     assert_eq!(psql_url(&env, &a.url, "select count(*) from t"), "1");
 }

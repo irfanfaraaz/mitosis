@@ -139,6 +139,9 @@ pub struct CloneCreateArgs {
     /// put `previous` back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvTarget>,
+    /// How long to wait for room under the limits; `None` uses the daemon's `queue_wait`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_secs: Option<u64>,
 }
 
 /// One variable in one `.env` file that holds a clone's URL.
@@ -220,6 +223,8 @@ pub enum Request {
     },
     Gc,
     Status,
+    /// Resource use of all clones against the limits.
+    Usage,
     /// Re-read `config.toml` and the environment; later requests use the new settings.
     ConfigReload,
     Shutdown,
@@ -294,6 +299,15 @@ pub struct CloneInfo {
     /// Wall time of the create request.
     #[serde(default)]
     pub duration_ms: u64,
+    /// Time the create spent queued for room under the limits.
+    #[serde(default)]
+    pub waited_ms: u64,
+    /// The clone's own disk use is past `clone_disk_warn`.
+    #[serde(default)]
+    pub disk_warn: bool,
+    /// Restarted after an unclean shutdown with fsync off: recent writes may be lost or corrupt.
+    #[serde(default)]
+    pub suspect: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -305,6 +319,9 @@ pub struct GcReport {
     /// Entries gc could not clean up; they are retried on the next gc.
     #[serde(default)]
     pub failed: Vec<GcFailure>,
+    /// Things the caller should know, such as a restarted clone that is suspect.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -355,6 +372,7 @@ pub enum Response {
     },
     Gc(GcReport),
     Status(DaemonStatus),
+    Usage(crate::budget::Usage),
     Ok,
 }
 
@@ -396,6 +414,7 @@ mod tests {
                 fresh: false,
                 protect: false,
                 env: None,
+                wait_secs: None,
             }),
         };
         let line = serde_json::to_string(&env).unwrap();
@@ -476,6 +495,9 @@ mod tests {
             protected: false,
             warnings: Vec::new(),
             duration_ms: 0,
+            waited_ms: 0,
+            disk_warn: false,
+            suspect: false,
         }
     }
 

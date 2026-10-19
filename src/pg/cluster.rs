@@ -92,6 +92,11 @@ pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Resul
         .create(true)
         .append(true)
         .open(&opts.log_file)?;
+    // The log is appended across tries; wait_ready classifies only what follows the last marker.
+    let tries = std::fs::read_to_string(&opts.log_file)
+        .map(|t| t.matches(TRY_MARKER).count())
+        .unwrap_or(0);
+    writeln!(&log, "{TRY_MARKER} {}", tries + 1)?;
     let log_err = log.try_clone()?;
 
     let listen = if opts.listen_tcp {
@@ -147,6 +152,19 @@ pub fn start(install: &PgInstall, data_dir: &Path, opts: &StartOptions) -> Resul
     })
 }
 
+const TRY_MARKER: &str = "mitosis: start try";
+
+/// Like `log_tail`, but only the lines after the last start-try marker (the current try).
+fn current_try_tail(path: &Path, n: usize) -> String {
+    let tail = log_tail(path, usize::MAX);
+    let after = match tail.rfind(TRY_MARKER) {
+        Some(i) => tail[i..].split_once('\n').map_or("", |(_, rest)| rest),
+        None => &tail,
+    };
+    let lines: Vec<&str> = after.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// Last `n` lines of the last 64 KiB of the file; empty if unreadable.
 pub(crate) fn log_tail(path: &Path, n: usize) -> String {
     let read = || -> std::io::Result<String> {
@@ -186,7 +204,10 @@ pub async fn wait_ready(
     let deadline = Instant::now() + timeout;
     loop {
         if has_exited(pg.pid) {
-            return Err(start_failure(&log_tail(&opts.log_file, 20), opts.port));
+            return Err(start_failure(
+                &current_try_tail(&opts.log_file, 20),
+                opts.port,
+            ));
         }
         let ready = tokio::process::Command::new(install.bin("pg_isready"))
             .arg("-h")
@@ -205,7 +226,7 @@ pub async fn wait_ready(
                 format!(
                     "postgres not ready after {}s:\n{}",
                     timeout.as_secs(),
-                    log_tail(&opts.log_file, 20)
+                    current_try_tail(&opts.log_file, 20)
                 ),
             ));
         }
@@ -389,7 +410,47 @@ pub fn stop(
     remove_dead_pid_file(data_dir)
 }
 
-/// Reads lines 1 (pid), 2 (data dir), 3 (start time) and 4 (port) of `postmaster.pid`;
+/// `Database cluster state` from `pg_control`, as `pg_controldata` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlState {
+    /// Shut down cleanly (`shut down` or `shut down in recovery`): every write reached disk.
+    ShutDown,
+    InProduction,
+    Other(String),
+}
+
+/// The cluster state from `pg_controldata` output; `None` when the line is missing.
+pub fn parse_control_state(text: &str) -> Option<ControlState> {
+    let state = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Database cluster state:"))?
+        .trim();
+    Some(match state {
+        "shut down" | "shut down in recovery" => ControlState::ShutDown,
+        "in production" => ControlState::InProduction,
+        other => ControlState::Other(other.to_string()),
+    })
+}
+
+/// Runs `pg_controldata` on a stopped (or crashed) cluster and reads its state.
+pub fn control_state(install: &PgInstall, data_dir: &Path) -> Result<ControlState> {
+    let out = Command::new(install.bin("pg_controldata"))
+        .arg("-D")
+        .arg(data_dir)
+        .env("LC_ALL", "C") // the labels are translated otherwise
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match parse_control_state(&text) {
+        Some(s) if out.status.success() => Ok(s),
+        _ => Err(internal(format!(
+            "pg_controldata failed for {}: {}",
+            data_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
+}
+
+/// Reads lines 1-4 of `postmaster.pid` (pid, data dir, start time, port);
 /// `None` if the file is absent.
 pub fn read_postmaster_pid(data_dir: &Path) -> Result<Option<PostmasterInfo>> {
     let text = match std::fs::read_to_string(data_dir.join("postmaster.pid")) {
@@ -601,5 +662,52 @@ mod tests {
         let e = start_failure("FATAL:  data directory has wrong ownership", 54321);
         assert_eq!(e.code, ErrorCode::PostgresStartFailed);
         assert!(e.message.contains("wrong ownership"));
+    }
+
+    #[test]
+    fn current_try_tail_ignores_earlier_tries() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pg.log");
+        std::fs::write(
+            &p,
+            "mitosis: start try 1\nFATAL: Address already in use\nmitosis: start try 2\nFATAL: other\n",
+        )
+        .unwrap();
+        assert_eq!(current_try_tail(&p, 20), "FATAL: other");
+        std::fs::write(&p, "no marker\n").unwrap();
+        assert_eq!(current_try_tail(&p, 20), "no marker");
+    }
+
+    #[test]
+    fn parse_control_state_cases() {
+        let sample = |state: &str| {
+            format!(
+                "pg_control version number:            1300\n\
+                 Catalog version number:               202307071\n\
+                 Database system identifier:           7300000000000000000\n\
+                 Database cluster state:               {state}\n\
+                 pg_control last modified:             Mon Oct 19 10:00:00 2026\n"
+            )
+        };
+        assert_eq!(
+            parse_control_state(&sample("shut down")),
+            Some(ControlState::ShutDown)
+        );
+        assert_eq!(
+            parse_control_state(&sample("shut down in recovery")),
+            Some(ControlState::ShutDown)
+        );
+        assert_eq!(
+            parse_control_state(&sample("in production")),
+            Some(ControlState::InProduction)
+        );
+        assert_eq!(
+            parse_control_state(&sample("in crash recovery")),
+            Some(ControlState::Other("in crash recovery".into()))
+        );
+        assert_eq!(
+            parse_control_state("pg_control version number: 1300\n"),
+            None
+        );
     }
 }

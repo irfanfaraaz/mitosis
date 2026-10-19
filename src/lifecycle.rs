@@ -1,8 +1,8 @@
-use crate::clones::{destroy, install_for, mark, stop_and_remove};
+use crate::clones::{destroy, install_for, mark, restart, stop_and_remove, suspect_warning};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::is_clone_id;
-use crate::pg::{running_server, stop};
+use crate::pg::{control_state, running_server, stop, ControlState, RunningPg};
 use crate::proc_util::{has_exited, is_alive, process_start_time};
 use crate::protocol::{GcFailure, GcReport};
 use crate::state::{CloneRow, CloneStatus};
@@ -272,7 +272,8 @@ async fn destroy_after_parent_exit(watch: Watch) {
 /// Brings the store and the home folder back in line after a crash; safe while requests are served.
 /// Clones with an in-flight create and templates with a running build are left alone.
 /// A failure on one entry is logged to `logs/daemon.log` and the rest still run.
-pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
+/// `boot_time` (`proc_util::boot_time()`) tells which dead servers died in a reboot.
+pub async fn reconcile(ctx: Arc<Ctx>, now: i64, boot_time: Option<i64>) -> Result<GcReport> {
     let mut report = GcReport::default();
     let ids: Vec<String> = ctx
         .store()
@@ -289,7 +290,7 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
             Some(row) if row.id == id => row,
             _ => continue,
         };
-        if let Err(e) = reconcile_clone(&ctx, &row, now, &mut report).await {
+        if let Err(e) = reconcile_clone(&ctx, &row, now, boot_time, &mut report).await {
             log(&ctx, &format!("gc: clone {id}: {e}"));
             failed(&mut report, id, &e);
         }
@@ -313,6 +314,7 @@ async fn reconcile_clone(
     ctx: &Arc<Ctx>,
     row: &CloneRow,
     now: i64,
+    boot_time: Option<i64>,
     report: &mut GcReport,
 ) -> Result<()> {
     let dir = ctx.home.clones_dir().join(&row.id);
@@ -326,6 +328,10 @@ async fn reconcile_clone(
         return Ok(());
     }
     let running = row.status == CloneStatus::Ready && postmaster_running(row);
+    let rebooted = boot_time.is_some_and(|b| row.pg_start_time.is_some_and(|t| (t as i64) < b));
+    if row.status == CloneStatus::Ready && !running && rebooted {
+        return recover_after_reboot(ctx, row, now, report).await;
+    }
     let keep = running
         && row.expires_at > now
         && row
@@ -345,6 +351,98 @@ async fn reconcile_clone(
         watch_parent(ctx.clone(), row.id.clone(), pid);
     }
     Ok(())
+}
+
+/// Destroys a clone gc decided to drop, unless another operation owns it now.
+async fn drop_clone(ctx: &Ctx, row: &CloneRow, report: &mut GcReport) -> Result<()> {
+    let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
+        return Ok(());
+    };
+    stop_and_remove(ctx, row).await?;
+    report.destroyed.push(row.id.clone());
+    Ok(())
+}
+
+/// A Ready clone whose server died in a reboot. Named, protected and parentless clones are
+/// restarted; a non-durable one that did not shut down cleanly is suspect (fsync was off), and
+/// a suspect clone without a name is destroyed instead. Everything else is destroyed as in v0.1.
+async fn recover_after_reboot(
+    ctx: &Arc<Ctx>,
+    row: &CloneRow,
+    now: i64,
+    report: &mut GcReport,
+) -> Result<()> {
+    let parent_gone = row
+        .parent_pid
+        .is_some_and(|p| !parent_alive(p, row.parent_start_time));
+    let kept = row.name.is_some() || row.protected || row.parent_pid.is_none();
+    if parent_gone || !kept || row.expires_at <= now {
+        return drop_clone(ctx, row, report).await;
+    }
+    let Ok(mark) = mark(ctx, &row.id, InFlightOp::Create) else {
+        return Ok(());
+    };
+    let mut row = row.clone();
+    if !row.durable {
+        let install = install_for(ctx, &row.dir).ok_or_else(|| {
+            internal(format!(
+                "no Postgres install found for {}",
+                row.dir.display()
+            ))
+        })?;
+        let dir = row.dir.clone();
+        let state = tokio::task::spawn_blocking(move || control_state(&install, &dir))
+            .await
+            .map_err(|e| internal(format!("background task failed: {e}")))??;
+        if state != ControlState::ShutDown {
+            if row.name.is_none() {
+                drop(mark);
+                log(
+                    ctx,
+                    &format!(
+                        "gc: clone {} did not shut down cleanly with fsync off; destroyed",
+                        row.id
+                    ),
+                );
+                return drop_clone(ctx, &row, report).await;
+            }
+            row.suspect = true;
+            ctx.store().update_clone(&row)?;
+        }
+    }
+    let (old_pid, old_start) = (row.pg_pid, row.pg_start_time);
+    match restart(ctx, &mut row).await {
+        Ok(warnings) => {
+            report.adopted.push(row.id.clone());
+            let suspect = row.suspect.then(|| suspect_warning(&row));
+            for w in warnings.into_iter().chain(suspect) {
+                log(ctx, &format!("gc: clone {}: {w}", row.id));
+                report.warnings.push(w);
+            }
+            if let Some(pid) = row.parent_pid {
+                watch_parent(ctx.clone(), row.id.clone(), pid);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Kept, not destroyed: it may hold data someone wants. The old identity stays recorded,
+            // so the next daemon start or gc tries again.
+            let started = row
+                .pg_pid
+                .zip(row.pg_start_time)
+                .filter(|_| row.pg_pid != old_pid)
+                .map(|(pid, start_time)| RunningPg { pid, start_time });
+            if let (Some(pg), Some(install)) = (started, install_for(ctx, &row.dir)) {
+                let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
+                let _ =
+                    tokio::task::spawn_blocking(move || stop(&install, &dir, Some(pg), t)).await;
+            }
+            row.pg_pid = old_pid;
+            row.pg_start_time = old_start;
+            let _ = ctx.store().update_clone(&row);
+            Err(e)
+        }
+    }
 }
 
 fn entries(dir: &Path) -> Vec<(String, PathBuf)> {
@@ -636,9 +734,9 @@ mod tests {
     #[tokio::test]
     async fn reconcile_skips_in_flight_clones() {
         let (_tmp, ctx) = tmp_ctx();
-        let row = fake_clone(&ctx, "cbusy01", CloneStatus::Creating);
+        let row = fake_clone(&ctx, "cb0550a", CloneStatus::Creating);
         let m = mark(&ctx, &row.id, InFlightOp::Create).unwrap();
-        let report = reconcile(ctx.clone(), now()).await.unwrap();
+        let report = reconcile(ctx.clone(), now(), None).await.unwrap();
         assert!(
             report.destroyed.is_empty() && report.orphan_folders_removed.is_empty(),
             "{report:?}"
@@ -646,7 +744,7 @@ mod tests {
         assert!(row.dir.is_dir() && ctx.store().get_clone(&row.id).unwrap().is_some());
 
         drop(m); // the create "crashed": now it is debris
-        let report = reconcile(ctx.clone(), now()).await.unwrap();
+        let report = reconcile(ctx.clone(), now(), None).await.unwrap();
         assert_eq!(report.destroyed, vec![row.id.clone()]);
         assert!(!row.dir.exists() && ctx.store().get_clone(&row.id).unwrap().is_none());
     }
@@ -654,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn reap_and_destroy_respect_in_flight_ops() {
         let (_tmp, ctx) = tmp_ctx();
-        let row = fake_clone(&ctx, "cbusy02", CloneStatus::Ready);
+        let row = fake_clone(&ctx, "cb0550b", CloneStatus::Ready);
         {
             let _m = mark(&ctx, &row.id, InFlightOp::Destroy).unwrap();
             assert!(reap_expired(&ctx, now() + 10_000).await.unwrap().is_empty());
@@ -688,7 +786,7 @@ mod tests {
     fn futures_are_send(ctx: &'static Ctx, arc: Arc<Ctx>) {
         fn send<T: Send>(_: T) {}
         send(reap_expired(ctx, 0));
-        send(reconcile(arc.clone(), 0));
+        send(reconcile(arc.clone(), 0, None));
         send(destroy_after_parent_exit(Watch {
             ctx: arc,
             id: String::new(),
