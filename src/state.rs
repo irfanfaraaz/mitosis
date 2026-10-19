@@ -2,7 +2,7 @@ use crate::error::{ErrorCode, MitosisError, Result};
 use crate::protocol::TemplateSource;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,11 +192,13 @@ macro_rules! clone_params {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
+        // Create the file 0600 first so the -wal/-shm files SQLite derives from it inherit that mode.
+        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let conn = Connection::open(path)?;
         // journal_mode returns a row, so read it instead of executing.
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.execute_batch(SCHEMA)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(Store { conn })
     }
 
@@ -394,6 +396,12 @@ mod tests {
             let store = Store::open(&path).unwrap();
             store.upsert_template(&tpl("main")).unwrap();
             store.insert_clone(&clone_row("c1", Some("x"), 54320)).unwrap();
+            // while open, the WAL side files exist and must be private too
+            for suffix in ["-wal", "-shm"] {
+                let side = dir.path().join(format!("state.db{suffix}"));
+                let mode = std::fs::metadata(&side).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{suffix}");
+            }
         }
         let store = Store::open(&path).unwrap();
         assert!(store.get_template("main").unwrap().is_some());
