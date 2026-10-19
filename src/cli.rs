@@ -2,6 +2,7 @@ use crate::budget;
 use crate::client;
 use crate::config::{Config, ConfigEntry};
 use crate::daemon;
+use crate::doctor;
 use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::mcp;
@@ -97,6 +98,14 @@ enum Cmd {
     },
     /// Remove expired clones and leftovers.
     Gc,
+    /// Check the home, config, daemon, Postgres installs and templates for problems.
+    Doctor {
+        /// Finish pending .env restores and run gc.
+        #[arg(long)]
+        fix: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the daemon in the foreground, or manage it.
     Daemon {
         #[command(subcommand)]
@@ -524,6 +533,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 ),
                 other => return Err(unexpected(other)),
             }
+        }
+        Cmd::Doctor { fix, json } => {
+            let checks = doctor::run(&home, fix).await;
+            if json {
+                print_json(&checks)?;
+            } else {
+                print!("{}", doctor::render(&checks));
+            }
+            return Ok(ExitCode::from(doctor::exit_code(&checks)));
         }
         Cmd::Gc => match client::request(&home, Request::Gc).await? {
             Response::Gc(r) => {
