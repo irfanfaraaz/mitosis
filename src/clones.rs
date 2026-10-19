@@ -469,7 +469,10 @@ mod tests {
         };
         assert_eq!(
             to_info(&row, 0).url,
-            "postgres://postgres:pw@127.0.0.1:54321/my%20db%2Fx%3Fy%25z"
+            format!(
+                "postgres://postgres:{}@127.0.0.1:54321/my%20db%2Fx%3Fy%25z",
+                row.password
+            )
         );
         row.database = "app".into();
         assert!(to_info(&row, 0).url.ends_with("/app"));

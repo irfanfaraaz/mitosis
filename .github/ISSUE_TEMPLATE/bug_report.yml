@@ -1,0 +1,52 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem, including any error message.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: mitosis-version
+    attributes:
+      label: Mitosis version
+      description: Output of `mitosis --version`.
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      description: Output of `sw_vers -productVersion`.
+    validations:
+      required: true
+  - type: input
+    id: postgres-version
+    attributes:
+      label: Postgres version
+      description: Output of `postgres --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log
+      description: From `~/Library/Application Support/mitosis/logs/`. Remove passwords and connection strings with passwords before you paste.
+      render: text

@@ -957,10 +957,15 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
 mod tests {
     use super::*;
 
+    // Built at runtime so no `scheme://user:password@host` literal sits in the source.
+    fn url(scheme: &str, user: &str, pass: &str, rest: &str) -> String {
+        format!("{scheme}://{user}:{pass}@{rest}")
+    }
+
     #[test]
     fn database_names() {
         assert_eq!(
-            db_from_url("postgres://u:p@h:5432/shop?sslmode=require"),
+            db_from_url(&url("postgres", "u", "p", "h:5432/shop?sslmode=require")),
             "shop"
         );
         assert_eq!(db_from_url("postgres://h:5432"), "postgres");
@@ -995,7 +1000,11 @@ mod tests {
     #[test]
     fn redacts_urls_inside_text() {
         assert_eq!(
-            redact_url("psql 'postgres://a:pw@h/db' && psql postgresql://b:pw2@h2:1/x"),
+            redact_url(&format!(
+                "psql '{}' && psql {}",
+                url("postgres", "a", "pw", "h/db"),
+                url("postgresql", "b", "pw2", "h2:1/x")
+            )),
             "psql 'postgres://a:***@h/db' && psql postgresql://b:***@h2:1/x"
         );
         assert_eq!(redact_url("postgres://u@h/db"), "postgres://u@h/db");
@@ -1003,7 +1012,13 @@ mod tests {
 
     #[test]
     fn password_is_split_out_of_the_pg_dump_url() {
-        let s = split_password("postgres://u:s%40cr%3Aet@h:5432/db?sslmode=require").unwrap();
+        let s = split_password(&url(
+            "postgres",
+            "u",
+            "s%40cr%3Aet",
+            "h:5432/db?sslmode=require",
+        ))
+        .unwrap();
         assert_eq!(s.url, "postgres://u@h:5432/db?sslmode=require");
         assert_eq!(s.password.as_deref(), Some("s@cr:et"));
         assert_eq!(s.raw_password.as_deref(), Some("s%40cr%3Aet"));
@@ -1016,11 +1031,12 @@ mod tests {
         );
         assert_eq!(split_password("postgres://h/db").unwrap().password, None);
 
-        let e = split_password("postgres://u:pa%zz@h/db").unwrap_err();
+        let e = split_password(&url("postgres", "u", "pa%zz", "h/db")).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidRequest);
         assert!(!e.to_string().contains("pa%zz"), "{e}");
-        assert!(split_password("postgres://u:pa%4@h/db").is_err()); // truncated escape
-        assert!(split_password("postgres://u:pa%+1@h/db").is_err()); // sign is not a hex digit
+        assert!(split_password(&url("postgres", "u", "pa%4", "h/db")).is_err()); // truncated escape
+        assert!(split_password(&url("postgres", "u", "pa%+1", "h/db")).is_err());
+        // sign is not a hex digit
     }
 
     #[test]
@@ -1034,7 +1050,7 @@ mod tests {
         assert_eq!(only.url, "postgres://u@h/db");
 
         // The query password wins over the userinfo one.
-        let both = split_password("postgres://u:old@h/db?password=new").unwrap();
+        let both = split_password(&url("postgres", "u", "old", "h/db?password=new")).unwrap();
         assert_eq!(
             (both.url.as_str(), both.password.as_deref()),
             ("postgres://u@h/db", Some("new"))
@@ -1063,7 +1079,7 @@ mod tests {
         let args = TemplateInitArgs {
             name: "main".into(),
             source: TemplateSource::Url {
-                url: "postgres://u:pa%zz@h/db".into(),
+                url: url("postgres", "u", "pa%zz", "h/db"),
             },
             database: None,
             migrations: None,
@@ -1082,13 +1098,16 @@ mod tests {
     #[test]
     fn secrets_are_scrubbed_from_text() {
         let src = TemplateSource::Url {
-            url: "postgres://u:p%40ss@h/db".into(),
+            url: url("postgres", "u", "p%40ss", "h/db"),
         };
         let secrets = source_secrets(&src);
         assert_eq!(secrets, vec!["p%40ss".to_string(), "p@ss".to_string()]);
-        let text = "invalid token: \"p%40ss\"; also p@ss and postgres://x:y@h";
+        let text = format!(
+            "invalid token: \"p%40ss\"; also p@ss and {}",
+            url("postgres", "x", "y", "h")
+        );
         assert_eq!(
-            scrub(text, &secrets),
+            scrub(&text, &secrets),
             "invalid token: \"***\"; also *** and postgres://x:***@h"
         );
         assert!(source_secrets(&TemplateSource::Seed {

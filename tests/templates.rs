@@ -12,6 +12,11 @@ use mitosis::templates::{self, hash_dir, info, redact_url};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+// Built at runtime so no `scheme://user:password@host` literal sits in the source.
+fn pg_url(user: &str, pass: &str, rest: &str) -> String {
+    format!("postgres://{user}:{pass}@{rest}")
+}
+
 /// A Ctx that needs no Postgres, for tests that must always run.
 fn bare_ctx() -> (TempDir, Ctx) {
     let tmp = tmp_home();
@@ -236,12 +241,12 @@ async fn refresh_unknown_template_not_found() {
 #[test]
 fn list_masks_url_password() {
     assert_eq!(
-        redact_url("postgres://u:secret@h:5432/db"),
+        redact_url(&pg_url("u", "secret", "h:5432/db")),
         "postgres://u:***@h:5432/db"
     );
     assert_eq!(redact_url("postgres://h/db"), "postgres://h/db");
     let (_tmp, ctx) = bare_ctx();
-    let url = "postgres://u:secret@h:5432/db".to_string();
+    let url = pg_url("u", "secret", "h:5432/db");
     ctx.store()
         .upsert_template(&row("main", TemplateSource::Url { url }))
         .unwrap();

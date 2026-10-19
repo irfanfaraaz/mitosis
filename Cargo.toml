@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Copy-on-write Postgres clones for AI agent tasks on macOS APFS"
+repository = "https://github.com/irfanfaraaz/mitosis"
+homepage = "https://github.com/irfanfaraaz/mitosis"
+readme = "README.md"
+keywords = ["postgres", "database", "clone", "copy-on-write", "mcp"]
+categories = ["command-line-utilities", "database", "development-tools"]
+rust-version = "1.89"
+exclude = [".github/", "docs/"]
 
 [lib]
 name = "mitosis"

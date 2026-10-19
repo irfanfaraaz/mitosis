@@ -1,5 +1,9 @@
 # Mitosis for Postgres
 
+[![CI](https://github.com/irfanfaraaz/mitosis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/irfanfaraaz/mitosis/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/mitosis-db.svg)](https://crates.io/crates/mitosis-db)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Give each AI agent task its own private Postgres database, cloned from a template.
 
 Mitosis is a CLI and a small background daemon. It copies a template Postgres data directory with APFS `clonefile` (copy-on-write), starts a real Postgres process on the copy, and deletes it when the task ends or its TTL passes. Cloning a database takes about a tenth of a second and costs almost no extra disk, even for a 10 GB template (see [Benchmarks](#benchmarks)).
@@ -118,6 +122,14 @@ Measured on an Apple M4 with 24 GB RAM, APFS, Postgres 18.6. Clone time does not
 
 macOS on APFS only in v0.1. On any other file system Mitosis fails with the error code `not_apfs`.
 
+## Contributing
+
+Bug reports, fixes and ideas are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test and send a pull request. Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+Please report vulnerabilities privately, not in a public issue. See [SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
