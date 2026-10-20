@@ -3,6 +3,7 @@ use crate::clones::START_TRIES;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::events;
+use crate::mask::{mask_statements, subset_statements, ColumnInfo, ForeignKey, MaskFile};
 use crate::names::{random_hex, validate_name};
 use crate::pg::{
     initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
@@ -16,6 +17,7 @@ use crate::state::{GenerationRow, TemplateRow};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -23,7 +25,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SEED_DATABASE: &str = "app";
 /// The shortest refresh interval `--every` accepts.
@@ -183,6 +185,12 @@ fn apply_settings(
     if s.migrate.is_some() && s.migrate_off {
         return Err(invalid("set --migrate to a command or to off, not both"));
     }
+    if s.mask.is_some() && s.mask_off {
+        return Err(invalid("set --mask to a file or to off, not both"));
+    }
+    if let Some(p) = &s.mask {
+        MaskFile::load(p)?;
+    }
     if s.keep == Some(0) {
         return Err(invalid("--keep must be at least 1"));
     }
@@ -216,6 +224,11 @@ fn apply_settings(
     }
     if let Some(a) = s.auto_migrate {
         t.auto_migrate = a;
+    }
+    if s.mask_off {
+        t.mask_path = None;
+    } else if s.mask.is_some() {
+        t.mask_path = s.mask.clone();
     }
     if let Some(o) = s.on_stale {
         t.on_stale = o;
@@ -289,6 +302,14 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
             ));
         }
     }
+    if let Some(p) = &row.mask_path {
+        if MaskFile::hash(p).ok() != cur.mask_hash {
+            warnings.push(format!(
+                "mask file {} changed since the template was built",
+                p.display()
+            ));
+        }
+    }
     let source = match &row.source {
         TemplateSource::Url { url } => TemplateSource::Url {
             url: redact_url(url),
@@ -319,6 +340,7 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
         auto_migrate: row.auto_migrate,
         on_stale: row.on_stale,
         keep: row.keep,
+        mask: row.mask_path.clone(),
     }
 }
 
@@ -551,7 +573,7 @@ fn scrub(text: &str, secrets: &[String]) -> String {
         .fold(redact_url(text), |t, s| t.replace(s.as_str(), "***"))
 }
 
-fn fnv1a(h: &mut u64, bytes: &[u8]) {
+pub(crate) fn fnv1a(h: &mut u64, bytes: &[u8]) {
     for b in bytes {
         *h ^= *b as u64;
         *h = h.wrapping_mul(0x0100_0000_01b3);
@@ -1028,6 +1050,7 @@ async fn run_steps(
     opts: &mut StartOptions,
     database: &str,
     source: &TemplateSource,
+    mask: Option<&Masking>,
 ) -> StepResult<Vec<String>> {
     let (i, d) = (install.clone(), data_dir.to_path_buf());
     blocking(move || initdb(&i, &d))
@@ -1075,6 +1098,9 @@ async fn run_steps(
                 invalid("a promoted template has no source to rebuild"),
             ));
         }
+    }
+    if let Some(m) = mask {
+        mask_and_dump(ctx, install, data_dir, opts, database, m).await?;
     }
     extensions_and_stop(ctx, install, data_dir, opts, database, pg).await
 }
@@ -1146,6 +1172,16 @@ async fn extensions_and_stop(
     Ok(extensions)
 }
 
+/// Stops any server in `dir` and deletes the folder. A server that would not stop keeps its
+/// folder; gc deals with it later.
+fn stop_and_remove(install: &PgInstall, dir: &Path, timeout: Duration) -> Result<()> {
+    stop(install, dir, None, timeout)?;
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Stops the build server, deletes the build folder, and turns `e` into `TemplateBuildFailed`.
 async fn fail(
     ctx: &Ctx,
@@ -1167,15 +1203,7 @@ async fn fail(
         build_dir.to_path_buf(),
         ctx.config().stop_timeout,
     );
-    let cleanup = blocking(move || {
-        // A server that would not stop keeps its folder; gc deals with it later.
-        stop(&i, &d, None, t)?;
-        match std::fs::remove_dir_all(&d) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
-    })
-    .await;
+    let cleanup = blocking(move || stop_and_remove(&i, &d, t)).await;
     if let Err(ce) = cleanup {
         append_log(
             log,
@@ -1210,8 +1238,18 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
         _ => None,
     };
+    // The masking file this build uses: the one given now, else the recorded one.
+    let mask_path = match (&args.settings.mask, args.settings.mask_off) {
+        (_, true) => None,
+        (Some(p), false) => Some(p.clone()),
+        (None, false) => ctx.store().get_template(&name)?.and_then(|t| t.mask_path),
+    };
+    let mask_file = match mask_path.as_deref() {
+        Some(p) => Some((MaskFile::load(p)?, MaskFile::hash(p)?)),
+        None => None,
+    };
     // The commit expects the pointer read here; a new template starts at 0 (no generation).
-    let (created, expected, gen) = {
+    let (created, expected, gen, masking) = {
         let store = ctx.store();
         let (created, expected) = match store.get_template(&name)? {
             Some(t) => (false, t.current_gen),
@@ -1227,7 +1265,15 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
                 (true, 0)
             }
         };
-        (created, expected, store.alloc_gen(&name)?)
+        let masking = match mask_file {
+            Some((file, hash)) => Some(Masking {
+                file,
+                hash,
+                salt: store.ensure_mask_salt(&name, &random_hex(32))?,
+            }),
+            None => None,
+        };
+        (created, expected, store.alloc_gen(&name)?, masking)
     };
     let built = build_gen(
         ctx,
@@ -1235,6 +1281,7 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         &args,
         &database,
         migrations_hash,
+        masking.as_ref(),
         gen,
         expected,
     )
@@ -1301,6 +1348,24 @@ async fn layered_held(
         );
     };
     migrate.path = path.or(migrate.path);
+    // Masking in place covers only what the migration adds; the copied rows must be masked already.
+    if let (Some(p), None) = (&t.mask_path, &cur.mask_hash) {
+        return Err(invalid(format!(
+            "template {name} has the masking file {} but its current generation was not built masked",
+            p.display()
+        ))
+        .with_hint(format!(
+            "run a full build first: mitosis template refresh {name}"
+        )));
+    }
+    let masking = match t.mask_path.as_deref() {
+        Some(p) => Some(Masking {
+            file: MaskFile::load(p)?,
+            hash: MaskFile::hash(p)?,
+            salt: ctx.store().ensure_mask_salt(name, &random_hex(32))?,
+        }),
+        None => None,
+    };
     let install = ctx.install_major(cur.pg_major).await?;
     let migrations_hash = match t.migrations.as_deref() {
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
@@ -1308,7 +1373,8 @@ async fn layered_held(
     };
     let gen = ctx.store().alloc_gen(name)?;
 
-    let secrets = source_secrets(&t.source);
+    let mut secrets = source_secrets(&t.source);
+    secrets.extend(masking.as_ref().map(|m| m.salt.clone()));
     let ts = now();
     let side = ctx.home.templates_dir().join(build_dir_name(name, ts));
     let mut opts = build_start_options(ctx, name)?;
@@ -1321,6 +1387,7 @@ async fn layered_held(
         &mut opts,
         &t.database,
         &migrate,
+        masking.as_ref(),
     )
     .await;
     let result = match result {
@@ -1344,6 +1411,7 @@ async fn layered_held(
         size_bytes: 0,
         from_clone: None,
         from_gen: Some(cur.gen),
+        mask_hash: masking.map(|m| m.hash),
     };
     if let Err(e) = commit_built(ctx, &install, &log, &secrets, row, cur.gen).await {
         events::emit_template_failed(ctx, name, gen, "layered", &e);
@@ -1358,7 +1426,9 @@ async fn layered_held(
     template_info(ctx, name)
 }
 
-/// Copy of generation folder `from` into `dir`, started privately, migrated, stopped.
+/// Copy of generation folder `from` into `dir`, started privately, migrated, masked again when
+/// `mask` is set, stopped.
+#[allow(clippy::too_many_arguments)]
 async fn layered_steps(
     ctx: &Ctx,
     install: &PgInstall,
@@ -1367,6 +1437,7 @@ async fn layered_steps(
     opts: &mut StartOptions,
     database: &str,
     migrate: &MigrateCmd,
+    mask: Option<&Masking>,
 ) -> StepResult<Vec<String>> {
     {
         // A commit or prune moves generation folders only under the write guard.
@@ -1389,6 +1460,11 @@ async fn layered_steps(
     )
     .await
     .map_err(at("migrate"))?;
+    if let Some(m) = mask {
+        apply_mask(install, opts, database, m, false)
+            .await
+            .map_err(at("mask"))?;
+    }
     extensions_and_stop(ctx, install, dir, opts, database, pg).await
 }
 
@@ -1417,24 +1493,48 @@ fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
     })
 }
 
-/// Builds generation `gen` in a side folder and commits it as a `Full` generation.
+/// Builds generation `gen` in a side folder and commits it as a `Full` generation; through a
+/// staging cluster when `masking` is set.
+#[allow(clippy::too_many_arguments)]
 async fn build_gen(
     ctx: &Ctx,
     install: &PgInstall,
     args: &TemplateInitArgs,
     database: &str,
     migrations_hash: Option<String>,
+    masking: Option<&Masking>,
     gen: u32,
     expected: u32,
 ) -> Result<()> {
     let name = &args.name;
-    let secrets = source_secrets(&args.source);
+    let mut secrets = source_secrets(&args.source);
+    secrets.extend(masking.map(|m| m.salt.clone()));
     let ts = now();
     let build_dir = ctx.home.templates_dir().join(build_dir_name(name, ts));
     let mut opts = build_start_options(ctx, name)?;
     let log = opts.log_file.clone();
 
-    let result = run_steps(ctx, install, &build_dir, &mut opts, database, &args.source).await;
+    let result = match masking {
+        None => {
+            run_steps(
+                ctx,
+                install,
+                &build_dir,
+                &mut opts,
+                database,
+                &args.source,
+                None,
+            )
+            .await
+        }
+        Some(m) => {
+            let source = &args.source;
+            masked_steps(
+                ctx, install, name, &build_dir, &mut opts, database, source, m,
+            )
+            .await
+        }
+    };
     let result = match result {
         Ok(ext) => Ok(ext),
         Err((step, e)) => Err(fail(ctx, install, &build_dir, &log, &secrets, step, e).await),
@@ -1453,8 +1553,274 @@ async fn build_gen(
         size_bytes: 0,
         from_clone: None,
         from_gen: None,
+        mask_hash: masking.map(|m| m.hash.clone()),
     };
     commit_built(ctx, install, &log, &secrets, row, expected).await
+}
+
+/// What a masked build needs: the masking file, its hash, and the template's salt.
+struct Masking {
+    file: MaskFile,
+    hash: String,
+    salt: String,
+}
+
+/// Every column of every user table, as JSON for `ColumnInfo`.
+const COLUMNS_SQL: &str = "SELECT coalesce(json_agg(json_build_object('schema', n.nspname, \
+    'table', c.relname, 'column', a.attname, 'data_type', format_type(a.atttypid, a.atttypmod), \
+    'not_null', a.attnotnull)), '[]') \
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+    WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped \
+    AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%'";
+
+/// Every foreign key (partitions' inherited copies left out), as JSON for `ForeignKey`.
+const FOREIGN_KEYS_SQL: &str = "SELECT coalesce(json_agg(json_build_object( \
+    'child', format('%I.%I', cn.nspname, cc.relname), \
+    'child_cols', (SELECT json_agg(quote_ident(a.attname) ORDER BY k.i) \
+        FROM unnest(con.conkey) WITH ORDINALITY AS k(num, i) \
+        JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num), \
+    'parent', format('%I.%I', pn.nspname, pc.relname), \
+    'parent_cols', (SELECT json_agg(quote_ident(a.attname) ORDER BY k.i) \
+        FROM unnest(con.confkey) WITH ORDINALITY AS k(num, i) \
+        JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.num))), '[]') \
+    FROM pg_constraint con \
+    JOIN pg_class cc ON cc.oid = con.conrelid JOIN pg_namespace cn ON cn.oid = cc.relnamespace \
+    JOIN pg_class pc ON pc.oid = con.confrelid JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+    WHERE con.contype = 'f' AND con.conparentid = 0";
+
+/// Files the staging stage leaves for the restore stage, inside the staging folder.
+const GLOBALS_FILE: &str = "mitosis-globals.sql";
+const DUMP_FILE: &str = "mitosis-masked.dump";
+
+/// Runs the subset (when `subset`) and masking statements of `m` against `database`, in one
+/// transaction with triggers and foreign-key checks off.
+async fn apply_mask(
+    install: &PgInstall,
+    opts: &StartOptions,
+    database: &str,
+    m: &Masking,
+    subset: bool,
+) -> Result<()> {
+    let columns: Vec<ColumnInfo> =
+        serde_json::from_str(&run_psql(install, opts, database, COLUMNS_SQL.into()).await?)?;
+    let mut statements = Vec::new();
+    if subset && !m.file.subset.is_empty() {
+        let fks: Vec<ForeignKey> = serde_json::from_str(
+            &run_psql(install, opts, database, FOREIGN_KEYS_SQL.into()).await?,
+        )?;
+        statements = subset_statements(&m.file, &fks)?;
+    }
+    statements.extend(mask_statements(&m.file, &m.salt, &columns)?);
+    if statements.is_empty() {
+        return Ok(());
+    }
+    // The statements hold the salt: a failing one must not be copied into the server log.
+    let sql = format!(
+        "SET log_min_error_statement = panic;\nBEGIN;\nSET LOCAL session_replication_role = replica;\n{};\nCOMMIT;\n",
+        statements.join(";\n")
+    );
+    run_psql(install, opts, database, sql).await.map(drop)
+}
+
+/// Runs a Postgres tool against the build server, output to the build log, in its own process group.
+fn run_tool(
+    install: &PgInstall,
+    tool: &str,
+    opts: &StartOptions,
+    groups: &Groups,
+    args: &[&OsStr],
+) -> Result<()> {
+    let log = || OpenOptions::new().append(true).open(&opts.log_file);
+    let mut child = Command::new(install.bin(tool))
+        .arg("-h")
+        .arg(&opts.socket_dir)
+        .args(["-p", &opts.port.to_string(), "-U", "postgres"])
+        .args(args)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(log()?)
+        .stderr(log()?)
+        .spawn()
+        .map_err(|e| internal(format!("could not run {tool}: {e}")))?;
+    let _group = GroupGuard::new(groups, child.id() as i32);
+    let status = child
+        .wait()
+        .map_err(|e| internal(format!("waiting for {tool}: {e}")))?;
+    if !status.success() {
+        return Err(internal(format!("{tool} failed ({status})")));
+    }
+    Ok(())
+}
+
+/// In the running staging server: subsets and masking, then the roles (without passwords) and
+/// the database dumped into files in the staging folder.
+async fn mask_and_dump(
+    ctx: &Ctx,
+    install: &PgInstall,
+    staging: &Path,
+    opts: &StartOptions,
+    database: &str,
+    m: &Masking,
+) -> StepResult<()> {
+    apply_mask(install, opts, database, m, true)
+        .await
+        .map_err(at("mask"))?;
+    let (i, o, db, dir, g) = (
+        install.clone(),
+        opts.clone(),
+        database.to_string(),
+        staging.to_path_buf(),
+        ctx.build_groups.clone(),
+    );
+    blocking(move || {
+        let (globals, dump) = (dir.join(GLOBALS_FILE), dir.join(DUMP_FILE));
+        let globals_args = ["--globals-only", "--no-role-passwords", "-f"].map(OsStr::new);
+        run_tool(
+            &i,
+            "pg_dumpall",
+            &o,
+            &g,
+            &[&globals_args[..], &[globals.as_os_str()]].concat(),
+        )?;
+        let dump_args = ["-Fc", "-d", &db, "-f"].map(OsStr::new);
+        run_tool(
+            &i,
+            "pg_dump",
+            &o,
+            &g,
+            &[&dump_args[..], &[dump.as_os_str()]].concat(),
+        )
+    })
+    .await
+    .map_err(at("dump"))
+}
+
+/// Stage two of a masked build: a fresh cluster in `dir` gets the staging roles, then the
+/// staging dump, and is stopped.
+async fn restore_steps(
+    ctx: &Ctx,
+    install: &PgInstall,
+    dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+    staging: &Path,
+) -> StepResult<()> {
+    let (i, d) = (install.clone(), dir.to_path_buf());
+    blocking(move || initdb(&i, &d))
+        .await
+        .map_err(at("initdb"))?;
+    let pg = start_build_server(ctx, install, dir, opts).await?;
+    let globals = std::fs::read_to_string(staging.join(GLOBALS_FILE))
+        .map_err(|e| ("roles", MitosisError::from(e)))?;
+    // initdb made the postgres role already, and psql stops at the first error.
+    let globals: String = globals
+        .lines()
+        .filter(|l| *l != "CREATE ROLE postgres;")
+        .map(|l| format!("{l}\n"))
+        .collect();
+    run_psql(install, opts, "postgres", globals)
+        .await
+        .map_err(at("roles"))?;
+    if database != "postgres" {
+        let sql = format!("CREATE DATABASE {}", quote_ident(database));
+        run_psql(install, opts, "postgres", sql)
+            .await
+            .map_err(at("create database"))?;
+    }
+    let (i, o, db, f, g) = (
+        install.clone(),
+        opts.clone(),
+        database.to_string(),
+        staging.join(DUMP_FILE),
+        ctx.build_groups.clone(),
+    );
+    blocking(move || {
+        let args = [OsStr::new("-d"), OsStr::new(&db), f.as_os_str()];
+        run_tool(&i, "pg_restore", &o, &g, &args)
+    })
+    .await
+    .map_err(at("restore"))?;
+    let (i, d, t) = (
+        install.clone(),
+        dir.to_path_buf(),
+        ctx.config().stop_timeout,
+    );
+    blocking(move || stop(&i, &d, Some(pg), t))
+        .await
+        .map_err(at("stop"))
+}
+
+/// The staging cluster of a masked build. It holds raw source values, so it is stopped and
+/// deleted on every path: by `remove`, or from a thread if the build is dropped midway.
+struct Staging {
+    install: PgInstall,
+    dir: PathBuf,
+    timeout: Duration,
+    removed: bool,
+}
+
+impl Staging {
+    async fn remove(mut self, log: &Path) {
+        self.removed = true;
+        let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
+        if let Err(e) = blocking(move || stop_and_remove(&i, &d, t)).await {
+            append_log(
+                log,
+                &format!(
+                    "mitosis: cleanup of staging {} failed: {e}",
+                    self.dir.display()
+                ),
+            );
+        }
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.removed {
+            let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
+            std::thread::spawn(move || stop_and_remove(&i, &d, t));
+        }
+    }
+}
+
+/// The two-stage build: the source is built into a staging cluster, subset and masked there,
+/// and only a dump of the result is restored into a fresh cluster in `build_dir`, so the
+/// generation's data files and WAL never hold raw values.
+#[allow(clippy::too_many_arguments)]
+async fn masked_steps(
+    ctx: &Ctx,
+    install: &PgInstall,
+    name: &str,
+    build_dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+    source: &TemplateSource,
+    m: &Masking,
+) -> StepResult<Vec<String>> {
+    let mut ts = now();
+    let dir = loop {
+        let d = ctx.home.templates_dir().join(build_dir_name(name, ts));
+        if d != build_dir && !d.exists() {
+            break d;
+        }
+        ts += 1;
+    };
+    let staging = Staging {
+        install: install.clone(),
+        dir,
+        timeout: ctx.config().stop_timeout,
+        removed: false,
+    };
+    let result = async {
+        let extensions =
+            run_steps(ctx, install, &staging.dir, opts, database, source, Some(m)).await?;
+        restore_steps(ctx, install, build_dir, opts, database, &staging.dir).await?;
+        Ok(extensions)
+    }
+    .await;
+    staging.remove(&opts.log_file).await;
+    result
 }
 
 /// Step 7: measures the built side folder `row.dir` (filling `pg_major` and `size_bytes`), then

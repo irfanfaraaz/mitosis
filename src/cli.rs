@@ -264,6 +264,9 @@ struct SettingsFlags {
     /// When a clone's template is older than --max-age: warn, or also refresh in the background.
     #[arg(long, value_parser = ["warn", "refresh"])]
     on_stale: Option<String>,
+    /// Masking file (TOML: columns to mask, row subsets) applied to every build, or off.
+    #[arg(long)]
+    mask: Option<std::path::PathBuf>,
 }
 
 /// A protocol enum from its snake_case name (clap already limited the choices).
@@ -301,6 +304,20 @@ impl SettingsFlags {
             ),
             None => (None, false),
         };
+        let (mask, mask_off) = match self.mask {
+            Some(p) if p.as_os_str() == "off" => (None, true),
+            // Stored absolute, like --migrations, so the daemon finds it from any folder.
+            Some(p) => (
+                Some(std::fs::canonicalize(&p).map_err(|e| {
+                    MitosisError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("masking file {}: {e}", p.display()),
+                    )
+                })?),
+                false,
+            ),
+            None => (None, false),
+        };
         let settings = TemplateSettings {
             keep: self.keep,
             every_secs,
@@ -310,6 +327,8 @@ impl SettingsFlags {
             migrate_off,
             auto_migrate: self.auto_migrate.map(|a| a == "on"),
             on_stale: enum_arg(self.on_stale)?,
+            mask,
+            mask_off,
         };
         Ok((max_age_secs, settings))
     }
@@ -692,6 +711,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "uptime    {}",
                     format_duration(Duration::from_secs(s.uptime_secs))
                 );
+                match &s.router {
+                    None => println!("router    off"),
+                    Some(r) if r.listening => println!("router    listening on port {}", r.port),
+                    Some(r) => {
+                        println!("router    not listening on port {}", r.port);
+                        if let Some(e) = &r.error {
+                            eprintln!(
+                                "warning: router: {e}; it retries every minute (direct URLs still work: mitosis env <clone> --direct)"
+                            );
+                        }
+                    }
+                }
             }
             Some(other) => return Err(unexpected(other)),
         },
@@ -711,18 +742,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 Some(other) => return Err(unexpected(other)),
             }
         }
-                match &s.router {
-                    None => println!("router    off"),
-                    Some(r) if r.listening => println!("router    listening on port {}", r.port),
-                    Some(r) => {
-                        println!("router    not listening on port {}", r.port);
-                        if let Some(e) = &r.error {
-                            eprintln!(
-                                "warning: router: {e}; it retries every minute (direct URLs still work: mitosis env <clone> --direct)"
-                            );
-                        }
-                    }
-                }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1034,6 +1053,7 @@ fn print_clones(clones: &[CloneInfo]) {
             "NAME",
             "TEMPLATE",
             "PORT",
+            "URL",
             "AGE",
             "TTL LEFT",
             "RAM",
@@ -1048,12 +1068,13 @@ fn print_clones(clones: &[CloneInfo]) {
                     c.name.clone().unwrap_or_else(|| "-".into()),
                     c.template.clone(),
                     c.port.to_string(),
+                    // The password stays out of the table; `mitosis env` prints the full URL.
+                    crate::templates::redact_url(&c.url),
                     secs(now - c.created_at),
                     if c.protected {
                         "never".into()
                     } else {
                         secs(c.expires_at - now)
-            "URL",
                     },
                     opt_bytes(c.rss_bytes),
                     opt_bytes(c.own_disk_bytes),
@@ -1068,8 +1089,6 @@ fn print_clones(clones: &[CloneInfo]) {
 fn flags(c: &CloneInfo) -> String {
     let mut f = Vec::new();
     if c.disk_warn {
-                    // The password stays out of the table; `mitosis env` prints the full URL.
-                    crate::templates::redact_url(&c.url),
         f.push("!");
     }
     if c.protected {

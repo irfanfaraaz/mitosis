@@ -215,6 +215,7 @@ mod tests {
             size_bytes: 1,
             from_clone: None,
             from_gen: None,
+            mask_hash: None,
         }
     }
 

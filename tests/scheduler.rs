@@ -310,6 +310,7 @@ async fn crashed_build_leaves_no_generation() {
                 size_bytes: 1,
                 from_clone: None,
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
         assert_eq!(store.alloc_gen("main").unwrap(), 2);

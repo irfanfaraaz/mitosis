@@ -95,6 +95,11 @@ pub struct TemplateSettings {
     pub auto_migrate: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_stale: Option<OnStale>,
+    /// Masking file, as an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<PathBuf>,
+    #[serde(default)]
+    pub mask_off: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -302,6 +307,9 @@ pub struct TemplateInfo {
     pub on_stale: OnStale,
     #[serde(default)]
     pub keep: u32,
+    /// The masking file, when the template has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -348,6 +356,12 @@ pub struct CloneInfo {
     /// Restarted after an unclean shutdown with fsync off: recent writes may be lost or corrupt.
     #[serde(default)]
     pub suspect: bool,
+    /// The URL straight to the clone's own port; `url` is the router URL while the router is on.
+    #[serde(default)]
+    pub direct_url: String,
+    /// `ready`, `sleeping`, `starting` or `stopping`.
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -356,12 +370,6 @@ pub struct GcReport {
     pub destroyed: Vec<String>,
     pub orphan_folders_removed: Vec<PathBuf>,
     pub records_dropped: Vec<String>,
-    /// The URL straight to the clone's own port; `url` is the router URL while the router is on.
-    #[serde(default)]
-    pub direct_url: String,
-    /// `ready`, `sleeping`, `starting` or `stopping`.
-    #[serde(default)]
-    pub status: String,
     /// Entries gc could not clean up; they are retried on the next gc.
     #[serde(default)]
     pub failed: Vec<GcFailure>,
@@ -390,14 +398,6 @@ pub struct DaemonStatus {
     /// Started by the launchd login service.
     #[serde(default)]
     pub service: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Response {
-    TemplateBuilt(TemplateInfo),
-    Templates {
-        templates: Vec<TemplateInfo>,
     /// The router's state; none when `router = off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterStatus>,
@@ -410,6 +410,14 @@ pub struct RouterStatus {
     /// Why the router is not listening (a taken port, say); it retries every minute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
+    TemplateBuilt(TemplateInfo),
+    Templates {
+        templates: Vec<TemplateInfo>,
     },
     Generations {
         template: String,
@@ -533,6 +541,7 @@ mod tests {
             auto_migrate: true,
             on_stale: OnStale::Refresh,
             keep: 3,
+            mask: None,
         }
     }
 
@@ -561,6 +570,8 @@ mod tests {
             waited_ms: 0,
             disk_warn: false,
             suspect: false,
+            direct_url: "postgres://localhost:5500/app".into(),
+            status: "ready".into(),
         }
     }
 
@@ -570,8 +581,6 @@ mod tests {
             result: Ok(r),
         };
         let line = serde_json::to_string(&env).unwrap();
-            direct_url: "postgres://localhost:5500/app".into(),
-            status: "ready".into(),
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(
             serde_json::to_value(&env).unwrap(),

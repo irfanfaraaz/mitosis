@@ -59,6 +59,11 @@ pub struct TemplateRow {
     pub paused: bool,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<i64>,
+    /// Masking file (absolute path); full builds then dump and restore through a staging cluster.
+    pub mask_path: Option<PathBuf>,
+    /// Hex of the 32 random bytes that key masked values; made at the first masked build.
+    /// Written only by `ensure_mask_salt`, never by `update_template_settings`.
+    pub mask_salt: Option<String>,
 }
 
 impl TemplateRow {
@@ -87,6 +92,8 @@ impl TemplateRow {
             paused: false,
             last_error: None,
             last_attempt_at: None,
+            mask_path: None,
+            mask_salt: None,
         }
     }
 }
@@ -105,6 +112,8 @@ pub struct GenerationRow {
     pub size_bytes: u64,
     pub from_clone: Option<String>,
     pub from_gen: Option<u32>,
+    /// Hash of the masking file the generation was masked with.
+    pub mask_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,7 +174,9 @@ CREATE TABLE IF NOT EXISTS templates (
     on_stale TEXT NOT NULL DEFAULT 'warn',
     paused INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    last_attempt_at INTEGER
+    last_attempt_at INTEGER,
+    mask_salt TEXT,
+    mask_path TEXT
 );
 CREATE TABLE IF NOT EXISTS generations (
     template TEXT NOT NULL,
@@ -180,6 +191,7 @@ CREATE TABLE IF NOT EXISTS generations (
     size_bytes INTEGER NOT NULL,
     from_clone TEXT,
     from_gen INTEGER,
+    mask_hash TEXT,
     PRIMARY KEY (template, gen)
 );
 CREATE TABLE IF NOT EXISTS clones (
@@ -260,8 +272,16 @@ CREATE TABLE IF NOT EXISTS pending_restores (
 );
 ";
 
-const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at";
-const GEN_COLS: &str = "template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes, from_clone, from_gen";
+/// Columns added after their table first shipped: added on open when missing, so v0.2 stores
+/// and v3 stores made before them gain them too.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("templates", "mask_salt", "TEXT"),
+    ("templates", "mask_path", "TEXT"),
+    ("generations", "mask_hash", "TEXT"),
+];
+
+const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at, mask_salt, mask_path";
+const GEN_COLS: &str = "template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes, from_clone, from_gen, mask_hash";
 const CLONE_COLS: &str = "id, name, template, dir, port, socket_dir, password, database, pg_pid, pg_start_time, parent_pid, parent_start_time, created_at, expires_at, durable, status, generation, protected, suspect";
 
 fn conv_err(idx: usize, msg: String) -> rusqlite::Error {
@@ -311,6 +331,8 @@ fn template_from_row(r: &Row) -> rusqlite::Result<TemplateRow> {
         paused: r.get::<_, i64>(13)? != 0,
         last_error: r.get(14)?,
         last_attempt_at: r.get(15)?,
+        mask_salt: r.get(16)?,
+        mask_path: r.get::<_, Option<String>>(17)?.map(PathBuf::from),
     })
 }
 
@@ -328,6 +350,7 @@ fn gen_from_row(r: &Row) -> rusqlite::Result<GenerationRow> {
         size_bytes: r.get::<_, i64>(9)? as u64,
         from_clone: r.get(10)?,
         from_gen: r.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+        mask_hash: r.get(12)?,
     })
 }
 
@@ -408,8 +431,25 @@ macro_rules! template_params {
             $t.paused as i64,
             $t.last_error,
             $t.last_attempt_at,
+            $t.mask_salt,
+            $t.mask_path.as_deref().map(p),
         ]
     };
+}
+
+/// Adds the `ADDED_COLUMNS` a table lacks.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    for (table, col, decl) in ADDED_COLUMNS {
+        let has = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, col],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Brings a store of any older version to `SCHEMA_VERSION` in one transaction.
@@ -427,7 +467,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(RESERVATIONS)?;
     conn.execute_batch(ENV_TABLES)?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return add_missing_columns(conn);
     }
     let tx = conn.transaction()?;
     // A v0.1 store has a templates table but no version; a new file has no tables. A v2 store
@@ -442,6 +482,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(MIGRATE_V1)?;
     }
     tx.execute_batch(SCHEMA)?;
+    add_missing_columns(&tx)?;
     if v01 {
         tx.execute_batch(MIGRATE_V1_ROWS)?;
     }
@@ -469,7 +510,7 @@ impl Store {
     /// Fails when the name is taken.
     pub fn insert_template(&self, t: &TemplateRow) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO templates ({TEMPLATE_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"),
+            &format!("INSERT INTO templates ({TEMPLATE_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"),
             template_params!(t),
         )?;
         Ok(())
@@ -480,7 +521,7 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE templates SET database=?2, source=?3, migrations=?4, max_age_secs=?5, keep=?8, \
              every_secs=?9, every_mode=?10, migrate=?11, auto_migrate=?12, on_stale=?13, paused=?14, \
-             last_error=?15, last_attempt_at=?16 WHERE name=?1",
+             last_error=?15, last_attempt_at=?16, mask_path=?18 WHERE name=?1",
             template_params!(t),
         )?;
         if n == 0 {
@@ -490,6 +531,29 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    /// Stores `salt` as the masking salt of `name` unless it already has one; returns the salt in
+    /// effect, so every build of a template masks with the same key.
+    pub fn ensure_mask_salt(&self, name: &str, salt: &str) -> Result<String> {
+        self.conn.execute(
+            "UPDATE templates SET mask_salt = ?2 WHERE name = ?1 AND mask_salt IS NULL",
+            params![name, salt],
+        )?;
+        self.conn
+            .query_row(
+                "SELECT mask_salt FROM templates WHERE name = ?1",
+                [name],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .ok_or_else(|| {
+                MitosisError::new(
+                    ErrorCode::TemplateNotFound,
+                    format!("template {name} not found"),
+                )
+            })
     }
 
     /// Removes the template and all its generation rows (not their folders).
@@ -542,7 +606,7 @@ impl Store {
 
     pub fn insert_generation(&self, g: &GenerationRow) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO generations ({GEN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
+            &format!("INSERT INTO generations ({GEN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
             params![
                 g.template,
                 g.gen as i64,
@@ -556,6 +620,7 @@ impl Store {
                 g.size_bytes as i64,
                 g.from_clone,
                 g.from_gen.map(|v| v as i64),
+                g.mask_hash,
             ],
         )?;
         Ok(())
@@ -936,6 +1001,7 @@ mod tests {
             size_bytes: 1,
             from_clone: None,
             from_gen: None,
+            mask_hash: Some("m1".into()),
         }
     }
 
@@ -1300,6 +1366,43 @@ PRAGMA user_version = 2;
             vec![ev]
         );
         assert_eq!(store.list_generations("main").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mask_columns_reach_v02_and_early_v3_stores() {
+        for version in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(V02_SCHEMA).unwrap();
+                conn.execute_batch(&format!(
+                    "INSERT INTO templates (name, database, source, max_age_secs, current_gen, next_gen)
+                         VALUES ('main', 'app', '{{\"kind\":\"seed\",\"command\":\"x\"}}', 1, 1, 2);
+                     INSERT INTO generations VALUES ('main', 1, 'full', '/d', 16, '/b', '[]', NULL, 5, 9, NULL, NULL);
+                     PRAGMA user_version = {version};"
+                ))
+                .unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            let (t, g) = store.current("main").unwrap().unwrap();
+            assert_eq!((t.mask_path, t.mask_salt, g.mask_hash), (None, None, None));
+            assert_eq!(store.ensure_mask_salt("main", "aa").unwrap(), "aa");
+            // The first salt sticks, and a settings write leaves it alone.
+            assert_eq!(store.ensure_mask_salt("main", "bb").unwrap(), "aa");
+            let mut t = store.get_template("main").unwrap().unwrap();
+            t.mask_salt = None;
+            t.mask_path = Some(PathBuf::from("/w/mask.toml"));
+            store.update_template_settings(&t).unwrap();
+            let t = store.get_template("main").unwrap().unwrap();
+            assert_eq!(t.mask_salt.as_deref(), Some("aa"));
+            assert_eq!(t.mask_path, Some(PathBuf::from("/w/mask.toml")));
+            store.insert_generation(&gen("main", 2)).unwrap();
+            assert_eq!(
+                store.get_generation("main", 2).unwrap().unwrap(),
+                gen("main", 2)
+            );
+        }
     }
 
     #[test]

@@ -174,6 +174,7 @@ async fn promoted_template_refuses_a_full_schedule() {
                 size_bytes: 1,
                 from_clone: Some("c0a1b2".into()),
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
     }

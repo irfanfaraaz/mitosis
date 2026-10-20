@@ -217,6 +217,7 @@ async fn run(
         from_clone: None,
         // Only a generation of the same template names its parent.
         from_gen: (!created).then_some(cur.gen),
+        mask_hash: cur.mask_hash.clone(),
     };
     commit_built(ctx, target, &work.log, &[], row, expected).await?;
     if !created {

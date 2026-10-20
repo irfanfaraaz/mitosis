@@ -273,6 +273,7 @@ async fn run(
                 size_bytes: 0,
                 from_clone: Some(clone.id.clone()),
                 from_gen: (clone.template == name).then_some(clone.generation),
+                mask_hash: None,
             };
             commit_built(ctx, install, &log, &[], row, expected).await
         }

@@ -51,6 +51,7 @@ fn row(name: &str, source: TemplateSource) -> (TemplateRow, GenerationRow) {
         size_bytes: 1,
         from_clone: None,
         from_gen: None,
+        mask_hash: None,
     };
     (t, g)
 }

@@ -213,6 +213,7 @@ async fn reconcile_restores_template_from_old_folder() {
                 size_bytes: 1,
                 from_clone: None,
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
     }
