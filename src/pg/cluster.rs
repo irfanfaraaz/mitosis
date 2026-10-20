@@ -127,13 +127,15 @@ fn include_leaves_dir(line: &str, data_dir: &Path) -> bool {
 /// or `None` to just comment the source's line out. A copy must not run the source's
 /// `archive_command` against its WAL archive, load its certificates, follow a primary, or read
 /// its `hba_file`, `ident_file` or data folder.
-const NEUTRALISED: [(&str, Option<&str>); 10] = [
+const NEUTRALISED: [(&str, Option<&str>); 11] = [
     ("archive_mode", Some("off")),
     ("archive_command", Some("''")),
     ("ssl", Some("off")),
     ("restore_command", Some("''")),
     ("primary_conninfo", Some("''")),
     ("primary_slot_name", Some("''")),
+    // A source with synchronous replication would make every commit wait for a standby.
+    ("synchronous_standby_names", Some("''")),
     ("data_directory", None),
     ("hba_file", None),
     ("ident_file", None),
@@ -190,9 +192,11 @@ pub fn make_standalone(data_dir: &Path) -> Result<Vec<String>> {
         Some(name) => NEUTRALISED.iter().any(|(n, _)| *n == name),
         None => false,
     });
+    // Names only: a value can hold a password (`primary_conninfo`) or keys (`archive_command`).
     warnings.extend(
-        hits.into_iter()
-            .map(|l| format!("commented out in the copy: {l}")),
+        hits.iter()
+            .filter_map(|l| setting_name(l))
+            .map(|name| format!("commented out the source's {name} setting in postgresql.conf")),
     );
     // Later lines win, so these also beat a setting an included file inside the folder sets.
     if !text.is_empty() && !text.ends_with('\n') {

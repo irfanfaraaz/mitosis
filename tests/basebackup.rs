@@ -239,7 +239,8 @@ fn make_standalone_turns_off_archive_and_ssl() {
         d.join("postgresql.conf"),
         "shared_buffers = 1GB\narchive_mode = on\nARCHIVE_COMMAND = 'aws s3 cp %p s3://wal/%f'\n\
          ssl = on\nssl_cert_file = '/etc/ssl/pg.crt'\nrestore_command = 'cp /a/%f %p'\n\
-         primary_conninfo = 'host=prod'\nprimary_slot_name = 'slot'\nhba_file = '/etc/pg/hba'\n",
+         primary_conninfo = 'host=prod password=hunter2-secret'\nprimary_slot_name = 'slot'\n\
+         synchronous_standby_names = 'standby1'\nhba_file = '/etc/pg/hba'\n",
     )
     .unwrap();
 
@@ -252,8 +253,9 @@ fn make_standalone_turns_off_archive_and_ssl() {
         "#mitosis: ARCHIVE_COMMAND = 'aws s3 cp %p s3://wal/%f'",
         "#mitosis: ssl = on",
         "#mitosis: restore_command = 'cp /a/%f %p'",
-        "#mitosis: primary_conninfo = 'host=prod'",
+        "#mitosis: primary_conninfo = 'host=prod password=hunter2-secret'",
         "#mitosis: primary_slot_name = 'slot'",
+        "#mitosis: synchronous_standby_names = 'standby1'",
         "#mitosis: hba_file = '/etc/pg/hba'",
     ] {
         assert!(conf.contains(original), "{original} in:\n{conf}");
@@ -284,10 +286,24 @@ fn make_standalone_turns_off_archive_and_ssl() {
         last("primary_slot_name").as_deref(),
         Some("primary_slot_name = ''")
     );
+    assert_eq!(
+        last("synchronous_standby_names").as_deref(),
+        Some("synchronous_standby_names = ''")
+    );
     assert_eq!(last("hba_file"), None);
     assert!(conf.contains("\nshared_buffers = 1GB\n"));
-    assert!(
-        warnings.iter().any(|w| w.contains("archive_mode = on")),
-        "{warnings:?}"
-    );
+    // Warnings name the settings and never show a value (it can hold a password or keys).
+    let all = warnings.join("\n");
+    for name in ["archive_mode", "archive_command", "primary_conninfo", "ssl"] {
+        assert!(all.contains(name), "{name} in {warnings:?}");
+    }
+    for value in [
+        "hunter2-secret",
+        "password=",
+        "aws s3",
+        "s3://wal",
+        "host=prod",
+    ] {
+        assert!(!all.contains(value), "{value} leaked in {warnings:?}");
+    }
 }
