@@ -344,9 +344,9 @@ fn apply_settings(
         && t.every_mode == RefreshMode::Full
     {
         return Err(invalid(
-            "--every with --mode full needs a source, and a promoted template has none",
+            "--every with --every-mode full needs a source, and a promoted template has none",
         )
-        .with_hint("use --mode layered"));
+        .with_hint("use --every-mode layered"));
     }
     if t.auto_migrate && t.migrations.is_none() {
         return Err(
@@ -1396,7 +1396,7 @@ async fn basebackup_install(ctx: &Ctx, url: &str, pinned: Option<u32>) -> Result
         return Err(invalid(format!(
             "the source runs Postgres {major}, so its physical copy is Postgres {major}, not {m}"
         ))
-        .with_hint("drop --pg-version; to move to another major, upgrade the template"));
+        .with_hint("drop --pg-major; to move to another major, upgrade the template"));
     }
     ctx.install_major(major).await.map_err(|e| {
         if e.code != ErrorCode::NoMatchingPostgres {

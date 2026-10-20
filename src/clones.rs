@@ -679,7 +679,7 @@ async fn create_inner(
                 events::CLONE_CREATED,
                 &row,
                 serde_json::json!({
-                    "generation": row.generation,
+                    "gen": row.generation,
                     "durable": row.durable,
                     "protected": row.protected,
                     "waited_ms": waited_ms,

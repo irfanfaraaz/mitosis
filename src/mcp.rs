@@ -3,7 +3,7 @@
 use crate::client;
 use crate::envfile;
 use crate::error::{self, ErrorCode, MitosisError};
-use crate::names::{format_duration, parse_duration, validate_name};
+use crate::names::{format_duration, parse_duration, parse_wait, validate_name};
 use crate::paths::Home;
 use crate::protocol::{BranchArgs, CloneCreateArgs, CloneInfo, Request, Response};
 use rmcp::handler::server::wrapper::Parameters;
@@ -34,9 +34,9 @@ pub struct CloneCreateParams {
     pub env_file: Option<String>,
     /// Variable to set in `env_file`. Default "DATABASE_URL".
     pub env_var: Option<String>,
-    /// Seconds to wait for room when the clone limits are full. 0 fails at once. Default: the
-    /// daemon's setting.
-    pub wait_secs: Option<u64>,
+    /// How long to wait for room when the clone limits are full, like 30s or 2m; "0" fails at
+    /// once. Default: the daemon's setting.
+    pub wait: Option<String>,
     /// Clone a template built for this git branch, so the database has the branch's schema: the
     /// template's migrate command runs in the git checkout the MCP server runs in. "" means the
     /// branch checked out there; it must be the branch checked out. Default: the template itself.
@@ -47,7 +47,7 @@ pub struct CloneCreateParams {
 #[schemars(crate = "rmcp::schemars")]
 pub struct CloneDestroyParams {
     /// Clone id or name.
-    pub id: String,
+    pub id_or_name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -79,7 +79,7 @@ fn unexpected() -> MitosisError {
         .with_hint("restart the daemon: mitosis daemon stop")
 }
 
-#[tool_router]
+#[tool_router(vis = "pub")]
 impl Mitosis {
     #[tool(
         description = "Create a private, throwaway Postgres database cloned from a template in about a second. Use it for migrations, seeds and destructive tests. It is deleted when this session ends or the TTL passes. Returns `url`, a stable router URL (postgres://postgres:<password>@127.0.0.1:<router_port>/<clone name or id>) that keeps working when the clone sleeps: an idle clone is stopped to save memory and the next connection to `url` wakes it. `direct_url` is the clone's own port and refuses connections while it sleeps. `branch` clones a template built for a git branch, so the database has that branch's schema. Use clone_diff afterwards to see what you changed."
@@ -110,13 +110,13 @@ impl Mitosis {
     }
 
     #[tool(
-        description = "Destroy a clone this session created, by id or name. Works on a sleeping clone too."
+        description = "Destroy a clone this session created, by id or name. Works on a sleeping clone too. Returns `{\"destroyed\": \"<id>\"}`."
     )]
     async fn clone_destroy(
         &self,
         Parameters(p): Parameters<CloneDestroyParams>,
     ) -> Result<String, String> {
-        text(self.destroy(p.id).await)
+        text(self.destroy(p.id_or_name).await)
     }
 
     #[tool(
@@ -183,7 +183,7 @@ impl Mitosis {
         )
         .await?
         {
-            Response::Destroyed { id } => Ok(format!("destroyed {id}")),
+            Response::Destroyed { id } => Ok(serde_json::to_string_pretty(&destroy_output(&id))?),
             _ => Err(unexpected()),
         }
     }
@@ -238,7 +238,12 @@ impl Mitosis {
             // Agents must not make undeletable clones.
             protect: false,
             env: None,
-            wait_secs: p.wait_secs,
+            wait_secs: p
+                .wait
+                .as_deref()
+                .map(parse_wait)
+                .transpose()?
+                .map(|d| d.as_secs()),
             // `create_clone` resolves the branch and the repository root from our cwd.
             branch: match p.branch {
                 Some(name) => Some(BranchArgs {
@@ -266,16 +271,29 @@ impl Mitosis {
                 _ => Vec::new(),
             };
         warnings.extend(info.warnings.iter().cloned());
-        let mut out = serde_json::to_value(&info)?;
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert(
-                "template_age".into(),
-                format_duration(Duration::from_secs(info.template_age_secs)).into(),
-            );
-            obj.insert("warnings".into(), warnings.into());
-        }
-        Ok(serde_json::to_string_pretty(&out)?)
+        Ok(serde_json::to_string_pretty(&create_output(
+            &info, warnings,
+        )?)?)
     }
+}
+
+/// The `clone_create` reply: the clone, a readable `template_age`, and every warning (the
+/// template's and the clone's).
+pub fn create_output(info: &CloneInfo, warnings: Vec<String>) -> error::Result<serde_json::Value> {
+    let mut out = serde_json::to_value(info)?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "template_age".into(),
+            format_duration(Duration::from_secs(info.template_age_secs)).into(),
+        );
+        obj.insert("warnings".into(), warnings.into());
+    }
+    Ok(out)
+}
+
+/// The `clone_destroy` reply.
+pub fn destroy_output(id: &str) -> serde_json::Value {
+    serde_json::json!({ "destroyed": id })
 }
 
 #[tool_handler(

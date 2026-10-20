@@ -60,9 +60,10 @@ impl Default for Config {
     }
 }
 
-/// Where a setting's value came from.
+/// Where a setting's value came from. In JSON: `"source": "default" | "file" | "env"`, plus
+/// `"env_var"` for `env`, so `source` is always a string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "source", content = "env_var", rename_all = "snake_case")]
 pub enum ConfigSource {
     Default,
     File,
@@ -85,6 +86,7 @@ impl ConfigSource {
 pub struct ConfigEntry {
     pub key: String,
     pub value: String,
+    #[serde(flatten)]
     pub source: ConfigSource,
 }
 
@@ -167,6 +169,11 @@ const KEYS: [KeySpec; 11] = [
 
 fn invalid(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::InvalidRequest, msg)
+}
+
+/// Every setting as `(config key, environment variable)`, in `mitosis config` order.
+pub fn keys() -> impl Iterator<Item = (&'static str, &'static str)> {
+    KEYS.iter().map(|k| (k.key, k.env))
 }
 
 fn key_list() -> String {
@@ -265,11 +272,7 @@ fn parse_idle(v: &str) -> Option<Option<Duration>> {
 }
 
 fn parse_wait(v: &str) -> Option<Duration> {
-    if v == "0" || v == "0s" {
-        Some(Duration::ZERO)
-    } else {
-        parse_duration(v).ok()
-    }
+    crate::names::parse_wait(v).ok()
 }
 
 impl Config {

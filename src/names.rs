@@ -43,6 +43,15 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     n.checked_mul(mult).map(Duration::from_secs).ok_or_else(bad)
 }
 
+/// A queue wait: a duration, or `0` / `0s` for no wait at all.
+pub fn parse_wait(s: &str) -> Result<Duration> {
+    if s == "0" || s == "0s" {
+        Ok(Duration::ZERO)
+    } else {
+        parse_duration(s)
+    }
+}
+
 /// Compound, largest unit first, zero parts skipped: 7200s -> "2h", 90s -> "1m30s", 0 -> "0s".
 pub fn format_duration(d: Duration) -> String {
     let mut secs = d.as_secs();

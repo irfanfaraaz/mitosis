@@ -235,7 +235,7 @@ async fn promoted_template_refuses_a_full_schedule() {
     // The default mode is full.
     let e = set(None).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidRequest);
-    assert_eq!(e.hint.as_deref(), Some("use --mode layered"));
+    assert_eq!(e.hint.as_deref(), Some("use --every-mode layered"));
     assert!(set(Some(RefreshMode::Full)).is_err());
     assert!(ctx
         .store()

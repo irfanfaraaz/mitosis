@@ -1258,8 +1258,7 @@ async fn apply_fix(home: &Home) -> Check {
     };
     let mut f = Vec::new();
     if snap.pending > 0 {
-        let warnings = envfile::finish_pending(home).await;
-        let done = snap.pending.saturating_sub(warnings.len());
+        let (done, warnings) = envfile::finish_pending_counted(home).await;
         f.push((
             Level::Ok,
             format!(

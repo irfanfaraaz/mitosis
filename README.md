@@ -42,7 +42,7 @@ You can leave the password out of `--from-url`, so it stays out of your shell hi
 | `--database <DATABASE>` | Database name for a `--seed` template (default `app`); `--from-url` uses the name in the URL |
 | `--migrations <MIGRATIONS>` | Migrations folder; the template is flagged stale when it changes |
 | `--max-age <MAX_AGE>` | Age after which clones warn, like `7d` |
-| `--pg-version <PG_VERSION>` | Postgres major version to build with |
+| `--pg-major <PG_MAJOR>` | Postgres major to build with, like `17` |
 
 List what you have:
 
@@ -83,9 +83,9 @@ Mitosis ships an MCP server with three tools: `clone_create`, `clone_list` and `
 | `fresh` | With `name`: destroy the running clone and make a new one from the current template |
 | `env_file` | A `.env` file that gets the clone's URL (relative paths resolve against the MCP server's folder) |
 | `env_var` | Variable to set in `env_file` (default `DATABASE_URL`) |
-| `wait_secs` | Seconds to wait for room under the limits; `0` fails at once |
+| `wait` | How long to wait for room under the limits, like `30s`; `0` fails at once |
 
-The reply also carries `generation`, `existing`, `stale`, `refreshing`, `suspect`, `duration_ms` and `warnings`. The tool does not expose `protect`, promote, upgrade or config: those stay with a human.
+The reply also carries `gen`, `existing`, `stale`, `refreshing`, `suspect`, `duration_ms` and `warnings`. The tool does not expose `protect`, promote, upgrade or config: those stay with a human.
 
 For Claude Code, add this to your MCP config:
 
@@ -114,7 +114,7 @@ Rollback does not delete newer generations. It pauses the template's automatic b
 | Flag | Meaning |
 |---|---|
 | `--every <dur\|off>` | Rebuild on a schedule, like `24h` (at least `1m`) |
-| `--mode full\|layered` | How scheduled rebuilds run (default `full`) |
+| `--every-mode full\|layered` | How scheduled rebuilds run (default `full`) |
 | `--migrate "<cmd>"` | Migration command for layered refreshes; runs in your folder with `DATABASE_URL` set. `off` clears it |
 | `--auto-migrate on\|off` | Run a layered refresh when the `--migrations` folder changes. Needs `--migrations` and `--migrate` |
 | `--on-stale warn\|refresh` | When a template is older than `--max-age`: warn only, or also refresh in the background. The clone is served at once from the current generation |

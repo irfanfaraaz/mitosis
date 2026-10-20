@@ -29,9 +29,9 @@ const RESERVATIONS_EVERY_SECS: i64 = 24 * 3600;
 /// Longest request line accepted; a longer one closes the connection.
 const MAX_LINE: usize = 1 << 20;
 /// Events a plain `events` request returns when it sets no limit of its own.
-const EVENTS_DEFAULT_LIMIT: u32 = 1000;
+pub const EVENTS_DEFAULT_LIMIT: u32 = 1000;
 /// Past events a following request starts with when it sets no limit of its own.
-const EVENTS_FOLLOW_BACKLOG: u32 = 20;
+pub const EVENTS_FOLLOW_BACKLOG: u32 = 20;
 
 fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)

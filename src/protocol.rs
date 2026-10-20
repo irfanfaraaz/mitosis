@@ -329,8 +329,8 @@ pub struct TemplateInfo {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub current_gen: u32,
-    /// How many generations the template keeps on disk.
-    #[serde(default)]
+    /// How many generations the template has on disk.
+    #[serde(default, rename = "gen_count")]
     pub generations: u32,
     #[serde(default)]
     pub paused: bool,
@@ -379,7 +379,7 @@ pub struct CloneInfo {
     pub rss_bytes: Option<u64>,
     pub own_disk_bytes: Option<u64>,
     /// The template generation this clone was made from.
-    #[serde(default)]
+    #[serde(default, rename = "gen")]
     pub generation: u32,
     /// The template was older than its max age when this clone was made.
     #[serde(default)]
@@ -426,6 +426,7 @@ pub struct CloneInfo {
 pub struct DiffReport {
     pub clone: String,
     pub template: String,
+    #[serde(rename = "gen")]
     pub generation: u32,
     pub schema: Vec<SchemaChange>,
     /// Every table of either side; `public.` is left off names.

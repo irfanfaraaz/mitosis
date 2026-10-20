@@ -164,7 +164,7 @@ async fn mcp_tools_roundtrip() {
     assert_eq!(clones[0].id, info.id);
 
     for target in [other.id.as_str(), "not-mine"] {
-        let r = call(&client, "clone_destroy", json!({ "id": target })).await;
+        let r = call(&client, "clone_destroy", json!({ "id_or_name": target })).await;
         let text = result_text(&r);
         assert_eq!(r.is_error, Some(true), "{text}");
         assert!(text.contains("not created by this session"), "{text}");
@@ -174,10 +174,11 @@ async fn mcp_tools_roundtrip() {
     // clone_destroy removes this session's own clone.
     let r = call(&client, "clone_create", json!({})).await;
     let second: CloneInfo = serde_json::from_str(&result_text(&r)).expect("second clone");
-    let r = call(&client, "clone_destroy", json!({ "id": second.id })).await;
+    let r = call(&client, "clone_destroy", json!({ "id_or_name": second.id })).await;
     let text = result_text(&r);
     assert_ne!(r.is_error, Some(true), "{text}");
-    assert_eq!(text, format!("destroyed {}", second.id));
+    let v: serde_json::Value = serde_json::from_str(&text).expect("clone_destroy text parses");
+    assert_eq!(v, json!({ "destroyed": second.id }));
     assert!(!list(home).iter().any(|c| c.id == second.id));
 
     // Ending the session ends `mitosis mcp`, the clone's parent, so the daemon destroys the clone.
@@ -223,7 +224,7 @@ async fn mcp_named_clone_with_env_file() {
     assert_ne!(r.is_error, Some(true), "{text}");
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     let info: CloneInfo = serde_json::from_str(&text).unwrap();
-    assert!(v["generation"].as_u64().unwrap() >= 1, "{text}");
+    assert!(v["gen"].as_u64().unwrap() >= 1, "{text}");
     assert_eq!(v["name"], "api-db");
     let env = std::fs::read_to_string(cwd.path().join(".env")).unwrap();
     assert!(env.contains("KEEP=1"), "{env}");
@@ -249,7 +250,7 @@ async fn mcp_clone_destroy_tool() {
     let r = call(&client, "clone_create", json!({})).await;
     let c: CloneInfo = serde_json::from_str(&result_text(&r)).expect("clone");
     assert!(list(home).iter().any(|x| x.id == c.id));
-    let r = call(&client, "clone_destroy", json!({ "id": c.id })).await;
+    let r = call(&client, "clone_destroy", json!({ "id_or_name": c.id })).await;
     assert_ne!(r.is_error, Some(true), "{}", result_text(&r));
     assert!(list(home).is_empty(), "clone still listed");
     client.cancel().await.expect("stop mcp client");

@@ -7,7 +7,7 @@ use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::events;
 use crate::mcp;
-use crate::names::{format_duration, parse_duration, validate_name};
+use crate::names::{format_duration, parse_duration, parse_wait, validate_name};
 use crate::paths::Home;
 use crate::protocol::{
     BranchArgs, CloneCreateArgs, CloneInfo, EventFilter, EventRow, MigrateCmd, Request, Response,
@@ -113,7 +113,7 @@ enum Cmd {
     },
     /// Make a running clone the newest generation of its template (or of --template).
     Promote {
-        clone: String,
+        id_or_name: String,
         /// Promote into this template instead of the clone's own; created when it does not exist.
         #[arg(long)]
         template: Option<String>,
@@ -137,6 +137,9 @@ enum Cmd {
         /// Only events from this long ago, like 30m, 2h or 1d.
         #[arg(long)]
         since: Option<String>,
+        /// Only the newest N matching events (default 1000; with --follow, 20 before the new ones).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: Option<u32>,
         /// A JSON array; with --follow one JSON object per line.
         #[arg(long)]
         json: bool,
@@ -167,6 +170,7 @@ enum Cmd {
         command: ServiceCmd,
     },
     /// Show the settings and where each value comes from, or change one.
+    #[command(args_conflicts_with_subcommands = true)]
     Config {
         #[command(subcommand)]
         command: Option<ConfigCmd>,
@@ -179,7 +183,7 @@ enum Cmd {
 enum ConfigCmd {
     /// Write a setting to config.toml and tell a running daemon to reload.
     Set {
-        /// max_clones, min_free_disk, ram_budget, disk_budget, queue_wait or clone_disk_warn.
+        /// One of the settings `mitosis config` lists, like max_clones or idle_sleep.
         key: String,
         /// A number, a size like 4GB, a duration like 60s, or off.
         value: String,
@@ -211,8 +215,9 @@ enum TemplateCmd {
         /// Migrations folder; the template is flagged stale when it changes.
         #[arg(long)]
         migrations: Option<std::path::PathBuf>,
+        /// Postgres major to build with, like 17 (default: the newest installed).
         #[arg(long)]
-        pg_version: Option<u32>,
+        pg_major: Option<u32>,
         #[command(flatten)]
         settings: SettingsFlags,
     },
@@ -280,7 +285,7 @@ struct SettingsFlags {
     every: Option<String>,
     /// How scheduled rebuilds run.
     #[arg(long, value_parser = ["full", "layered"])]
-    mode: Option<String>,
+    every_mode: Option<String>,
     /// Migration command for layered refreshes, run in this folder with DATABASE_URL set, or off.
     #[arg(long)]
     migrate: Option<String>,
@@ -352,7 +357,7 @@ impl SettingsFlags {
             keep: self.keep,
             every_secs,
             every_off,
-            every_mode: enum_arg(self.mode)?,
+            every_mode: enum_arg(self.every_mode)?,
             migrate,
             migrate_off,
             auto_migrate: self.auto_migrate.map(|a| a == "on"),
@@ -376,7 +381,10 @@ enum PgCmd {
         version: Option<String>,
     },
     /// List the builds installed by `pg install` and which ones Mitosis uses.
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove an installed build by major (17) or version (17.9).
     Remove { spec: String },
 }
@@ -529,8 +537,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let ttl_secs = parse_duration(&ttl)?.as_secs();
             let wait_secs = match wait.as_deref() {
                 None => None,
-                Some("0" | "0s") => Some(0),
-                Some(w) => Some(parse_duration(w)?.as_secs()),
+                Some(w) => Some(parse_wait(w)?.as_secs()),
             };
             let args = CloneCreateArgs {
                 template: template.clone(),
@@ -683,14 +690,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 other => return Err(unexpected(other)),
             }
         }
-        Cmd::Promote { clone, template } => {
+        Cmd::Promote {
+            id_or_name,
+            template,
+        } => {
             let req = Request::ClonePromote {
-                id_or_name: clone.clone(),
+                id_or_name: id_or_name.clone(),
                 template,
             };
             match client::request(&home, req).await? {
                 Response::TemplateBuilt(t) => println!(
-                    "promoted {clone} to template {} generation {} (Postgres {}, {})",
+                    "promoted {id_or_name} to template {} generation {} (Postgres {}, {})",
                     t.name,
                     t.current_gen,
                     t.pg_major,
@@ -714,6 +724,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             template,
             kind,
             since,
+            limit,
             json,
         } => {
             let since = match since {
@@ -725,7 +736,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 template,
                 kind,
                 since,
-                limit: None,
+                limit,
             };
             let show = |e: &EventRow| -> Result<()> {
                 if json {
@@ -766,6 +777,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     Response::Events { events } => {
                         for e in &events {
                             show(e)?;
+                        }
+                        let cap = limit.unwrap_or(daemon::EVENTS_DEFAULT_LIMIT);
+                        if events.len() >= cap as usize {
+                            eprintln!(
+                                "note: showing only the newest {cap} events; use --limit to see more"
+                            );
                         }
                     }
                     other => return Err(unexpected(other)),
@@ -865,11 +882,13 @@ async fn pg(home: &Home, cmd: PgCmd) -> Result<()> {
             .map_err(blocking)??;
             println!("{}", i.dir.join("bin").display());
         }
-        PgCmd::List => {
+        PgCmd::List { json } => {
             let installs = tokio::task::spawn_blocking(move || managed::list(&h))
                 .await
                 .map_err(blocking)??;
-            if installs.is_empty() {
+            if json {
+                print_json(&installs)?;
+            } else if installs.is_empty() {
                 println!("no managed Postgres builds (mitosis pg install <major>)");
             } else {
                 let rows = installs
@@ -906,7 +925,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
             seed,
             database,
             migrations,
-            pg_version,
+            pg_major,
             settings,
         } => {
             validate_name("template", &name)?;
@@ -940,7 +959,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 database,
                 migrations,
                 max_age_secs,
-                pg_major: pg_version,
+                pg_major,
                 settings,
             };
             match client::request(home, Request::TemplateInit(args)).await? {
@@ -1050,11 +1069,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                     other => return Err(unexpected(other)),
                 };
             if json {
-                print_json(&serde_json::json!({
-                    "template": template,
-                    "paused": paused,
-                    "generations": generations,
-                }))?;
+                print_json(&history_json(&template, paused, &generations))?;
             } else {
                 if paused {
                     println!("{}", paused_line(&template));
@@ -1115,6 +1130,24 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `template history --json`.
+pub fn history_json(
+    template: &str,
+    paused: bool,
+    generations: &[crate::protocol::GenerationInfo],
+) -> serde_json::Value {
+    serde_json::json!({
+        "template": template,
+        "paused": paused,
+        "generations": generations,
+    })
+}
+
+/// The command tree, for the contract tests.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
 }
 
 /// The template's source for the table: the URL (the daemon already masked its password) or
@@ -1512,7 +1545,7 @@ mod tests {
             "2",
             "--every",
             "off",
-            "--mode",
+            "--every-mode",
             "layered",
             "--migrate",
             "make migrate",
@@ -1542,7 +1575,9 @@ mod tests {
         assert_eq!(s.migrate.unwrap().command, "make migrate");
         assert_eq!(s.auto_migrate, Some(true));
         assert_eq!(s.on_stale, Some(crate::protocol::OnStale::Refresh));
-        assert!(Cli::try_parse_from(["mitosis", "template", "set", "--mode", "fast"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mitosis", "template", "set", "--every-mode", "fast"]).is_err()
+        );
     }
 
     #[test]
