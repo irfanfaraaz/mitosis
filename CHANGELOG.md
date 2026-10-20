@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [1.0.0] - Unreleased
 
+### Added
+
+- A router: every clone is reached through one fixed port (`router_port`, default 54300), picked by database name, at `postgres://postgres:<password>@127.0.0.1:54300/<clone name or id>`. Passwords stay end to end, query cancels are routed, and containers use `host.docker.internal`. New config keys `router`, `router_port` and `router_listen`.
+- `clone`, `list` and the MCP replies carry `url` (the router URL while the router is on) and `direct_url` (the clone's own port). `mitosis env <clone> --direct` prints the direct URL.
+- Sleep and wake: idle clones stop and wake on the first router connection (`idle_sleep`, default 10 minutes), the status `sleeping`, `mitosis wake <clone>`, and eviction of idle clones to fit the RAM budget before a request queues. `idle_reap` destroys idle unnamed, unprotected clones.
+- `mitosis diff <clone> [--table <t> [--limit N]] [--json]` and the MCP tool `clone_diff`: schema changes, row counts and changed rows against the template generation the clone came from.
+- Masking and subsets: `template init|set --mask <file>` with the strategies `email`, `name`, `hash`, `null`, `redact`, `const:<value>` and `keep`, and `[subset]` filters or percents that keep foreign keys valid. A masked template never holds the raw values.
+- Per-branch templates: `mitosis clone --branch [<branch>]`, MCP `clone_create` `branch`, `template set --base-branch`, and gc of unused branch templates.
+- `template init --basebackup <url>`: a physical copy of a running server with `pg_basebackup`.
+- `mitosis pg install <major> [--version <x.y>]`, `pg list [--json]` and `pg remove`: Postgres builds downloaded from the `theseus-rs/postgresql-binaries` releases with a SHA-256 check. These are the only commands that download.
+- `mitosis events [--follow] [--clone] [--template] [--kind] [--since] [--limit N] [--json]` and the event log in the store (30 days or 50,000 events).
+- `mitosis pg list --json`.
+- `COMPATIBILITY.md` and contract tests (`tests/contract.rs`) that pin the CLI, `--json` output, MCP tools, error codes and config keys.
+- `mitosis doctor` checks the router, `router_listen`, managed Postgres builds, mask files, branch templates and the event log.
+- `scripts/bench.sh` also prints the connect time through the router against the direct port, and the wake time.
+
 ### Changed
 
 - The CLI, `--json` output, MCP tools, config keys, error codes and daemon protocol are now frozen until 2.0; see [COMPATIBILITY.md](COMPATIBILITY.md). Contract tests pin them.
@@ -52,6 +68,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `mitosis doctor` reports a read error of `state.db` instead of treating the table as empty.
 - `mitosis service install` waits for launchd to unload the old job before loading the new one.
 - Upgrade logs and error tails hide SCRAM password hashes.
+
+### Fixed
+
+- `mitosis doctor --fix` reports the true number of finished `.env` restores. It used to count warnings.
+- A restart of a clone whose `.env` rewrite failed keeps the URL the file holds in its record, as `--fresh` does.
+- `.env` records are written while the create is still marked in flight, and `.env` restores no longer block the daemon's runtime.
+- A reused process id of a dead MCP session is no longer taken for the same session (the name guard compares the parent's start time too).
+- A failed create gives back the port and password reservation it made.
+- gc no longer removes a generation folder while a clone is being copied from it, and no longer holds its read guard while it deletes.
+- gc finishes a prune that crashed half-way instead of calling the folder foreign.
+- A put to sleep checks direct connections again before it stops the server, and a failed revert is logged.
+- A waking clone's memory counts toward the RAM budget while it starts.
+- A promote commits the new generation before it restarts the clone, so a kill in between cannot lose the promoted data. Its build log is named safely for branch templates, and a failed resume is logged.
+- Deleting a template removes it and its generations in one transaction.
+- `ensure_daemon` starts our daemon again when its child lost the lock race and no socket is left, instead of waiting 30 seconds.
+- A kickstarted login service that dies no longer waits the full 30 seconds, and the hint shows `service.log`.
+- `config.toml` writes use a unique temporary file, and the login service compares homes through symlinks.
 
 ## [0.2.0] - 2026-10-20
 
@@ -106,6 +139,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Configurable limits through `MITOSIS_MAX_CLONES` and `MITOSIS_MIN_FREE_DISK`.
 - Benchmark script, `scripts/bench.sh`.
 
-[Unreleased]: https://github.com/irfanfaraaz/mitosis/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/irfanfaraaz/mitosis/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/irfanfaraaz/mitosis/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/irfanfaraaz/mitosis/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/irfanfaraaz/mitosis/releases/tag/v0.1.0

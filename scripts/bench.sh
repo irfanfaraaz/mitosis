@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Mitosis benchmark: clone time, extra disk and idle RAM for ~1 GB and ~10 GB templates.
+# Mitosis benchmark: clone time, extra disk and idle RAM for ~1 GB and ~10 GB templates, then the
+# connect time through the router against the direct port, and the wake time of a sleeping clone.
 #
 # Binary: $MITOSIS_BIN, else ./target/release/mitosis.
-# Needs: jq, perl, and pgbench (on PATH, or in a Homebrew Postgres/libpq bin dir).
+# Needs: jq, perl, and pgbench and psql (on PATH, or in a Homebrew Postgres/libpq bin dir).
 # Uses a temporary MITOSIS_HOME on the same volume as $TMPDIR; it is deleted on exit.
 # Note: pgbench scale-to-size is approximate (scale 70 is about 1 GB, scale 700 about 10 GB).
 # The 10 GB template needs roughly 25 GB of free disk while it is being seeded.
@@ -21,6 +22,7 @@ if ! command -v pgbench >/dev/null; then
   done
 fi
 command -v pgbench >/dev/null || { echo "error: pgbench not found; put it on PATH (brew install postgresql@18)" >&2; exit 1; }
+command -v psql >/dev/null || { echo "error: psql not found; put it on PATH (brew install postgresql@18)" >&2; exit 1; }
 
 # /tmp, not $TMPDIR: macOS $TMPDIR is long enough to break the 103-byte socket path limit.
 MITOSIS_HOME="$(mktemp -d /tmp/mitosis-bench.XXXXXX)"
@@ -64,6 +66,14 @@ free_bytes() {
   [[ $kb =~ ^[0-9]+$ ]] || { echo "error: could not read free space for $MITOSIS_HOME (got '$kb')" >&2; return 1; }
   echo $(( kb * 1024 ))
 }
+# Milliseconds for one `select 1` through the URL $1. Fails (not exits) so the caller's errexit fires.
+time_query() {
+  local t0 t1
+  t0=$(now)
+  psql "$1" -Atqc 'select 1' >/dev/null || return 1
+  t1=$(now)
+  awk -v a="$t0" -v b="$t1" 'BEGIN{print (b-a)*1000}'
+}
 median() { sort -g | awk '{a[NR]=$1} END{print (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2)}'; }
 
 echo "| Template | Median clone time | Median extra disk | Median idle RAM |"
@@ -104,3 +114,51 @@ for entry in "${SIZES[@]}"; do
   awk -v l="$label" -v t="$t" -v d="$d" -v r="$r" \
     'BEGIN{printf "| %s | %.0f ms | %.1f MB | %.1f MB |\n", l, t, d/1e6, r/1e6}'
 done
+
+# Router connect time and wake time, on a clone of the first (smaller) template.
+rname="bench-${SIZES[0]%%:*}"
+
+info=$("$MITOSIS" clone --template "$rname" --json)
+url=$(jq -r '.url // empty' <<<"$info")
+direct_url=$(jq -r '.direct_url // empty' <<<"$info")
+id=$(jq -r '.id // empty' <<<"$info")
+[ -n "$url" ] && [ -n "$direct_url" ] && [ -n "$id" ] || { echo "error: clone --json returned no url, direct_url or id: $info" >&2; exit 1; }
+time_query "$direct_url" >/dev/null  # warm-up, not counted
+time_query "$url" >/dev/null
+rtimes=(); dtimes=()
+for _ in $(seq "$RUNS"); do
+  dtimes+=("$(time_query "$direct_url")")
+  rtimes+=("$(time_query "$url")")
+done
+"$MITOSIS" destroy "$id" >/dev/null
+d=$(printf '%s\n' "${dtimes[@]}" | median)
+r=$(printf '%s\n' "${rtimes[@]}" | median)
+
+# Wake time: make RUNS clones, let them go idle until they sleep (the idle check runs every 30 s),
+# then time the first query through the router of each, which starts the clone.
+"$MITOSIS" config set idle_sleep 5s >&2
+urls=()
+for _ in $(seq "$RUNS"); do
+  info=$("$MITOSIS" clone --template "$rname" --json)
+  u=$(jq -r '.url // empty' <<<"$info")
+  [ -n "$u" ] || { echo "error: clone --json returned no url: $info" >&2; exit 1; }
+  urls+=("$u")
+done
+deadline=$(( $(date +%s) + 300 ))
+while :; do
+  asleep=$("$MITOSIS" list --json | jq '[.[] | select(.status == "sleeping")] | length')
+  [ "$asleep" -ge "$RUNS" ] && break
+  [ "$(date +%s)" -lt "$deadline" ] || { echo "error: $asleep of $RUNS clones sleeping after 300 s" >&2; exit 1; }
+  sleep 3
+done
+wakes=()
+for u in "${urls[@]}"; do
+  wakes+=("$(time_query "$u")")
+done
+w=$(printf '%s\n' "${wakes[@]}" | median)
+
+echo
+echo "| Connection | Median time |"
+echo "|---|---|"
+awk -v d="$d" -v r="$r" -v w="$w" \
+  'BEGIN{printf "| direct port | %.0f ms |\n| through the router | %.0f ms |\n| first query after sleep (wake) | %.0f ms |\n", d, r, w}'
