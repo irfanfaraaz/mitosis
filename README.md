@@ -50,6 +50,15 @@ Mitosis is a CLI and a small background daemon. It copies a template Postgres da
 
 From 1.0 on, the CLI, the `--json` output, the MCP tools, the config keys and the daemon protocol are stable until 2.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## Contents
+
+- **Start:** [Install](#install) · [Quick start](#quick-start) · [MCP setup](#mcp-setup) · [How it works](#how-it-works)
+- **Clones:** [Router and URLs](#router-and-urls) · [Sleep and wake](#sleep-and-wake) · [Named clones](#named-clones) · [`.env` injection](#env-injection) · [Diff](#diff) · [Budgets, queue and `top`](#budgets-queue-and-top) · [Events](#events)
+- **Templates:** [Generations](#generations) · [Template settings](#template-settings) · [Masking and subsets](#masking-and-subsets) · [Per-branch templates](#per-branch-templates) · [Physical copy of a server](#physical-copy-of-a-server) · [Promote](#promote) · [Upgrade to a newer Postgres](#upgrade-a-template-to-a-newer-postgres) · [Managed Postgres builds](#managed-postgres-builds)
+- **Running it:** [Config](#config) · [Login service](#login-service) · [Reboot recovery](#reboot-recovery-and-suspect-clones) · [Doctor](#doctor) · [Defaults](#defaults)
+- **Upgrading:** [From 0.2](#upgrading-from-02) · [From 0.1](#upgrading-from-01)
+- **Project:** [Benchmarks](#benchmarks) · [Compatibility](#compatibility) · [Platform](#platform) · [Contributing](#contributing) · [Security](#security) · [License](#license)
+
 ## Install
 
 ```sh
