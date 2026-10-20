@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["postgres", "database", "clone", "copy-on-write", "mcp"]
 categories = ["command-line-utilities", "database", "development-tools"]
 rust-version = "1.89"
-exclude = [".github/", "docs/"]
+exclude = [".github/", "docs/", "assets/"]
 
 [lib]
 name = "mitosis"

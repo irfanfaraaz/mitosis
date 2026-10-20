@@ -1,10 +1,50 @@
-# Mitosis for Postgres
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img alt="Mitosis for Postgres" src="assets/logo-light.png" height="64">
+  </picture>
+</h1>
 
 [![CI](https://github.com/irfanfaraaz/mitosis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/irfanfaraaz/mitosis/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/mitosis-db.svg)](https://crates.io/crates/mitosis-db)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Give each AI agent task its own private Postgres database, cloned from a template.
+**Every AI agent gets its own throwaway copy of your Postgres, in about 0.1 seconds.**
+
+Let the agent drop tables, run a bad migration or fill the database with junk. It does it on its own clone. Your real database stays untouched, and the clone is deleted when the agent's session ends.
+
+<a href="assets/demo.mp4"><img alt="Watch the 45-second demo: an agent drops the users table on its own clone, and the template keeps all its rows" src="assets/demo-poster.jpg" width="100%"></a>
+
+| Clone time | Extra disk per clone | Template size |
+|---|---|---|
+| **115 ms** | **under 1 MB** | 1 GB or 10 GB: same speed |
+
+Measured on an Apple M4 with Postgres 18.6; see [Benchmarks](#benchmarks).
+
+**Try it:**
+
+```sh
+cargo install mitosis-db
+brew install postgresql@18
+mitosis template init --seed 'psql "$DATABASE_URL" -f schema.sql'
+export DATABASE_URL=$(mitosis clone)
+```
+
+**Give it to Claude Code** (or any MCP client). Each session gets its own clone, removed when the session ends:
+
+```json
+{"mcpServers": {"mitosis": {"command": "mitosis", "args": ["mcp"]}}}
+```
+
+> **macOS on APFS only for now.** Linux (Btrfs and XFS reflinks) is planned for v2.
+
+**Why not something else?**
+
+| Instead of | The difference |
+|---|---|
+| `pg_dump` or `createdb -T` | A real copy takes seconds to minutes and doubles the disk. A clone takes 0.1 s and shares every block it does not change. |
+| A Docker container per agent | A fresh container still has to load your data. A clone starts with all of it. |
+| Neon branching | The same copy-on-write idea, but in the cloud. Mitosis runs on your Mac, offline, for free. |
 
 Mitosis is a CLI and a small background daemon. It copies a template Postgres data directory with APFS `clonefile` (copy-on-write), starts a real Postgres process on the copy, and deletes it when the task ends or its TTL passes. Cloning a database takes about a tenth of a second and costs almost no extra disk, even for a 10 GB template (see [Benchmarks](#benchmarks)).
 
