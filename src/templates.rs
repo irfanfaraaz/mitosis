@@ -12,12 +12,13 @@ use crate::pg::{
 };
 use crate::ports::pick_port;
 use crate::protocol::{
-    GenKind, GenerationInfo, MigrateCmd, RefreshMode, TemplateInfo, TemplateInitArgs,
-    TemplateSetArgs, TemplateSettings, TemplateSource,
+    BranchArgs, EventFilter, GenKind, GenerationInfo, MigrateCmd, OnStale, RefreshMode,
+    TemplateInfo, TemplateInitArgs, TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::state::{GenerationRow, TemplateRow};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -108,7 +109,67 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
     preview.source = args.source.clone();
     apply_settings(&mut preview, None, &args.settings)?;
     check_mask_file(&args.settings)?;
-    build(ctx, args).await
+    // The checkout as it is now, recorded once the build is in.
+    let (cwd, mig) = (
+        preview.migrate.as_ref().map(|m| m.cwd.clone()),
+        preview.migrations.clone(),
+    );
+    let paths = blocking(move || Ok(git_paths(cwd.as_deref(), mig.as_deref()))).await?;
+    let (name, explicit_branch) = (args.name.clone(), args.settings.base_branch.is_some());
+    build(ctx, args).await?;
+    {
+        let store = ctx.store();
+        let mut t = store.get_template(&name)?.ok_or_else(|| not_found(&name))?;
+        record_git_paths(&mut t, paths, explicit_branch);
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, &name)
+}
+
+/// What `git_paths` found: the checked-out branch and the repo-relative migrate folder and
+/// migrations folder.
+type GitPaths = (Option<String>, Option<PathBuf>, Option<PathBuf>);
+
+/// Writes `paths` into `t`; `base_branch` stays when `keep_branch` (it was given explicitly).
+fn record_git_paths(t: &mut TemplateRow, paths: GitPaths, keep_branch: bool) {
+    if !keep_branch {
+        t.base_branch = paths.0;
+    }
+    (t.repo_rel_cwd, t.repo_rel_migrations) = (paths.1, paths.2);
+}
+
+/// Runs `git -C <dir> <args>`; its trimmed output when it succeeds, `None` when git fails or is
+/// missing. Blocking.
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The branch checked out in the git work tree of `cwd` (else of `migrations`), and each folder
+/// relative to the root of its work tree; `None` for what is not in a work tree. Blocking.
+fn git_paths(cwd: Option<&Path>, migrations: Option<&Path>) -> GitPaths {
+    let rel = |dir: &Path| {
+        let top = git(dir, &["rev-parse", "--show-toplevel"])?;
+        let top = Path::new(&top).canonicalize().ok()?;
+        let dir = dir.canonicalize().ok()?;
+        dir.strip_prefix(&top).ok().map(Path::to_path_buf)
+    };
+    let (rel_cwd, rel_mig) = (cwd.and_then(rel), migrations.and_then(rel));
+    let branch = cwd
+        .filter(|_| rel_cwd.is_some())
+        .or(migrations.filter(|_| rel_mig.is_some()))
+        .and_then(|d| git(d, &["branch", "--show-current"]))
+        .filter(|b| !b.is_empty());
+    (branch, rel_cwd, rel_mig)
 }
 
 /// A masking file given in a request must load. Checked at request time only: the settings
@@ -243,6 +304,12 @@ fn apply_settings(
     if let Some(o) = s.on_stale {
         t.on_stale = o;
     }
+    if let Some(b) = &s.base_branch {
+        if b.trim().is_empty() {
+            return Err(invalid("--base-branch needs a branch name"));
+        }
+        t.base_branch = Some(b.clone());
+    }
     // A full refresh of a promoted template is refused, so a schedule must be layered.
     if matches!(t.source, TemplateSource::Promoted { .. })
         && t.every_secs.is_some()
@@ -298,10 +365,11 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
     let age_secs = age_secs(cur.built_at, now);
     let mut warnings = Vec::new();
     if age_secs > row.max_age_secs {
+        // A branch template is rebuilt from its base, so the base is what to refresh.
         warnings.push(format!(
             "template is {} days old; run: mitosis template refresh {}",
             age_secs / 86_400,
-            row.name
+            row.base.as_deref().unwrap_or(&row.name)
         ));
     }
     if let Some(dir) = row.migrations.as_deref().filter(|d| d.is_dir()) {
@@ -354,11 +422,14 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
         on_stale: row.on_stale,
         keep: row.keep,
         mask: row.mask_path.clone(),
+        base: row.base.clone(),
+        branch: row.branch.clone(),
+        base_branch: row.base_branch.clone(),
     }
 }
 
 pub fn history(ctx: &Ctx, name: &str) -> Result<Vec<GenerationInfo>> {
-    validate_name("template", name)?;
+    validate_template_ref(name)?;
     let store = ctx.store();
     let t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
     Ok(store
@@ -757,6 +828,16 @@ pub(crate) async fn background(ctx: &Ctx, name: &str, mode: RefreshMode) {
         name: name.to_string(),
     };
     let started = now();
+    // The base follows only its own branch: a layered build from another checkout would pollute it.
+    if mode == RefreshMode::Layered {
+        match off_base_branch(ctx, name).await {
+            Ok(Some((base_branch, current))) => {
+                return emit_skipped(ctx, name, &base_branch, &current);
+            }
+            Ok(None) => {}
+            Err(e) => crate::lifecycle::log(ctx, &format!("template {name}: branch check: {e}")),
+        }
+    }
     // A layered build would be refused while the masking file is newer than the current
     // generation; an automatic build does the full build that re-bases it instead.
     let mode = match mode {
@@ -1029,6 +1110,7 @@ pub(crate) fn is_build_socket_name(name: &str) -> bool {
 }
 
 /// A leftover folder `build` makes in `templates/`: `.<name>.building-<ts>` or `.<name>.old-<ts>`.
+/// The string is the template's `folder_stem`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Leftover {
     Building(String),
@@ -1036,22 +1118,91 @@ pub(crate) enum Leftover {
 }
 
 pub(crate) fn build_dir_name(name: &str, ts: i64) -> String {
-    format!(".{name}.building-{ts}")
+    format!(".{}.building-{ts}", folder_stem(name))
 }
 
 fn old_dir_name(name: &str, ts: i64) -> String {
-    format!(".{name}.old-{ts}")
+    format!(".{}.old-{ts}", folder_stem(name))
 }
 
 /// The folder of generation `gen` of template `name`, in `templates/`.
 fn gen_dir_name(name: &str, gen: u32) -> String {
-    format!("{name}@{gen}")
+    format!("{}@{gen}", folder_stem(name))
+}
+
+/// The name of the template built for git branch `branch` of template `base`.
+pub fn branch_template_name(base: &str, branch: &str) -> String {
+    format!("{base}~{branch}")
+}
+
+/// What stands for a branch template in folder names: `base`, `~`, the branch as a lowercase
+/// ASCII slug (any other character becomes `-`, at most 40) and `-` plus 8 hex of its SHA-256.
+pub fn branch_folder_slug(base: &str, branch: &str) -> String {
+    let slug: String = branch
+        .chars()
+        .map(|c| match c.to_ascii_lowercase() {
+            c @ ('a'..='z' | '0'..='9' | '-') => c,
+            _ => '-',
+        })
+        .take(40)
+        .collect();
+    let hash: String = Sha256::digest(branch.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{base}~{slug}-{hash}")
+}
+
+/// What stands for template `name` in folder and log names: the name, or a branch template's slug.
+pub(crate) fn folder_stem(name: &str) -> String {
+    match name.split_once('~') {
+        Some((base, branch)) => branch_folder_slug(base, branch),
+        None => name.to_string(),
+    }
+}
+
+/// True for the names `folder_stem` makes.
+fn valid_stem(stem: &str) -> bool {
+    match stem.split_once('~') {
+        Some((base, slug)) => {
+            validate_name("template", base).is_ok()
+                && (10..=49).contains(&slug.len())
+                && slug
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }
+        None => validate_name("template", stem).is_ok(),
+    }
+}
+
+/// A template name a read request may name: a plain name, or a branch template `<base>~<branch>`.
+pub fn validate_template_ref(name: &str) -> Result<()> {
+    match name.split_once('~') {
+        Some((base, branch)) => {
+            validate_name("template", base)?;
+            check_branch_name(branch)
+        }
+        None => validate_name("template", name),
+    }
+}
+
+/// A git branch name `clone --branch` accepts.
+fn check_branch_name(branch: &str) -> Result<()> {
+    if branch.is_empty()
+        || branch.len() > 255
+        || branch.contains('~')
+        || branch.chars().any(char::is_control)
+    {
+        return Err(invalid(format!("invalid branch name {branch:?}")));
+    }
+    Ok(())
 }
 
 /// Parses the names `gen_dir_name` makes; anything else is `None`.
 pub(crate) fn parse_gen_dir(file_name: &str) -> Option<(String, u32)> {
     let (name, gen) = file_name.split_once('@')?;
-    validate_name("template", name).ok()?;
+    valid_stem(name).then_some(())?;
     if gen.is_empty() || !gen.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -1061,7 +1212,7 @@ pub(crate) fn parse_gen_dir(file_name: &str) -> Option<(String, u32)> {
 /// Parses the names `build_dir_name` and `old_dir_name` make; anything else is `None`.
 pub(crate) fn parse_leftover(file_name: &str) -> Option<Leftover> {
     let (name, suffix) = file_name.strip_prefix('.')?.split_once('.')?;
-    validate_name("template", name).ok()?;
+    valid_stem(name).then_some(())?;
     let ts = |s: &str| {
         s.bytes()
             .all(|b| b.is_ascii_digit())
@@ -1578,10 +1729,74 @@ pub(crate) fn resume_if_current(t: &mut TemplateRow, gen: u32) {
 
 /// Copies the current generation of `name`, runs only its migrate command on the copy and makes
 /// the result a `Layered` generation. `path`, when given, replaces the command's recorded `PATH`.
+/// Refused while the template's recorded checkout is on another branch than its `base_branch`.
 pub async fn layered(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
     validate_name("template", name)?;
+    if let Some((base_branch, current)) = off_base_branch(ctx, name).await? {
+        return Err(invalid(format!(
+            "the checkout of template {name} is on {}, not on its base branch {base_branch}",
+            branch_label(&current)
+        ))
+        .with_hint(format!(
+            "for this branch use: mitosis clone --branch; to refresh {name}: git switch {base_branch}"
+        )));
+    }
     let _guard = BuildGuard::take(ctx, name)?;
     layered_held(ctx, name, path, true).await
+}
+
+/// `branch X` for a branch name, `a detached HEAD` for the empty one.
+fn branch_label(branch: &str) -> String {
+    if branch.is_empty() {
+        "a detached HEAD".into()
+    } else {
+        format!("branch {branch}")
+    }
+}
+
+/// `(base_branch, checked out branch)` when `name` has a `base_branch` and its migrate folder's
+/// checkout is on another branch (`""` for a detached HEAD); `None` otherwise, also when git
+/// cannot tell.
+async fn off_base_branch(ctx: &Ctx, name: &str) -> Result<Option<(String, String)>> {
+    let Some(t) = ctx.store().get_template(name)? else {
+        return Ok(None);
+    };
+    let (Some(base_branch), Some(m)) = (t.base_branch, t.migrate) else {
+        return Ok(None);
+    };
+    let current = blocking(move || Ok(git(&m.cwd, &["branch", "--show-current"]))).await?;
+    Ok(current
+        .filter(|c| *c != base_branch)
+        .map(|c| (base_branch, c)))
+}
+
+/// `template.skipped` for a layered build of `name` skipped because its checkout is on `current`;
+/// not again while the newest event of `name` already says so.
+fn emit_skipped(ctx: &Ctx, name: &str, base_branch: &str, current: &str) {
+    let filter = EventFilter {
+        template: Some(name.to_string()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let last = ctx.store().list_events(&filter).unwrap_or_default();
+    if last.last().is_some_and(|e| {
+        e.kind == events::TEMPLATE_SKIPPED
+            && e.detail.get("branch").and_then(|b| b.as_str()) == Some(current)
+    }) {
+        return;
+    }
+    events::emit(
+        ctx,
+        events::TEMPLATE_SKIPPED,
+        None,
+        Some(name),
+        serde_json::json!({
+            "op": "layered",
+            "reason": "checkout on another branch",
+            "branch": current,
+            "base_branch": base_branch,
+        }),
+    );
 }
 
 /// `layered` for a caller that holds the build slot. Only a `manual` build clears `paused`.
@@ -1600,6 +1815,43 @@ async fn layered_held(
         );
     };
     migrate.path = path.or(migrate.path);
+    let gen = build_layer(
+        ctx,
+        Layer {
+            target: name,
+            src: &t,
+            from: &cur,
+            migrate,
+            migrations: t.migrations.clone(),
+            expected: cur.gen,
+        },
+    )
+    .await?;
+    if manual {
+        let store = ctx.store();
+        let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+        resume_if_current(&mut t, gen);
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, name)
+}
+
+/// A layered build: generation `from` of template `src` copied, `migrate` run on the copy (and
+/// `src`'s masking applied again), committed as the next generation of `target` when its current
+/// pointer is still `expected`. `target` is `src` itself, or a branch template of it.
+struct Layer<'a> {
+    target: &'a str,
+    src: &'a TemplateRow,
+    from: &'a GenerationRow,
+    migrate: MigrateCmd,
+    /// Hashed into the new generation, for freshness checks.
+    migrations: Option<PathBuf>,
+    expected: u32,
+}
+
+/// Runs `l`; returns the new generation's number. The caller holds the build slot of `l.target`.
+async fn build_layer(ctx: &Ctx, l: Layer<'_>) -> Result<u32> {
+    let (name, t, cur) = (l.target, l.src, l.from);
     // Masking in place covers only what the migration adds: the copied pages must already be
     // masked with this very file, or raw values of newly masked columns would stay in them.
     let masking = match t.mask_path.as_deref() {
@@ -1607,24 +1859,27 @@ async fn layered_held(
             let hash = MaskFile::hash(p)?;
             if cur.mask_hash.as_deref() != Some(hash.as_str()) {
                 return Err(invalid(format!(
-                    "the current generation of template {name} was not built with the masking \
+                    "the current generation of template {} was not built with the masking \
                      file {} as it is now",
+                    t.name,
                     p.display()
                 ))
                 .with_hint(format!(
-                    "run a full build first: mitosis template refresh {name}"
+                    "run a full build first: mitosis template refresh {}",
+                    t.name
                 )));
             }
+            // The source's salt, so a branch template masks values as its base does.
             Some(Masking {
                 file: MaskFile::load(p)?,
                 hash,
-                salt: ctx.store().ensure_mask_salt(name, &random_hex(32))?,
+                salt: ctx.store().ensure_mask_salt(&t.name, &random_hex(32))?,
             })
         }
         None => None,
     };
     let install = ctx.install_major(cur.pg_major).await?;
-    let migrations_hash = match t.migrations.as_deref() {
+    let migrations_hash = match l.migrations.as_deref() {
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
         _ => None,
     };
@@ -1643,7 +1898,7 @@ async fn layered_held(
         &side,
         &mut opts,
         &t.database,
-        &migrate,
+        &l.migrate,
         masking.as_ref(),
     )
     .await;
@@ -1670,17 +1925,11 @@ async fn layered_held(
         from_gen: Some(cur.gen),
         mask_hash: masking.map(|m| m.hash),
     };
-    if let Err(e) = commit_built(ctx, &install, &log, &secrets, row, cur.gen).await {
+    if let Err(e) = commit_built(ctx, &install, &log, &secrets, row, l.expected).await {
         events::emit_template_failed(ctx, name, gen, "layered", &e);
         return Err(e);
     }
-    if manual {
-        let store = ctx.store();
-        let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
-        resume_if_current(&mut t, gen);
-        store.update_template_settings(&t)?;
-    }
-    template_info(ctx, name)
+    Ok(gen)
 }
 
 /// Copy of generation folder `from` into `dir`, started privately, migrated, masked again when
@@ -1725,6 +1974,208 @@ async fn layered_steps(
     extensions_and_stop(ctx, install, dir, opts, database, pg).await
 }
 
+/// What `clone --branch` gets: the branch template to clone and how its freshness was handled.
+#[derive(Debug)]
+pub struct BranchUse {
+    pub name: String,
+    /// It was rebuilt before the clone.
+    pub rebuilt: bool,
+    /// It is out of date and served as it is (the base has `on_stale = refresh`).
+    pub stale: bool,
+    /// A rebuild of it runs in the background.
+    pub refreshing: bool,
+}
+
+/// Where a branch build runs: the caller's checkout joined with the base's repo-relative paths.
+struct Checkout {
+    cwd: PathBuf,
+    migrations: Option<PathBuf>,
+}
+
+/// The branch template of `base` for the caller's checkout `b`: created on first use, and rebuilt
+/// first when the base has another current generation than the one it was layered on, or the
+/// checkout's migrations differ from the ones it was built with. With the base's
+/// `on_stale = refresh`, an existing generation is served and rebuilt in the background instead.
+pub async fn ensure_branch(ctx: &Arc<Ctx>, base: &str, b: &BranchArgs) -> Result<BranchUse> {
+    validate_name("template", base)?;
+    check_branch_name(&b.name)?;
+    if !b.repo_root.is_absolute() {
+        return Err(invalid(format!(
+            "repository root {} is not an absolute path",
+            b.repo_root.display()
+        )));
+    }
+    let name = branch_template_name(base, &b.name);
+    let used = |rebuilt, stale, refreshing| BranchUse {
+        name: name.clone(),
+        rebuilt,
+        stale,
+        refreshing,
+    };
+    loop {
+        let (row, base_row, base_cur, checkout) = branch_row(ctx, base, &name, b).await?;
+        let cur = ctx.store().current(&name)?.map(|(_, g)| g);
+        let m = checkout.migrations;
+        let hash =
+            blocking(move || m.filter(|d| d.is_dir()).map(|d| hash_dir(&d)).transpose()).await?;
+        let fresh = cur
+            .as_ref()
+            .is_some_and(|g| row.base_gen == Some(base_cur.gen) && g.migrations_hash == hash);
+        if fresh {
+            return Ok(used(false, false, false));
+        }
+        if cur.is_some() && base_row.on_stale == OnStale::Refresh {
+            if claim_build(ctx, &name) {
+                let (ctx, name, base, b) = (ctx.clone(), name.clone(), base.to_string(), b.clone());
+                tokio::spawn(async move {
+                    // Adopts the slot claimed above.
+                    let _guard = BuildGuard {
+                        ctx: &ctx,
+                        name: name.clone(),
+                    };
+                    if let Err(e) = build_branch(&ctx, &base, &name, &b).await {
+                        let first = e.message.lines().next().unwrap_or_default().to_string();
+                        crate::lifecycle::log(
+                            &ctx,
+                            &format!("background build of template {name} failed: {first}"),
+                        );
+                    }
+                });
+            }
+            return Ok(used(false, true, true));
+        }
+        match BuildGuard::take(ctx, &name) {
+            Ok(_guard) => {
+                build_branch(ctx, base, &name, b).await?;
+                return Ok(used(true, false, false));
+            }
+            // Another clone is building it: wait for that build, then look again.
+            Err(_) => {
+                while is_building(ctx, &name) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+}
+
+/// Reads the base and creates the branch template `name` when it has no row yet; marks it used.
+/// Fails when the base has no migrate command or its migrate folder is not in a git work tree.
+async fn branch_row(
+    ctx: &Ctx,
+    base: &str,
+    name: &str,
+    b: &BranchArgs,
+) -> Result<(TemplateRow, TemplateRow, GenerationRow, Checkout)> {
+    let (mut base_row, base_cur) = ctx.store().current(base)?.ok_or_else(|| not_found(base))?;
+    let Some(migrate) = base_row.migrate.clone() else {
+        return Err(invalid(format!(
+            "template {base} has no migrate command, so it has no branch templates"
+        ))
+        .with_hint(format!(
+            "set one from your git checkout: mitosis template set {base} --migrate \"…\""
+        )));
+    };
+    if base_row.repo_rel_cwd.is_none() {
+        // `template init` records the paths; a migrate command set later is looked up here.
+        let (cwd, mig) = (migrate.cwd.clone(), base_row.migrations.clone());
+        let paths = blocking(move || Ok(git_paths(Some(&cwd), mig.as_deref()))).await?;
+        if paths.1.is_none() {
+            return Err(invalid(format!(
+                "the migrate command of template {base} runs in {}, which is not in a git work tree",
+                migrate.cwd.display()
+            ))
+            .with_hint(format!(
+                "--branch needs it inside your git checkout: mitosis template set {base} --migrate \"…\" from there"
+            )));
+        }
+        let store = ctx.store();
+        if let Some(mut t) = store.get_template(base)? {
+            let keep = t.base_branch.is_some();
+            record_git_paths(&mut t, paths, keep);
+            store.update_template_settings(&t)?;
+            base_row = t;
+        }
+    }
+    let checkout = Checkout {
+        cwd: b
+            .repo_root
+            .join(base_row.repo_rel_cwd.as_deref().unwrap_or(Path::new(""))),
+        migrations: base_row
+            .repo_rel_migrations
+            .as_ref()
+            .map(|r| b.repo_root.join(r)),
+    };
+    if !checkout.cwd.is_dir() {
+        return Err(invalid(format!(
+            "{} does not exist in this checkout",
+            checkout.cwd.display()
+        ))
+        .with_hint(format!(
+            "run it in a checkout of the repository template {base} was made from"
+        )));
+    }
+    let store = ctx.store();
+    if store.get_template(name)?.is_none() {
+        let mut t = TemplateRow::new(
+            name,
+            &base_row.database,
+            base_row.source.clone(),
+            checkout.migrations.clone(),
+            base_row.max_age_secs,
+        );
+        (t.base, t.branch, t.keep) = (Some(base.into()), Some(b.name.clone()), base_row.keep);
+        store.insert_template(&t)?;
+    }
+    let mut row = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+    (row.last_used, row.max_age_secs) = (Some(now()), base_row.max_age_secs);
+    store.update_template_settings(&row)?;
+    Ok((row, base_row, base_cur, checkout))
+}
+
+/// Layers a new generation of branch template `name` on the base's current generation, running the
+/// base's migrate command in the caller's checkout. A failed first build leaves no template. The
+/// caller holds the build slot of `name`.
+async fn build_branch(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) -> Result<()> {
+    let (row, base_row, base_cur, checkout) = branch_row(ctx, base, name, b).await?;
+    let Some(mut migrate) = base_row.migrate.clone() else {
+        return Err(not_found(base));
+    };
+    migrate.cwd = checkout.cwd;
+    migrate.path = b.path.clone().or(migrate.path);
+    let built = build_layer(
+        ctx,
+        Layer {
+            target: name,
+            src: &base_row,
+            from: &base_cur,
+            migrate,
+            migrations: checkout.migrations.clone(),
+            expected: row.current_gen,
+        },
+    )
+    .await;
+    let store = ctx.store();
+    let Some(mut t) = store.get_template(name)? else {
+        return built.map(drop);
+    };
+    match built {
+        Ok(gen) => {
+            if t.current_gen == gen {
+                (t.base_gen, t.last_error) = (Some(base_cur.gen), None);
+            }
+            t.migrations = checkout.migrations;
+            store.update_template_settings(&t)
+        }
+        Err(e) => {
+            if matches!(store.list_generations(name), Ok(g) if g.is_empty()) {
+                let _ = store.delete_template(name);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// A free port for a build server, skipping `skip`. Reserved ports too: a named clone's stable URL
 /// must not lose its port to a build server.
 fn build_port(ctx: &Ctx, skip: &HashSet<u16>) -> Result<u16> {
@@ -1738,7 +2189,10 @@ fn build_port(ctx: &Ctx, skip: &HashSet<u16>) -> Result<u16> {
 /// Options for a private build server of `name` on a free port. Truncates the build log, so an
 /// error tail belongs to this build.
 fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
-    let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
+    let log = ctx
+        .home
+        .logs_dir()
+        .join(format!("template-{}.log", folder_stem(name)));
     std::fs::File::create(&log)?;
     let port = build_port(ctx, &HashSet::new())?;
     Ok(StartOptions {
@@ -2230,8 +2684,13 @@ fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<(u32, PathBuf)>> {
     let Some(t) = store.get_template(name)? else {
         return Ok(Vec::new());
     };
+    // A branch template keeps as many generations as its base.
+    let keep = match &t.base {
+        Some(base) => store.get_template(base)?.map_or(t.keep, |b| b.keep),
+        None => t.keep,
+    };
     let gens = store.list_generations(name)?;
-    let cut = gens.len().saturating_sub(t.keep as usize);
+    let cut = gens.len().saturating_sub(keep as usize);
     let mut dirs = Vec::new();
     for g in gens[..cut].iter().filter(|g| g.gen != t.current_gen) {
         store.delete_generation(name, g.gen)?;

@@ -197,10 +197,16 @@ async fn reaper(shared: Shared, mut shutdown: watch::Receiver<bool>) {
         match lifecycle::idle_pass(&shared.ctx, now()).await {
             Ok((slept, reaped)) => {
                 if !slept.is_empty() {
-                    log(&shared.ctx.home, &format!("idle clones slept: {}", slept.join(", ")));
+                    log(
+                        &shared.ctx.home,
+                        &format!("idle clones slept: {}", slept.join(", ")),
+                    );
                 }
                 if !reaped.is_empty() {
-                    log(&shared.ctx.home, &format!("idle clones destroyed: {}", reaped.join(", ")));
+                    log(
+                        &shared.ctx.home,
+                        &format!("idle clones destroyed: {}", reaped.join(", ")),
+                    );
                 }
             }
             Err(e) => log(&shared.ctx.home, &format!("idle pass failed: {e}")),

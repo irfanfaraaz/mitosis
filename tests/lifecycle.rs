@@ -26,6 +26,7 @@ fn args(template: &str) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -87,6 +88,7 @@ async fn parent_exit_reaps() {
             protect: false,
             env: None,
             wait_secs: None,
+            branch: None,
             ..args("main")
         },
     )
@@ -317,6 +319,7 @@ async fn reconcile_destroys_clone_of_dead_parent() {
             protect: false,
             env: None,
             wait_secs: None,
+            branch: None,
             ..args("main")
         },
     )

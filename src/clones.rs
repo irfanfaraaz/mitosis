@@ -100,6 +100,8 @@ pub fn to_info(ctx: &Ctx, row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         },
         direct_url: direct,
         status: status_str(row.status).to_string(),
+        branch: row.template.split_once('~').map(|(_, b)| b.to_string()),
+        rebuilt: false,
         port: row.port,
         socket_dir: row.socket_dir.clone(),
         template_age_secs,
@@ -326,6 +328,18 @@ pub fn suspect_warning(row: &CloneRow) -> String {
 
 pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneInfo> {
     let started = Instant::now();
+    // `--branch`: clone the base's branch template, made or rebuilt first when needed.
+    let branch = match args.branch.take() {
+        Some(b) => {
+            if let Some(name) = &args.name {
+                validate_name("clone", name)?;
+            }
+            let used = crate::templates::ensure_branch(ctx, &args.template, &b).await?;
+            args.template = used.name.clone();
+            Some(used)
+        }
+        None => None,
+    };
     // The `.env` records a `--fresh` took from the clone it destroyed.
     let mut taken = Vec::new();
     let mut info = match create_inner(ctx, &mut args, &mut taken).await {
@@ -385,6 +399,11 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
                 e.message
             ));
         }
+    }
+    if let Some(used) = branch {
+        info.rebuilt = used.rebuilt;
+        info.stale |= used.stale;
+        info.refreshing |= used.refreshing;
     }
     info.warnings.extend(crate::router::warning(ctx));
     info.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);

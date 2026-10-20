@@ -31,6 +31,7 @@ fn args(template: &str) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 

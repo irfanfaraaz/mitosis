@@ -5,7 +5,7 @@ use crate::envfile;
 use crate::error::{self, ErrorCode, MitosisError};
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
-use crate::protocol::{CloneCreateArgs, CloneInfo, Request, Response};
+use crate::protocol::{BranchArgs, CloneCreateArgs, CloneInfo, Request, Response};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
@@ -37,6 +37,10 @@ pub struct CloneCreateParams {
     /// Seconds to wait for room when the clone limits are full. 0 fails at once. Default: the
     /// daemon's setting.
     pub wait_secs: Option<u64>,
+    /// Clone a template built for this git branch, so the database has the branch's schema: the
+    /// template's migrate command runs in the git checkout the MCP server runs in. "" means the
+    /// branch checked out there; it must be the branch checked out. Default: the template itself.
+    pub branch: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -231,6 +235,15 @@ impl Mitosis {
             protect: false,
             env: None,
             wait_secs: p.wait_secs,
+            // `create_clone` resolves the branch and the repository root from our cwd.
+            branch: match p.branch {
+                Some(name) => Some(BranchArgs {
+                    name,
+                    repo_root: std::env::current_dir()?,
+                    path: None,
+                }),
+                None => None,
+            },
             // This process is the parent: when the MCP session ends, the daemon destroys the clone.
             parent_pid: Some(std::process::id() as i32),
         };
@@ -243,7 +256,7 @@ impl Mitosis {
             match client::request(&self.home, Request::TemplateList).await {
                 Ok(Response::Templates { templates }) => templates
                     .into_iter()
-                    .filter(|t| t.name == template)
+                    .filter(|t| t.name == info.template)
                     .flat_map(|t| t.warnings)
                     .collect(),
                 _ => Vec::new(),

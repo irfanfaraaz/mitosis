@@ -31,6 +31,7 @@ fn args() -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: Some(0),
+        branch: None,
     }
 }
 
@@ -100,8 +101,10 @@ async fn diff_row_counts() {
     let report = run_diff(&env, &c.id, None).await;
     assert!(report.schema.is_empty(), "{:?}", report.schema);
     let t = report.tables.iter().find(|t| t.table == "t").expect("t");
-    assert_eq!((t.before.n, t.before.estimate), (1, false));
-    assert_eq!((t.after.n, t.after.estimate), (4, false));
+    let before = t.before.as_ref().expect("before");
+    assert_eq!((before.n, before.estimate), (1, false));
+    let after = t.after.as_ref().expect("after");
+    assert_eq!((after.n, after.estimate), (4, false));
     assert!(report.rows.is_none());
 }
 
@@ -193,7 +196,112 @@ async fn diff_of_sleeping_clone_wakes_it() {
     let report = run_diff(&env, &c.id, None).await;
     assert_eq!(status(&env), CloneStatus::Ready);
     let t = report.tables.iter().find(|t| t.table == "t").expect("t");
-    assert_eq!((t.before.n, t.after.n), (0, 1));
+    assert_eq!(
+        (
+            t.before.as_ref().map(|c| c.n),
+            t.after.as_ref().map(|c| c.n)
+        ),
+        (Some(0), Some(1))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_odd_identifiers_and_composite_key() {
+    let Some(env) = TestEnv::new() else { return };
+    template(
+        &env,
+        "main",
+        r#"create table "My Table"(id int primary key, v text);
+           create schema app;
+           create table app."we""ird"(id int primary key, v text);
+           create table comp(a int, b int, v text, primary key(a, b));
+           insert into "My Table" values (1, 'a');
+           insert into app."we""ird" values (1, 'a'), (2, 'b');
+           insert into comp values (1, 1, 'x'), (1, 2, 'y')"#,
+    )
+    .await;
+    let c = clone_of(&env).await;
+    psql_url(
+        &env,
+        &c.url,
+        r#"insert into "My Table" values (2, 'b');
+           alter table "My Table" add column extra int;
+           update app."we""ird" set v = 'z' where id = 2;
+           create index "we""ird_idx" on app."we""ird"(v);
+           update comp set v = 'yy' where a = 1 and b = 2;
+           insert into comp values (2, 1, 'n');
+           create table fresh(id int primary key);
+           insert into fresh values (7)"#,
+    );
+
+    let report = run_diff(&env, &c.id, None).await;
+    let got: Vec<(&str, &str, &str)> = report
+        .schema
+        .iter()
+        .map(|s| (s.kind.as_str(), s.name.as_str(), s.change.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("table", "fresh", "added"),
+            ("column", "My Table.extra", "added"),
+            ("index", "app.we\"ird_idx", "added"),
+        ],
+        "{report:?}"
+    );
+    // A table on one side only has no count on the other.
+    let fresh = report.tables.iter().find(|t| t.table == "fresh").unwrap();
+    assert!(fresh.before.is_none() && fresh.after.is_some(), "{fresh:?}");
+
+    let rows = |t: &'static str| {
+        let env = &env;
+        let id = c.id.clone();
+        async move { run_diff(env, &id, Some(t)).await.rows.expect("rows") }
+    };
+    let my = rows("My Table").await;
+    assert_eq!(
+        (my.inserted_total, my.deleted_total, my.updated_total),
+        (1, 0, 1)
+    );
+    assert_eq!(my.updated[0].pk, json!(1));
+    assert_eq!(my.updated[0].columns, ["extra"]);
+
+    let weird = rows("app.we\"ird").await;
+    assert_eq!(
+        (
+            weird.inserted_total,
+            weird.deleted_total,
+            weird.updated_total
+        ),
+        (0, 0, 1)
+    );
+    assert_eq!(weird.updated[0].pk, json!(2));
+    assert_eq!(weird.updated[0].columns, ["v"]);
+
+    let comp = rows("comp").await;
+    assert_eq!(
+        (comp.inserted_total, comp.deleted_total, comp.updated_total),
+        (1, 0, 1)
+    );
+    assert_eq!(comp.updated[0].pk, json!([1, 2]));
+    assert_eq!(comp.updated[0].columns, ["v"]);
+    assert_eq!(comp.inserted[0]["a"], 2);
+
+    let fresh = rows("fresh").await;
+    assert_eq!((fresh.inserted_total, fresh.deleted_total), (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_limit_is_capped() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(id int primary key)").await;
+    let c = clone_of(&env).await;
+    let e = diff(&env.ctx, &c.id, Some("t"), 1001).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.hint.is_some());
+    diff(&env.ctx, &c.id, Some("t"), 1000)
+        .await
+        .expect("1000 is allowed");
 }
 
 fn base_leftovers(env: &TestEnv) -> Vec<String> {

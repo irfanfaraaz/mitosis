@@ -218,6 +218,7 @@ async fn stale_clone_is_served_and_refresh_starts() {
             protect: false,
             env: None,
             wait_secs: None,
+            branch: None,
         },
     )
     .await

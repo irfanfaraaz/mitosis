@@ -68,6 +68,21 @@ pub struct TemplateRow {
     /// Hex of the 32 random bytes that key masked values; made at the first masked build.
     /// Written only by `ensure_mask_salt`, never by `update_template_settings`.
     pub mask_salt: Option<String>,
+    /// A branch template (`<base>~<branch>`): its base template.
+    pub base: Option<String>,
+    /// A branch template: the git branch it was built for, as git names it.
+    pub branch: Option<String>,
+    /// A branch template: the base generation its current generation was layered on.
+    pub base_gen: Option<u32>,
+    /// A base template: the branch its recorded checkout follows; layered builds of the base skip
+    /// while that checkout is on another branch.
+    pub base_branch: Option<String>,
+    /// The migrate command's folder, relative to the root of the git work tree it is in.
+    pub repo_rel_cwd: Option<PathBuf>,
+    /// The migrations folder, relative to the root of the git work tree it is in.
+    pub repo_rel_migrations: Option<PathBuf>,
+    /// A branch template: when a clone last asked for it (gc drops long-unused ones).
+    pub last_used: Option<i64>,
 }
 
 impl TemplateRow {
@@ -98,6 +113,13 @@ impl TemplateRow {
             last_attempt_at: None,
             mask_path: None,
             mask_salt: None,
+            base: None,
+            branch: None,
+            base_gen: None,
+            base_branch: None,
+            repo_rel_cwd: None,
+            repo_rel_migrations: None,
+            last_used: None,
         }
     }
 }
@@ -180,7 +202,14 @@ CREATE TABLE IF NOT EXISTS templates (
     last_error TEXT,
     last_attempt_at INTEGER,
     mask_salt TEXT,
-    mask_path TEXT
+    mask_path TEXT,
+    base TEXT,
+    branch TEXT,
+    base_gen INTEGER,
+    base_branch TEXT,
+    repo_rel_cwd TEXT,
+    repo_rel_migrations TEXT,
+    last_used INTEGER
 );
 CREATE TABLE IF NOT EXISTS generations (
     template TEXT NOT NULL,
@@ -282,9 +311,16 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("templates", "mask_salt", "TEXT"),
     ("templates", "mask_path", "TEXT"),
     ("generations", "mask_hash", "TEXT"),
+    ("templates", "base", "TEXT"),
+    ("templates", "branch", "TEXT"),
+    ("templates", "base_gen", "INTEGER"),
+    ("templates", "base_branch", "TEXT"),
+    ("templates", "repo_rel_cwd", "TEXT"),
+    ("templates", "repo_rel_migrations", "TEXT"),
+    ("templates", "last_used", "INTEGER"),
 ];
 
-const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at, mask_salt, mask_path";
+const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at, mask_salt, mask_path, base, branch, base_gen, base_branch, repo_rel_cwd, repo_rel_migrations, last_used";
 const GEN_COLS: &str = "template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes, from_clone, from_gen, mask_hash";
 const CLONE_COLS: &str = "id, name, template, dir, port, socket_dir, password, database, pg_pid, pg_start_time, parent_pid, parent_start_time, created_at, expires_at, durable, status, generation, protected, suspect";
 
@@ -337,6 +373,13 @@ fn template_from_row(r: &Row) -> rusqlite::Result<TemplateRow> {
         last_attempt_at: r.get(15)?,
         mask_salt: r.get(16)?,
         mask_path: r.get::<_, Option<String>>(17)?.map(PathBuf::from),
+        base: r.get(18)?,
+        branch: r.get(19)?,
+        base_gen: r.get::<_, Option<i64>>(20)?.map(|v| v as u32),
+        base_branch: r.get(21)?,
+        repo_rel_cwd: r.get::<_, Option<String>>(22)?.map(PathBuf::from),
+        repo_rel_migrations: r.get::<_, Option<String>>(23)?.map(PathBuf::from),
+        last_used: r.get(24)?,
     })
 }
 
@@ -437,6 +480,13 @@ macro_rules! template_params {
             $t.last_attempt_at,
             $t.mask_salt,
             $t.mask_path.as_deref().map(p),
+            $t.base,
+            $t.branch,
+            $t.base_gen.map(|v| v as i64),
+            $t.base_branch,
+            $t.repo_rel_cwd.as_deref().map(p),
+            $t.repo_rel_migrations.as_deref().map(p),
+            $t.last_used,
         ]
     };
 }
@@ -514,7 +564,7 @@ impl Store {
     /// Fails when the name is taken.
     pub fn insert_template(&self, t: &TemplateRow) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO templates ({TEMPLATE_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"),
+            &format!("INSERT INTO templates ({TEMPLATE_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)"),
             template_params!(t),
         )?;
         Ok(())
@@ -525,7 +575,9 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE templates SET database=?2, source=?3, migrations=?4, max_age_secs=?5, keep=?8, \
              every_secs=?9, every_mode=?10, migrate=?11, auto_migrate=?12, on_stale=?13, paused=?14, \
-             last_error=?15, last_attempt_at=?16, mask_path=?18 WHERE name=?1",
+             last_error=?15, last_attempt_at=?16, mask_path=?18, base=?19, branch=?20, \
+             base_gen=?21, base_branch=?22, repo_rel_cwd=?23, repo_rel_migrations=?24, \
+             last_used=?25 WHERE name=?1",
             template_params!(t),
         )?;
         if n == 0 {

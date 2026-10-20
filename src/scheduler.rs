@@ -74,7 +74,9 @@ pub(crate) fn start(ctx: &Arc<Ctx>, name: &str, mode: RefreshMode) -> bool {
 }
 
 /// The builds due at `now`, at most one per template: an interval refresh in its mode, else an
-/// auto-migrate layered refresh. Templates with a build running are left out.
+/// auto-migrate layered refresh. Templates with a build running are left out, and so are branch
+/// templates, which are built only by `clone --branch`. A layered build of a base whose checkout
+/// is on another branch is skipped when it starts (`templates::background`).
 fn plan(ctx: &Ctx, now: i64) -> Result<Vec<(String, RefreshMode)>> {
     let rows = {
         let store = ctx.store();
@@ -92,7 +94,7 @@ fn plan(ctx: &Ctx, now: i64) -> Result<Vec<(String, RefreshMode)>> {
     };
     let mut out = Vec::new();
     for (t, newest) in rows {
-        if templates::is_building(ctx, &t.name) {
+        if t.base.is_some() || templates::is_building(ctx, &t.name) {
             continue;
         }
         if let Some(mode) = due(&t, newest.built_at, now) {

@@ -37,6 +37,7 @@ fn args(name: Option<&str>) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: Some(0),
+        branch: None,
     }
 }
 

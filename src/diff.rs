@@ -17,6 +17,8 @@ use std::time::Duration;
 
 /// Rows shown per kind when `--limit` is not given.
 pub const DEFAULT_LIMIT: u32 = 20;
+/// The most rows per kind `--limit` accepts.
+pub const MAX_LIMIT: u32 = 1000;
 /// `--table` refuses tables above this many rows (by the planner's estimate).
 const MAX_TABLE_ROWS: i64 = 1_000_000;
 /// The socket file name only; the base server listens on no port.
@@ -60,38 +62,68 @@ pub fn check_session(ctx: &Ctx, id_or_name: &str, parent_pid: i32) -> Result<()>
 }
 
 /// The private base server and the folders around it. `close` (or, on a cancelled request, drop)
-/// stops the server and removes everything it made.
+/// stops the server and removes everything it made; a failure is written to `daemon.log` with the
+/// leaked folder, and `Drop` tries once more.
 struct BaseServer {
     install: PgInstall,
     dir: PathBuf,
     socket_dir: PathBuf,
     log: PathBuf,
+    daemon_log: PathBuf,
     pg: Option<RunningPg>,
     timeout: Duration,
     done: bool,
 }
 
 impl BaseServer {
+    /// Stops the server first; the folder is removed only once nothing runs in it.
     fn cleanup(&mut self) -> Result<()> {
-        self.done = true;
         if self.dir.exists() {
             stop(&self.install, &self.dir, self.pg, self.timeout)?;
             std::fs::remove_dir_all(&self.dir)?;
         }
         let _ = std::fs::remove_dir_all(&self.socket_dir);
         let _ = std::fs::remove_file(&self.log);
+        self.done = true;
         Ok(())
     }
 
-    async fn close(mut self) -> Result<()> {
-        blocking(move || self.cleanup()).await
+    fn cleanup_logged(&mut self) {
+        if let Err(e) = self.cleanup() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.daemon_log)
+            {
+                let _ = writeln!(
+                    f,
+                    "[{}] diff: could not clean up the private server in {}: {}",
+                    crate::templates::now(),
+                    self.dir.display(),
+                    e.message
+                );
+            }
+        }
+    }
+
+    /// Cleans up off the runtime. Never fails: the diff's own result stands.
+    async fn close(mut self) {
+        let _ = tokio::task::spawn_blocking(move || {
+            self.cleanup_logged();
+            self // dropping it here retries a cleanup that failed
+        })
+        .await;
     }
 }
 
+// shortcut: a drop on a runtime thread blocks on pg_ctl; it only runs for a cancelled request
+// or a failed cleanup. If `start` was still running then, `pg` is unknown and the postmaster can
+// outlive the folder removal.
 impl Drop for BaseServer {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.cleanup();
+            self.cleanup_logged();
         }
     }
 }
@@ -118,6 +150,10 @@ pub async fn diff(
     table: Option<&str>,
     limit: u32,
 ) -> Result<DiffReport> {
+    if limit > MAX_LIMIT {
+        return Err(invalid(format!("limit {limit} is above {MAX_LIMIT}"))
+            .with_hint(format!("ask for at most {MAX_LIMIT} rows per kind")));
+    }
     let row = clones::ensure_running(ctx, id_or_name).await?;
     let label = row.name.clone().unwrap_or_else(|| row.id.clone());
     let pruned = || {
@@ -144,6 +180,7 @@ pub async fn diff(
         // Short: Unix socket paths are limited to about 100 bytes.
         socket_dir: ctx.home.sockets_dir().join(format!("d{tag}")),
         log: ctx.home.logs_dir().join(format!("diff-{tag}.log")),
+        daemon_log: ctx.home.logs_dir().join("daemon.log"),
         pg: None,
         timeout: ctx.config().stop_timeout,
         done: false,
@@ -180,9 +217,8 @@ pub async fn diff(
         compare(&before, &after, table, limit).await
     }
     .await;
-    let closed = base.close().await;
+    base.close().await;
     let (schema, tables, rows) = run?;
-    closed?;
     Ok(DiffReport {
         clone: label,
         template: row.template,
@@ -419,16 +455,12 @@ async fn table_counts(
 ) -> Result<Vec<TableCount>> {
     let (b, a) = tokio::try_join!(counts(before, bt), counts(after, at))?;
     let names: std::collections::BTreeSet<&String> = b.keys().chain(a.keys()).collect();
-    let none = Count {
-        n: 0,
-        estimate: false,
-    };
     Ok(names
         .into_iter()
         .map(|t| TableCount {
             table: t.clone(),
-            before: b.get(t).cloned().unwrap_or_else(|| none.clone()),
-            after: a.get(t).cloned().unwrap_or_else(|| none.clone()),
+            before: b.get(t).cloned(),
+            after: a.get(t).cloned(),
         })
         .collect())
 }
@@ -467,31 +499,184 @@ fn pk_list(pk: &[String]) -> String {
     pk.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ")
 }
 
-/// `(pk json text, md5 of the row)` in key order.
-async fn row_hashes(side: &Side, q: &str, pk: &[String]) -> Result<Vec<(String, String)>> {
-    let sql = format!(
+/// Sorted by the key's text in byte order, so the merge below can compare keys as plain strings.
+fn hash_sql(q: &str, pk: &[String]) -> String {
+    format!(
         "SELECT md5(row_to_json(mitosis_row)::text) || ' ' || jsonb_build_array({cols})::text \
-         FROM {q} AS mitosis_row ORDER BY {cols};",
+         FROM {q} AS mitosis_row ORDER BY jsonb_build_array({cols})::text COLLATE \"C\";",
         cols = pk_list(pk)
-    );
-    let out = side.query(sql).await?;
-    Ok(out
-        .lines()
-        .filter_map(|l| l.split_once(' '))
-        .map(|(h, k)| (k.to_string(), h.to_string()))
-        .collect())
+    )
+}
+
+/// The lines of one psql query, read as they arrive: `(md5 of the row, key text)`.
+struct RowStream {
+    child: std::process::Child,
+    lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+    writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl RowStream {
+    fn open(side: &Side, sql: String) -> Result<RowStream> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(side.install.bin("psql"))
+            .arg("-h")
+            .arg(&side.socket_dir)
+            .args([
+                "-p",
+                &side.port.to_string(),
+                "-U",
+                "postgres",
+                "-d",
+                &side.db,
+            ])
+            .args(["-v", "ON_ERROR_STOP=1", "-X", "-A", "-t", "-q", "-f", "-"])
+            .env("PGCONNECT_TIMEOUT", "5")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("psql stdin is piped");
+        let stdout = child.stdout.take().expect("psql stdout is piped");
+        let writer = std::thread::spawn(move || stdin.write_all(sql.as_bytes()));
+        Ok(RowStream {
+            child,
+            lines: std::io::BufRead::lines(std::io::BufReader::new(stdout)),
+            writer: Some(writer),
+        })
+    }
+
+    fn next_row(&mut self) -> Result<Option<(String, String)>> {
+        loop {
+            match self.lines.next() {
+                None => return Ok(None),
+                Some(Err(e)) => return Err(e.into()),
+                Some(Ok(l)) => {
+                    if let Some((h, k)) = l.split_once(' ') {
+                        return Ok(Some((h.to_string(), k.to_string())));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits for psql after its output is read to the end; a failed query is an error.
+    fn finish(&mut self) -> Result<()> {
+        use std::io::Read;
+        let mut err = String::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        let status = self.child.wait()?;
+        let sent = self.writer.take().map(|w| {
+            w.join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("writer panicked")))
+        });
+        if !status.success() {
+            return Err(internal(format!("psql failed: {}", err.trim())));
+        }
+        if let Some(Err(e)) = sent {
+            return Err(internal(format!("could not send SQL to psql: {e}")));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RowStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Default)]
+struct Merged {
+    inserted: Vec<String>,
+    deleted: Vec<String>,
+    updated: Vec<String>,
+    inserted_total: u64,
+    deleted_total: u64,
+    updated_total: u64,
+}
+
+impl Merged {
+    fn push(list: &mut Vec<String>, total: &mut u64, key: String, limit: usize) {
+        *total += 1;
+        if list.len() < limit {
+            list.push(key);
+        }
+    }
+}
+
+/// Merges two key-ordered streams; memory is the `limit` keys kept per kind, not the table.
+fn merge(
+    mut before: Option<RowStream>,
+    mut after: Option<RowStream>,
+    limit: usize,
+) -> Result<Merged> {
+    let next = |s: &mut Option<RowStream>| -> Result<Option<(String, String)>> {
+        match s {
+            Some(s) => s.next_row(),
+            None => Ok(None),
+        }
+    };
+    let mut m = Merged::default();
+    let (mut b, mut a) = (next(&mut before)?, next(&mut after)?);
+    loop {
+        match (b.take(), a.take()) {
+            (None, None) => break,
+            (Some((_, k)), None) => {
+                Merged::push(&mut m.deleted, &mut m.deleted_total, k, limit);
+                b = next(&mut before)?;
+            }
+            (None, Some((_, k))) => {
+                Merged::push(&mut m.inserted, &mut m.inserted_total, k, limit);
+                a = next(&mut after)?;
+            }
+            (Some(bv), Some(av)) => match bv.1.cmp(&av.1) {
+                std::cmp::Ordering::Less => {
+                    Merged::push(&mut m.deleted, &mut m.deleted_total, bv.1, limit);
+                    b = next(&mut before)?;
+                    a = Some(av);
+                }
+                std::cmp::Ordering::Greater => {
+                    Merged::push(&mut m.inserted, &mut m.inserted_total, av.1, limit);
+                    a = next(&mut after)?;
+                    b = Some(bv);
+                }
+                std::cmp::Ordering::Equal => {
+                    if bv.0 != av.0 {
+                        Merged::push(&mut m.updated, &mut m.updated_total, av.1, limit);
+                    }
+                    b = next(&mut before)?;
+                    a = next(&mut after)?;
+                }
+            },
+        }
+    }
+    for s in [&mut before, &mut after].into_iter().flatten() {
+        s.finish()?;
+    }
+    Ok(m)
 }
 
 fn canon(text: &str) -> Result<Value> {
     Ok(serde_json::from_str(text)?)
 }
 
-/// The rows with the given key texts, keyed by their canonical key.
+/// Whole rows as JSON.
+const ROW_JSON: &str = "to_jsonb(mitosis_row)";
+/// Per column, the md5 of its JSON text: compares values exactly, as the row hash does.
+const COLUMN_HASHES: &str =
+    "(SELECT jsonb_object_agg(k, md5(v::text)) FROM json_each(row_to_json(mitosis_row)) AS e(k, v))";
+
+/// `expr` of the rows with the given key texts, keyed by their canonical key.
 async fn fetch_rows(
     side: &Side,
     q: &str,
     pk: &[String],
     keys: &[&str],
+    expr: &str,
 ) -> Result<HashMap<String, Value>> {
     if keys.is_empty() {
         return Ok(HashMap::new());
@@ -499,7 +684,7 @@ async fn fetch_rows(
     let lits = keys.iter().map(|k| ql(k)).collect::<Vec<_>>().join(", ");
     let cols = pk_list(pk);
     let sql = format!(
-        "SELECT jsonb_build_array(jsonb_build_array({cols}), to_jsonb(mitosis_row))::text \
+        "SELECT jsonb_build_array(jsonb_build_array({cols}), {expr})::text \
          FROM {q} AS mitosis_row WHERE jsonb_build_array({cols}) = ANY (ARRAY[{lits}]::jsonb[]);"
     );
     let out = side.query(sql).await?;
@@ -575,50 +760,31 @@ async fn row_diff(before: &Side, after: &Side, table: &str, limit: usize) -> Res
         .with_hint("diff a smaller table, or compare the row counts"));
     }
 
-    let (bh, ah) = tokio::try_join!(
-        async {
-            if bi.is_some() {
-                row_hashes(before, &q, &pk).await
-            } else {
-                Ok(Vec::new())
-            }
-        },
-        async {
-            if ai.is_some() {
-                row_hashes(after, &q, &pk).await
-            } else {
-                Ok(Vec::new())
-            }
-        }
-    )?;
-    // shortcut: both sides are held in memory; the 1,000,000-row cap keeps that small.
-    let bmap: HashMap<&str, &str> = bh.iter().map(|(k, h)| (k.as_str(), h.as_str())).collect();
-    let amap: HashMap<&str, &str> = ah.iter().map(|(k, h)| (k.as_str(), h.as_str())).collect();
-    let deleted: Vec<&str> = bh
-        .iter()
-        .map(|(k, _)| k.as_str())
-        .filter(|k| !amap.contains_key(k))
-        .collect();
-    let inserted: Vec<&str> = ah
-        .iter()
-        .map(|(k, _)| k.as_str())
-        .filter(|k| !bmap.contains_key(k))
-        .collect();
-    let updated: Vec<&str> = ah
-        .iter()
-        .filter(|(k, h)| bmap.get(k.as_str()).is_some_and(|bh| *bh != h.as_str()))
-        .map(|(k, _)| k.as_str())
-        .collect();
+    let (bsql, asql) = (hash_sql(&q, &pk), hash_sql(&q, &pk));
+    let (bs, as_) = (
+        bi.is_some().then(|| (before.clone(), bsql)),
+        ai.is_some().then(|| (after.clone(), asql)),
+    );
+    let m = blocking(move || {
+        let open = |s: Option<(Side, String)>| {
+            s.map(|(side, sql)| RowStream::open(&side, sql)).transpose()
+        };
+        merge(open(bs)?, open(as_)?, limit)
+    })
+    .await?;
 
     let (del, ins, upd) = (
-        &deleted[..deleted.len().min(limit)],
-        &inserted[..inserted.len().min(limit)],
-        &updated[..updated.len().min(limit)],
+        m.deleted.iter().map(String::as_str).collect::<Vec<_>>(),
+        m.inserted.iter().map(String::as_str).collect::<Vec<_>>(),
+        m.updated.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    let (bkeys, akeys) = ([del, upd].concat(), [ins, upd].concat());
+    let (bcols, acols) = tokio::try_join!(
+        fetch_rows(before, &q, &pk, &upd, COLUMN_HASHES),
+        fetch_rows(after, &q, &pk, &upd, COLUMN_HASHES)
+    )?;
     let (brows, arows) = tokio::try_join!(
-        fetch_rows(before, &q, &pk, &bkeys),
-        fetch_rows(after, &q, &pk, &akeys)
+        fetch_rows(before, &q, &pk, &del, ROW_JSON),
+        fetch_rows(after, &q, &pk, &ins, ROW_JSON)
     )?;
     let by_key = |m: &HashMap<String, Value>, k: &str| -> Result<Value> {
         Ok(m.get(&canon(k)?.to_string())
@@ -630,20 +796,20 @@ async fn row_diff(before: &Side, after: &Side, table: &str, limit: usize) -> Res
         inserted: Vec::new(),
         deleted: Vec::new(),
         updated: Vec::new(),
-        inserted_total: inserted.len() as u64,
-        deleted_total: deleted.len() as u64,
-        updated_total: updated.len() as u64,
+        inserted_total: m.inserted_total,
+        deleted_total: m.deleted_total,
+        updated_total: m.updated_total,
     };
-    for k in ins {
+    for k in &ins {
         out.inserted.push(by_key(&arows, k)?);
     }
-    for k in del {
+    for k in &del {
         out.deleted.push(by_key(&brows, k)?);
     }
-    for k in upd {
+    for k in &upd {
         out.updated.push(RowChange {
             pk: pk_value(k)?,
-            columns: changed_columns(&by_key(&brows, k)?, &by_key(&arows, k)?),
+            columns: changed_columns(&by_key(&bcols, k)?, &by_key(&acols, k)?),
         });
     }
     Ok(out)
@@ -651,8 +817,11 @@ async fn row_diff(before: &Side, after: &Side, table: &str, limit: usize) -> Res
 
 // ---- human output -------------------------------------------------------------------------
 
-fn count_text(c: &Count) -> String {
-    format!("{}{}", if c.estimate { "~" } else { "" }, c.n)
+fn count_text(c: &Option<Count>) -> String {
+    match c {
+        Some(c) => format!("{}{}", if c.estimate { "~" } else { "" }, c.n),
+        None => "(none)".into(),
+    }
 }
 
 /// The report as text: Schema, Row counts and (with `--table`) Rows.
@@ -691,7 +860,11 @@ pub fn render(r: &DiffReport) -> String {
     let shown: Vec<&TableCount> = r
         .tables
         .iter()
-        .filter(|t| t.before != t.after || t.before.estimate || t.after.estimate)
+        .filter(|t| {
+            t.before != t.after
+                || t.before.as_ref().is_some_and(|c| c.estimate)
+                || t.after.as_ref().is_some_and(|c| c.estimate)
+        })
         .collect();
     if shown.is_empty() {
         o.push_str("  no changes\n");

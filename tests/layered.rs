@@ -106,6 +106,7 @@ fn clone_args() -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 

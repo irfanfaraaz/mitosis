@@ -104,6 +104,9 @@ pub struct TemplateSettings {
     pub mask: Option<PathBuf>,
     #[serde(default)]
     pub mask_off: bool,
+    /// The git branch the base template's recorded checkout follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -151,6 +154,21 @@ pub struct CloneCreateArgs {
     /// How long to wait for room under the limits; `None` uses the daemon's `queue_wait`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
+    /// Clone the template built for this git branch (`<template>~<branch>`) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<BranchArgs>,
+}
+
+/// The caller's git checkout for `clone --branch`; the client fills it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BranchArgs {
+    /// The branch name as git shows it.
+    pub name: String,
+    /// The root of the caller's git work tree (`git rev-parse --show-toplevel`).
+    pub repo_root: PathBuf,
+    /// The caller's `PATH`, for the migrate command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// One variable in one `.env` file that holds a clone's URL.
@@ -331,6 +349,15 @@ pub struct TemplateInfo {
     /// The masking file, when the template has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<PathBuf>,
+    /// A branch template: its base template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// A branch template: its git branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// A base template: the branch its recorded checkout follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -383,6 +410,12 @@ pub struct CloneInfo {
     /// `ready`, `sleeping`, `starting` or `stopping`.
     #[serde(default)]
     pub status: String,
+    /// Made from a branch template: its git branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The branch template was rebuilt before this clone was made.
+    #[serde(default)]
+    pub rebuilt: bool,
 }
 
 /// What a clone changed against the template generation it was made from.
@@ -415,8 +448,11 @@ pub struct SchemaChange {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TableCount {
     pub table: String,
-    pub before: Count,
-    pub after: Count,
+    /// None: the table is not there on that side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<Count>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Count>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -571,6 +607,7 @@ mod tests {
                 protect: false,
                 env: None,
                 wait_secs: None,
+                branch: None,
             }),
         };
         let line = serde_json::to_string(&env).unwrap();
@@ -627,6 +664,9 @@ mod tests {
             on_stale: OnStale::Refresh,
             keep: 3,
             mask: None,
+            base: None,
+            branch: None,
+            base_branch: None,
         }
     }
 
@@ -657,6 +697,8 @@ mod tests {
             suspect: false,
             direct_url: "postgres://localhost:5500/app".into(),
             status: "ready".into(),
+            branch: None,
+            rebuilt: false,
         }
     }
 

@@ -10,8 +10,8 @@ use crate::mcp;
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
 use crate::protocol::{
-    CloneCreateArgs, CloneInfo, EventFilter, EventRow, MigrateCmd, Request, Response, TemplateInfo,
-    TemplateInitArgs, TemplateSetArgs, TemplateSettings, TemplateSource,
+    BranchArgs, CloneCreateArgs, CloneInfo, EventFilter, EventRow, MigrateCmd, Request, Response,
+    TemplateInfo, TemplateInitArgs, TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::service;
 use crate::templates::now;
@@ -64,6 +64,10 @@ enum Cmd {
         /// How long to wait for room under the limits, like 30s or 2m; 0 fails at once.
         #[arg(long)]
         wait: Option<String>,
+        /// Clone the template built for a git branch (default: the branch checked out here),
+        /// layered on --template by running its migrate command in this checkout.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        branch: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -289,6 +293,9 @@ struct SettingsFlags {
     /// Masking file (TOML: columns to mask, row subsets) applied to every build, or off.
     #[arg(long)]
     mask: Option<std::path::PathBuf>,
+    /// The git branch the template's checkout follows; layered builds skip on other branches.
+    #[arg(long)]
+    base_branch: Option<String>,
 }
 
 /// A protocol enum from its snake_case name (clap already limited the choices).
@@ -351,6 +358,7 @@ impl SettingsFlags {
             on_stale: enum_arg(self.on_stale)?,
             mask,
             mask_off,
+            base_branch: self.base_branch,
         };
         Ok((max_age_secs, settings))
     }
@@ -505,6 +513,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             env_file,
             env_var,
             wait,
+            branch,
             json,
         } => {
             validate_name("template", &template)?;
@@ -529,6 +538,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 parent_pid: None,
                 env: None,
                 wait_secs,
+                // `create_clone` resolves the branch and the repository root from this folder.
+                branch: match branch {
+                    Some(name) => Some(BranchArgs {
+                        name,
+                        repo_root: std::env::current_dir()?,
+                        path: None,
+                    }),
+                    None => None,
+                },
             };
             let info = envfile::create_clone(&home, args, env_file, env_var).await?;
             for w in &info.warnings {
@@ -537,13 +555,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if info.existing {
                 eprintln!("note: clone {} was already running", info.id);
             }
+            if info.rebuilt {
+                eprintln!(
+                    "note: template {} was rebuilt for this branch",
+                    info.template
+                );
+            }
             // Warnings are best effort: the clone already exists.
             if let Ok(Response::Templates { templates }) =
                 client::request(&home, Request::TemplateList).await
             {
                 for w in templates
                     .iter()
-                    .filter(|t| t.name == template)
+                    .filter(|t| t.name == info.template)
                     .flat_map(|t| &t.warnings)
                 {
                     eprintln!("warning: {w}");
@@ -962,15 +986,31 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
             if json {
                 print_json(&templates)?;
             } else {
+                // Branch templates right under their base, indented; any whose base is gone last.
+                let is_base = |t: &&TemplateInfo, b: &str| t.base.as_deref() == Some(b);
+                let mut ordered: Vec<&TemplateInfo> = Vec::new();
+                for t in templates.iter().filter(|t| t.base.is_none()) {
+                    ordered.push(t);
+                    ordered.extend(templates.iter().filter(|b| is_base(b, &t.name)));
+                }
+                ordered.extend(templates.iter().filter(|t| {
+                    t.base
+                        .as_deref()
+                        .is_some_and(|b| !templates.iter().any(|x| x.name == b))
+                }));
                 print_table(
                     &[
                         "NAME", "GEN", "PAUSED", "PG", "DATABASE", "SIZE", "AGE", "SOURCE",
                     ],
-                    templates
-                        .iter()
+                    ordered
+                        .into_iter()
                         .map(|t| {
                             vec![
-                                t.name.clone(),
+                                if t.base.is_some() {
+                                    format!("  {}", t.name)
+                                } else {
+                                    t.name.clone()
+                                },
                                 format!("{}/{}", t.current_gen, t.generations),
                                 if t.paused { "paused" } else { "-" }.to_string(),
                                 t.pg_major.to_string(),
@@ -985,7 +1025,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
             }
         }
         TemplateCmd::History { name, json } => {
-            validate_name("template", &name)?;
+            crate::templates::validate_template_ref(&name)?;
             let (template, generations, paused) =
                 match client::request(home, Request::TemplateHistory { name }).await? {
                     Response::Generations {

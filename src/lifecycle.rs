@@ -9,7 +9,9 @@ use crate::pg::{control_state, psql, running_server, stop, ControlState, Running
 use crate::proc_util::{has_exited, is_alive, process_start_time};
 use crate::protocol::{GcFailure, GcReport};
 use crate::state::{CloneRow, CloneStatus};
-use crate::templates::{is_build_socket_name, now, parse_gen_dir, parse_leftover, Leftover};
+use crate::templates::{
+    folder_stem, is_build_socket_name, now, parse_gen_dir, parse_leftover, Leftover,
+};
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use std::collections::HashSet;
@@ -26,6 +28,8 @@ const STARTING_WAIT: Duration = Duration::from_secs(60);
 const DESTROY_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often a parent watcher wakes to check that its clone still exists.
 const WATCH_RECHECK: Duration = Duration::from_secs(30);
+/// gc drops a branch template no clone uses after this long without a `clone --branch` for it.
+const BRANCH_UNUSED_SECS: i64 = 14 * 86_400;
 
 fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)
@@ -400,6 +404,8 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
             failed(&mut report, id, &e);
         }
     }
+    // Before the orphan pass, which then removes the dropped templates' generation folders.
+    drop_branch_templates(&ctx, now, &mut report).await;
     remove_orphans(&ctx, &mut report).await;
     drop_unused_reservations(&ctx, now);
     events::emit(
@@ -416,6 +422,83 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
         }),
     );
     Ok(report)
+}
+
+/// True when git says `branch` does not exist in the repository of `dir` (`rev-parse --verify`
+/// exits 1); false when it exists or git cannot tell. Blocking.
+fn branch_deleted(dir: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.code() == Some(1))
+}
+
+/// Drops the rows of branch templates no clone uses whose branch is gone from the base's
+/// repository or that were not used for `BRANCH_UNUSED_SECS`; logs, never fails.
+async fn drop_branch_templates(ctx: &Ctx, now: i64, report: &mut GcReport) {
+    let rows = match ctx.store().list_templates() {
+        Ok(ts) => ts.into_iter().filter(|t| t.base.is_some()),
+        Err(e) => return log(ctx, &format!("gc: list templates: {e}")),
+    };
+    for t in rows {
+        let (Some(base), Some(branch)) = (t.base.clone(), t.branch.clone()) else {
+            continue;
+        };
+        let unused = t
+            .last_used
+            .is_none_or(|u| now.saturating_sub(u) >= BRANCH_UNUSED_SECS);
+        let repo = ctx
+            .store()
+            .get_template(&base)
+            .ok()
+            .flatten()
+            .and_then(|b| b.migrate)
+            .map(|m| m.cwd);
+        let gone = match repo.filter(|_| !unused) {
+            Some(dir) => tokio::task::spawn_blocking(move || branch_deleted(&dir, &branch))
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if !unused && !gone {
+            continue;
+        }
+        // Under the write guard: no clone creation is between reading the template and cloning it.
+        let _swap = ctx.template_swap.write().await;
+        if ctx
+            .building
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&t.name)
+        {
+            continue;
+        }
+        let res = {
+            let store = ctx.store();
+            match store.list_clones() {
+                Ok(cs) if cs.iter().any(|c| c.template == t.name) => continue,
+                Ok(_) => store.delete_template(&t.name),
+                Err(e) => Err(e),
+            }
+        };
+        match res {
+            Ok(()) => {
+                let why = if gone { "branch deleted" } else { "unused" };
+                log(ctx, &format!("gc: dropped template {} ({why})", t.name));
+                report.records_dropped.push(format!("template {}", t.name));
+            }
+            Err(e) => {
+                log(ctx, &format!("gc: drop template {}: {e}", t.name));
+                failed(report, t.name.clone(), &e);
+            }
+        }
+    }
 }
 
 /// Drops name reservations unused for 30 days whose name has no clone; logs, never fails. Run by
@@ -826,11 +909,13 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
         let tpl = match &l {
             Leftover::Building(tpl) | Leftover::Old(tpl, _) => tpl,
         };
+        // `tpl` is a folder stem: a branch template's build is known by its full name.
         let remove = !ctx
             .building
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(tpl);
+            .iter()
+            .any(|b| folder_stem(b) == *tpl);
         if remove {
             let res = remove_data_dir(ctx, path.clone()).await;
             done(report, path, res);

@@ -8,7 +8,9 @@ use crate::client;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::random_hex;
 use crate::paths::Home;
-use crate::protocol::{CloneCreateArgs, CloneInfo, EnvTarget, PendingRestore, Request, Response};
+use crate::protocol::{
+    BranchArgs, CloneCreateArgs, CloneInfo, EnvTarget, PendingRestore, Request, Response,
+};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -259,9 +261,67 @@ fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
     })
 }
 
+/// Completes a `clone --branch` request. The caller sets `name` to the branch it asked for (empty:
+/// the branch checked out) and `repo_root` to its working folder; this resolves both with git and
+/// adds the caller's `PATH`.
+async fn fill_branch(b: &mut BranchArgs) -> Result<()> {
+    let cwd = b.repo_root.clone();
+    let git = move |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let (root, current) = tokio::task::spawn_blocking(move || {
+        (
+            git(&["rev-parse", "--show-toplevel"]),
+            git(&["branch", "--show-current"]),
+        )
+    })
+    .await
+    .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("git: {e}")))?;
+    let root = root.filter(|r| !r.is_empty()).ok_or_else(|| {
+        invalid(format!(
+            "{} is not in a git work tree",
+            b.repo_root.display()
+        ))
+        .with_hint("run mitosis clone --branch inside your git checkout")
+    })?;
+    let current = current.unwrap_or_default();
+    if b.name.is_empty() {
+        if current.is_empty() {
+            return Err(invalid("the checkout is not on a branch (detached HEAD)")
+                .with_hint("name the branch: mitosis clone --branch <branch>"));
+        }
+        b.name = current;
+    } else if !current.is_empty() && current != b.name {
+        // The build runs this checkout's migrations, which belong to the branch checked out.
+        return Err(invalid(format!(
+            "the checkout in {root} is on branch {current}, not {}",
+            b.name
+        ))
+        .with_hint(format!(
+            "git switch {}, or run it in a worktree of that branch",
+            b.name
+        )));
+    }
+    b.repo_root = PathBuf::from(root);
+    if b.path.is_none() {
+        b.path = std::env::var("PATH").ok();
+    }
+    Ok(())
+}
+
 /// Creates a clone through the daemon and, with `env_file`, writes its URL into that file
 /// (`env_var`, default `DATABASE_URL`). A file that cannot be written is a warning on the returned
-/// info: the clone exists and its URL is in the result.
+/// info: the clone exists and its URL is in the result. With `args.branch` (see `fill_branch`),
+/// the clone comes from the template built for that git branch.
 pub async fn create_clone(
     home: &Home,
     mut args: CloneCreateArgs,
@@ -273,6 +333,9 @@ pub async fn create_clone(
     }
     // Before `env_target` reads `previous`: a restore left by a dead clone must put the user's
     // value back first, or the dead clone's URL is recorded as `previous` and the value is lost.
+    if let Some(b) = &mut args.branch {
+        fill_branch(b).await?;
+    }
     let mut pending = finish_pending(home).await;
     args.env = match env_file {
         Some(f) => Some(env_target(f, env_var)?),
