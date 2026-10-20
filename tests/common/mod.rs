@@ -31,8 +31,13 @@ impl TestEnv {
             return None;
         }
         let tmp = tmp_home();
-        // One of 250 random 20-port slices of 55000-59999, so parallel test binaries rarely meet.
-        let slice = u16::from_str_radix(&random_hex(2), 16).unwrap() % 250;
+        // One of 250 20-port slices of 55000-59999: a random start per binary, then the next slice
+        // per test, so parallel tests in one binary never share a slice.
+        static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU16> = std::sync::OnceLock::new();
+        let next = NEXT.get_or_init(|| {
+            std::sync::atomic::AtomicU16::new(u16::from_str_radix(&random_hex(2), 16).unwrap())
+        });
+        let slice = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 250;
         let lo = 55_000 + slice * 20;
         let config = Config {
             port_range: lo..=lo + 19,

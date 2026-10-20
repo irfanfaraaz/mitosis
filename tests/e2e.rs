@@ -10,9 +10,18 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const SEED: &str = "create table t(id int); insert into t values (1)";
+
+/// Each test runs a real daemon on the default port range, so they run one at a time: parallel
+/// daemons race for the same lowest free port.
+fn serial_home() -> (MutexGuard<'static, ()>, tempfile::TempDir) {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    (guard, tmp_home())
+}
 
 fn mitosis(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_mitosis"))
@@ -65,7 +74,7 @@ fn cli_autostarts_daemon_and_clones() {
         println!("skipping: no Postgres installed");
         return;
     }
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
 
@@ -108,7 +117,7 @@ fn cli_autostarts_daemon_and_clones() {
 
 #[test]
 fn cli_error_has_hint() {
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let o = mitosis(home, &["clone", "--template", "nope"]);
@@ -121,7 +130,7 @@ fn cli_error_has_hint() {
 
 #[test]
 fn cli_bad_ttl() {
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let o = mitosis(home, &["clone", "--ttl", "0m"]);
     assert_eq!(o.status.code(), Some(1));
@@ -179,7 +188,7 @@ fn result_text(r: &CallToolResult) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_lists_three_tools() {
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let client = mcp_client(home).await;
@@ -192,7 +201,7 @@ async fn mcp_lists_three_tools() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_error_has_hint() {
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let client = mcp_client(home).await;
@@ -209,7 +218,7 @@ async fn mcp_tools_roundtrip() {
         println!("skipping: no Postgres installed");
         return;
     }
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
 
@@ -292,7 +301,7 @@ async fn mcp_named_clone_with_env_file() {
         println!("skipping: no Postgres installed");
         return;
     }
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let TemplateSource::Seed { command, .. } = seed(SEED) else {
@@ -327,7 +336,7 @@ async fn mcp_clone_destroy_tool() {
         println!("skipping: no Postgres installed");
         return;
     }
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let TemplateSource::Seed { command, .. } = seed(SEED) else {
@@ -371,7 +380,7 @@ fn fake_v1_daemon(home: &Path) -> std::thread::JoinHandle<()> {
 
 #[test]
 fn older_daemon_is_replaced() {
-    let tmp = tmp_home();
+    let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let fake = fake_v1_daemon(home);
