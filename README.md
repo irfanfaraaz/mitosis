@@ -13,7 +13,11 @@
 
 Let the agent drop tables, run a bad migration or fill the database with junk. It does it on its own clone. Your real database stays untouched, and the clone is deleted when the agent's session ends.
 
-<a href="assets/demo.mp4"><img alt="Watch the 45-second demo: an agent drops the users table on its own clone, and the template keeps all its rows" src="assets/demo-poster.jpg" width="100%"></a>
+
+
+https://github.com/user-attachments/assets/84d547ac-a16f-4ea9-80c1-a923c2d5c827
+
+
 
 | Clone time | Extra disk per clone | Template size |
 |---|---|---|
