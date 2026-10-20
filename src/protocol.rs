@@ -10,6 +10,10 @@ pub enum TemplateSource {
     Url {
         url: String,
     },
+    /// A physical copy of a running server made with `pg_basebackup`.
+    Basebackup {
+        url: String,
+    },
     Seed {
         command: String,
         /// Folder the command runs in; the daemon's own cwd when absent.

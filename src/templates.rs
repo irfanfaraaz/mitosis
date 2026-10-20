@@ -6,7 +6,9 @@ use crate::events;
 use crate::mask::{mask_statements, subset_statements, ColumnInfo, ForeignKey, MaskFile};
 use crate::names::{random_hex, validate_name};
 use crate::pg::{
-    initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
+    disable_preload_libraries, ensure_postgres_superuser, initdb, is_missing_library,
+    make_standalone, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg,
+    StartOptions,
 };
 use crate::ports::pick_port;
 use crate::protocol::{
@@ -59,7 +61,7 @@ where
 
 pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo> {
     validate_name("template", &args.name)?;
-    if let TemplateSource::Url { url } = &args.source {
+    if let TemplateSource::Url { url } | TemplateSource::Basebackup { url } = &args.source {
         if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
             return Err(invalid(
                 "source URL must start with postgres:// or postgresql://",
@@ -314,6 +316,9 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
         TemplateSource::Url { url } => TemplateSource::Url {
             url: redact_url(url),
         },
+        TemplateSource::Basebackup { url } => TemplateSource::Basebackup {
+            url: redact_url(url),
+        },
         TemplateSource::Seed { command, cwd, path } => TemplateSource::Seed {
             command: redact_url(command),
             cwd: cwd.clone(),
@@ -550,7 +555,7 @@ fn split_password(url: &str) -> Result<SplitUrl> {
 
 /// Literal secrets of a source (the URL password, decoded and raw), longest first.
 fn source_secrets(source: &TemplateSource) -> Vec<String> {
-    let TemplateSource::Url { url } = source else {
+    let (TemplateSource::Url { url } | TemplateSource::Basebackup { url }) = source else {
         return Vec::new();
     };
     let Ok(split) = split_password(url) else {
@@ -629,6 +634,9 @@ fn db_from_url(url: &str) -> String {
 fn database_for(args: &TemplateInitArgs) -> Result<String> {
     let db = match &args.source {
         TemplateSource::Url { url } => db_from_url(url),
+        TemplateSource::Basebackup { url } => {
+            args.database.clone().unwrap_or_else(|| db_from_url(url))
+        }
         TemplateSource::Seed { .. } | TemplateSource::Promoted { .. } => args
             .database
             .clone()
@@ -1052,20 +1060,27 @@ async fn run_steps(
     source: &TemplateSource,
     mask: Option<&Masking>,
 ) -> StepResult<Vec<String>> {
-    let (i, d) = (install.clone(), data_dir.to_path_buf());
-    blocking(move || initdb(&i, &d))
-        .await
-        .map_err(at("initdb"))?;
-    let pg = start_build_server(ctx, install, data_dir, opts).await?;
-
-    if database != "postgres" {
-        let sql = format!("CREATE DATABASE {}", quote_ident(database));
-        run_psql(install, opts, "postgres", sql)
+    let pg = if let TemplateSource::Basebackup { url } = source {
+        basebackup_server(ctx, install, url, data_dir, opts, database).await?
+    } else {
+        let (i, d) = (install.clone(), data_dir.to_path_buf());
+        blocking(move || initdb(&i, &d))
             .await
-            .map_err(at("create database"))?;
-    }
+            .map_err(at("initdb"))?;
+        let pg = start_build_server(ctx, install, data_dir, opts).await?;
+
+        if database != "postgres" {
+            let sql = format!("CREATE DATABASE {}", quote_ident(database));
+            run_psql(install, opts, "postgres", sql)
+                .await
+                .map_err(at("create database"))?;
+        }
+        pg
+    };
 
     match source {
+        // Already in the copy.
+        TemplateSource::Basebackup { .. } => {}
         TemplateSource::Url { url } => {
             let (i, u, o, db, g) = (
                 install.clone(),
@@ -1103,6 +1118,214 @@ async fn run_steps(
         mask_and_dump(ctx, install, data_dir, opts, database, m).await?;
     }
     extensions_and_stop(ctx, install, data_dir, opts, database, pg).await
+}
+
+/// Step name of a missing source database; `build_gen` turns it into `invalid_request`.
+const DATABASE_STEP: &str = "database";
+
+/// The major version of the server at `url`, read with `psql` of any install.
+fn source_major(install: &PgInstall, url: &str) -> Result<u32> {
+    let split = split_password(url)?;
+    let mut cmd = Command::new(install.bin("psql"));
+    if let Some(pw) = &split.password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let out = cmd
+        .args(["-X", "-A", "-t", "-w", "-c", "show server_version_num"])
+        .arg(&split.url)
+        .env("PGCONNECT_TIMEOUT", "10")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| internal(format!("could not run psql: {e}")))?;
+    let secrets = source_secrets(&TemplateSource::Basebackup { url: url.into() });
+    if !out.status.success() {
+        let err = scrub(String::from_utf8_lossy(&out.stderr).trim(), &secrets);
+        return Err(MitosisError::new(
+            ErrorCode::TemplateBuildFailed,
+            format!("could not read the version of the source server: {err}"),
+        )
+        .with_hint("check the URL and password, and that the server accepts this connection"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse::<u32>()
+        .map(|n| n / 10_000)
+        .map_err(|_| internal(format!("unexpected server_version_num {:?}", text.trim())))
+}
+
+/// The install whose `pg_basebackup` matches the major of the source at `url`. Fails before any
+/// copy when that major is not installed.
+async fn basebackup_install(ctx: &Ctx, url: &str, pinned: Option<u32>) -> Result<PgInstall> {
+    let probe = ctx.newest_install().await?;
+    let u = url.to_string();
+    let major = blocking(move || source_major(&probe, &u)).await?;
+    if let Some(m) = pinned.filter(|m| *m != major) {
+        return Err(invalid(format!(
+            "the source runs Postgres {major}, so its physical copy is Postgres {major}, not {m}"
+        ))
+        .with_hint("drop --pg-version; to move to another major, upgrade the template"));
+    }
+    ctx.install_major(major).await.map_err(|e| {
+        if e.code != ErrorCode::NoMatchingPostgres {
+            return e;
+        }
+        MitosisError::new(
+            ErrorCode::NoMatchingPostgres,
+            format!("the source runs Postgres {major} and pg_basebackup needs the same major; no Postgres {major} found"),
+        )
+        .with_hint(format!(
+            "brew install postgresql@{major}, or: mitosis pg install {major}"
+        ))
+    })
+}
+
+/// True when `pg_basebackup`'s error says the source refused a replication connection.
+fn refused_replication(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("replication") || s.contains("walsender") || s.contains("wal sender")
+}
+
+const REPLICATION_NOTE: &str =
+    "mitosis: the source refused the physical copy. The role in the URL \
+    needs the REPLICATION attribute (ALTER ROLE <role> REPLICATION), and the source's pg_hba.conf \
+    needs a 'replication' line that allows it (host replication <role> <address> scram-sha-256).";
+
+/// `pg_basebackup -D dir -X stream -c fast` of the server at `url`, stderr to the build log. The
+/// password goes in `PGPASSWORD`, never in argv. The tool creates `dir`, which must not exist.
+fn run_basebackup(
+    install: &PgInstall,
+    url: &str,
+    dir: &Path,
+    log: &Path,
+    groups: &Groups,
+) -> Result<()> {
+    let split = split_password(url)?;
+    let mut cmd = Command::new(install.bin("pg_basebackup"));
+    if let Some(pw) = &split.password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let child = cmd
+        .args(["-X", "stream", "-c", "fast", "-w", "-D"])
+        .arg(dir)
+        .arg("-d")
+        .arg(&split.url)
+        .env("PGCONNECT_TIMEOUT", "10")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| internal(format!("could not run pg_basebackup: {e}")))?;
+    let _group = GroupGuard::new(groups, child.id() as i32);
+    let out = child
+        .wait_with_output()
+        .map_err(|e| internal(format!("waiting for pg_basebackup: {e}")))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.trim().is_empty() {
+        append_log(log, stderr.trim());
+    }
+    if out.status.success() {
+        return Ok(());
+    }
+    if refused_replication(&stderr) {
+        append_log(log, REPLICATION_NOTE);
+    }
+    Err(internal(format!("pg_basebackup failed ({})", out.status)))
+}
+
+/// Ensures the `postgres` superuser, then starts the copied cluster. A `shared_preload_libraries`
+/// entry this machine lacks is commented out once, with a warning in the build log.
+async fn standalone_start(
+    ctx: &Ctx,
+    install: &PgInstall,
+    data_dir: &Path,
+    opts: &mut StartOptions,
+) -> StepResult<RunningPg> {
+    let mut retried = false;
+    loop {
+        let (i, d) = (install.clone(), data_dir.to_path_buf());
+        let attempt = match blocking(move || ensure_postgres_superuser(&i, &d)).await {
+            Ok(()) => start_build_server(ctx, install, data_dir, opts).await,
+            Err(e) => Err(("standalone", e)),
+        };
+        let (step, e) = match attempt {
+            Ok(pg) => return Ok(pg),
+            Err(failed) => failed,
+        };
+        if retried || !is_missing_library(&e.message) {
+            return Err((step, e));
+        }
+        let d = data_dir.to_path_buf();
+        let off = blocking(move || disable_preload_libraries(&d))
+            .await
+            .map_err(at("standalone"))?;
+        if off.is_empty() {
+            return Err((step, e));
+        }
+        for line in off {
+            append_log(
+                &opts.log_file,
+                &format!("mitosis: warning: the copy needs a library this Postgres lacks; disabled: {line}"),
+            );
+        }
+        retried = true;
+    }
+}
+
+/// The copy step of a `pg_basebackup` template: copies the source into `data_dir`, makes it a
+/// standalone cluster, starts it, and checks that `database` is in it. The server is left running.
+async fn basebackup_server(
+    ctx: &Ctx,
+    install: &PgInstall,
+    url: &str,
+    data_dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+) -> StepResult<RunningPg> {
+    let (i, u, d, l, g) = (
+        install.clone(),
+        url.to_string(),
+        data_dir.to_path_buf(),
+        opts.log_file.clone(),
+        ctx.build_groups.clone(),
+    );
+    blocking(move || run_basebackup(&i, &u, &d, &l, &g))
+        .await
+        .map_err(at("basebackup"))?;
+    let d = data_dir.to_path_buf();
+    let warnings = blocking(move || make_standalone(&d))
+        .await
+        .map_err(at("standalone"))?;
+    for w in warnings {
+        append_log(&opts.log_file, &format!("mitosis: warning: {w}"));
+    }
+    let pg = standalone_start(ctx, install, data_dir, opts).await?;
+    // template1 always exists and accepts connections.
+    let out = run_psql(
+        install,
+        opts,
+        "template1",
+        "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1"
+            .into(),
+    )
+    .await
+    .map_err(at("database"))?;
+    let have: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !have.contains(&database) {
+        return Err((
+            DATABASE_STEP,
+            invalid(format!(
+                "database {database} does not exist in the source (it has: {})",
+                have.join(", ")
+            ))
+            .with_hint("name one of them with --database"),
+        ));
+    }
+    Ok(pg)
 }
 
 /// Starts the build server in `data_dir`, moving `opts` to another port when the picked one is taken.
@@ -1230,9 +1453,13 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
 async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<TemplateInfo> {
     let name = args.name.clone();
     let database = database_for(&args)?;
-    let install = match args.pg_major {
-        Some(major) => ctx.install_major(major).await?,
-        None => ctx.newest_install().await?,
+    let install = match (&args.source, args.pg_major) {
+        // A physical copy keeps the major of the server it is copied from.
+        (TemplateSource::Basebackup { url }, pinned) => {
+            basebackup_install(ctx, url, pinned).await?
+        }
+        (_, Some(major)) => ctx.install_major(major).await?,
+        (_, None) => ctx.newest_install().await?,
     };
     let migrations_hash = match args.migrations.as_deref() {
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
@@ -1537,7 +1764,12 @@ async fn build_gen(
     };
     let result = match result {
         Ok(ext) => Ok(ext),
-        Err((step, e)) => Err(fail(ctx, install, &build_dir, &log, &secrets, step, e).await),
+        Err((step, e)) => {
+            // The caller named a database the source does not have: a bad request, not a failed build.
+            let bad_request = step == DATABASE_STEP;
+            let failed = fail(ctx, install, &build_dir, &log, &secrets, step, e.clone()).await;
+            Err(if bad_request { e } else { failed })
+        }
     };
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let row = GenerationRow {

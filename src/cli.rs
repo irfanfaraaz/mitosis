@@ -170,18 +170,26 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum TemplateCmd {
-    /// Build a template from a database URL or a seed command.
+    /// Build a template from a database URL, a physical copy of a server, or a seed command.
     Init {
         #[arg(default_value = "main")]
         name: String,
         /// Copy an existing database with pg_dump.
-        #[arg(long, conflicts_with = "seed", required_unless_present = "seed")]
+        #[arg(
+            long,
+            conflicts_with_all = ["seed", "basebackup"],
+            required_unless_present_any = ["seed", "basebackup"]
+        )]
         from_url: Option<String>,
         /// Shell command run in this folder with DATABASE_URL set.
         #[arg(long)]
+        /// Copy a running server physically with pg_basebackup (needs a role with REPLICATION).
+        #[arg(long, conflicts_with = "seed")]
+        basebackup: Option<String>,
         seed: Option<String>,
         #[arg(long)]
         database: Option<String>,
+        /// The database to keep (a --basebackup copy has all of the server's; default: the URL's).
         /// Migrations folder; the template is flagged stale when it changes.
         #[arg(long)]
         migrations: Option<std::path::PathBuf>,
@@ -826,19 +834,23 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                         MitosisError::new(
                             ErrorCode::InvalidRequest,
                             format!("migrations folder {}: {e}", dir.display()),
+            basebackup,
                         )
                     })
                 })
                 .transpose()?;
-            let source = match (from_url, seed) {
-                (Some(url), _) => TemplateSource::Url { url },
+            let source = match (from_url, basebackup, seed) {
+                (Some(url), _, _) => TemplateSource::Url { url },
+                (None, Some(url), _) => TemplateSource::Basebackup { url },
                 // The seed runs where and with the PATH it would in this shell.
-                (None, Some(command)) => TemplateSource::Seed {
+                (None, None, Some(command)) => TemplateSource::Seed {
                     command,
                     cwd: Some(std::env::current_dir()?),
                     path: std::env::var("PATH").ok(),
                 },
-                (None, None) => unreachable!("clap requires --from-url or --seed"),
+                (None, None, None) => {
+                    unreachable!("clap requires --from-url, --basebackup or --seed")
+                }
             };
             let args = TemplateInitArgs {
                 name,
@@ -1027,6 +1039,7 @@ fn source_cell(source: &TemplateSource) -> String {
     let cut: String = text.chars().take(MAX - 1).collect();
     format!("{cut}…")
 }
+        TemplateSource::Basebackup { url } => format!("basebackup: {url}"),
 
 fn paused_line(name: &str) -> String {
     format!(
@@ -1333,6 +1346,15 @@ mod tests {
             "layered",
             "--migrate",
             "make migrate",
+        let basebackup = |extra: &[&str]| {
+            let mut args = vec!["mitosis", "template", "init", "--basebackup", "u"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(basebackup(&[]).is_ok());
+        assert!(basebackup(&["--database", "shop"]).is_ok());
+        assert!(basebackup(&["--seed", "x"]).is_err());
+        assert!(basebackup(&["--from-url", "y"]).is_err());
             "--auto-migrate",
             "on",
             "--on-stale",
