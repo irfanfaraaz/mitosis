@@ -103,7 +103,11 @@ async fn failing_seed_leaves_old_template_intact() {
         .join("main@1/PG_VERSION")
         .exists());
     assert!(leftovers(&env.ctx, "main").is_empty());
-    assert_eq!(env.ctx.store().current("main").unwrap().unwrap(), before);
+    // The failed build used up its generation number (numbers are never reused); nothing else moved.
+    let (mut after, gen) = env.ctx.store().current("main").unwrap().unwrap();
+    assert_eq!(after.next_gen, before.0.next_gen + 1);
+    after.next_gen = before.0.next_gen;
+    assert_eq!((after, gen), before);
     assert_eq!(env.ctx.store().list_generations("main").unwrap().len(), 1);
 }
 
