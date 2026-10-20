@@ -26,6 +26,14 @@ fn short_home() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// The defaults without the router, so these daemons never bind the real router port 54300.
+fn no_router() -> Config {
+    Config {
+        router: false,
+        ..Config::default()
+    }
+}
+
 /// Starts the daemon on `root` and waits until its socket accepts connections.
 async fn start(root: &Path, config: Config) -> JoinHandle<Result<()>> {
     let handle = tokio::spawn(run(Home::at(root.to_path_buf()), config));
@@ -110,7 +118,7 @@ async fn status_clones(root: &Path) -> usize {
 #[tokio::test]
 async fn status_over_socket() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     match Conn::open(tmp.path()).await.ok(Request::Status).await {
         Response::Status(s) => {
             assert_eq!(s.clones, 0);
@@ -126,7 +134,7 @@ async fn status_over_socket() {
 #[tokio::test]
 async fn protocol_mismatch() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     let reply = Conn::open(tmp.path())
         .await
         .line(r#"{"v":99,"request":{"type":"status"}}"#)
@@ -144,7 +152,7 @@ async fn protocol_mismatch() {
 #[tokio::test]
 async fn garbage_line() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     let mut conn = Conn::open(tmp.path()).await;
     assert_eq!(
         conn.line("not json").await.result.unwrap_err().code,
@@ -161,8 +169,8 @@ async fn garbage_line() {
 #[tokio::test]
 async fn second_daemon_refused() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
-    let second = run(Home::at(tmp.path().to_path_buf()), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
+    let second = run(Home::at(tmp.path().to_path_buf()), no_router()).await;
     assert_eq!(second.unwrap_err().code, ErrorCode::AlreadyRunning);
     // The refused daemon did not touch the first one's socket.
     assert_eq!(status_clones(tmp.path()).await, 0);
@@ -172,7 +180,7 @@ async fn second_daemon_refused() {
 #[tokio::test]
 async fn request_too_large_is_rejected() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     let mut conn = Conn::open(tmp.path()).await;
     // Exactly one byte over the 1 MiB limit and no newline: the daemon reads no further.
     conn.wr.write_all(&vec![b'x'; (1 << 20) + 1]).await.unwrap();

@@ -376,7 +376,11 @@ async fn follow_reads_the_store_not_the_broadcast() {
     let root = tmp.path();
     let handle = tokio::spawn(daemon::run(
         Home::at(root.to_path_buf()),
-        mitosis::ctx::Config::default(),
+        // No router: it would bind the real port 54300 and its events could race into the stream.
+        mitosis::ctx::Config {
+            router: false,
+            ..mitosis::ctx::Config::default()
+        },
     ));
     let deadline = Instant::now() + Duration::from_secs(30);
     while UnixStream::connect(root.join("daemon.sock")).await.is_err() {
