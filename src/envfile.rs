@@ -241,16 +241,23 @@ pub fn rewrite(path: &Path, var: &str, old_url: &str, new_url: &str) -> Result<b
     Ok(true)
 }
 
-fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
-    let var = var.unwrap_or_else(|| DEFAULT_VAR.to_string());
+/// A variable name a `.env` line can hold: a letter or `_`, then letters, digits or `_`.
+pub fn check_var(var: &str) -> Result<()> {
     let mut chars = var.chars();
     let valid = chars
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !valid {
-        return Err(invalid(format!("{var} is not a valid variable name")));
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(format!("{var} is not a valid variable name")))
     }
+}
+
+fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
+    let var = var.unwrap_or_else(|| DEFAULT_VAR.to_string());
+    check_var(&var)?;
     let file = std::env::current_dir()?.join(file);
     check_name(&file)?;
     let previous = read_file(&file)?.and_then(|t| get_raw(&t, &var));
@@ -379,18 +386,50 @@ pub async fn create_clone(
     Ok(info)
 }
 
-/// Finishes the `.env` restores the daemon could not do. Returns warnings, never fails.
+/// Finishes the `.env` restores the daemon could not do, starting the daemon if none runs.
+/// Returns warnings, never fails.
 pub async fn finish_pending(home: &Home) -> Vec<String> {
-    let items = match client::request(home, Request::PendingRestores).await {
-        Ok(Response::PendingRestores { items }) => items,
-        Ok(_) => return vec!["unexpected daemon reply to a pending .env restore request".into()],
-        Err(e) => return vec![format!("pending .env restores: {}", e.message)],
+    finish_pending_counted(home).await.1
+}
+
+/// `finish_pending`, with how many restores were finished: a warning is not always one failed
+/// restore (a failed request is one warning for all of them).
+pub async fn finish_pending_counted(home: &Home) -> (usize, Vec<String>) {
+    match client::request(home, Request::PendingRestores).await {
+        Ok(r) => finish_items(home, r).await,
+        Err(e) => (0, vec![format!("pending .env restores: {}", e.message)]),
+    }
+}
+
+/// `finish_pending` when a daemon already runs; nothing (and no daemon start) when none does.
+/// For eager callers such as the MCP server start: a later command finishes them instead.
+pub async fn finish_pending_if_running(home: &Home) -> Vec<String> {
+    match client::request_if_running(home, Request::PendingRestores).await {
+        Ok(Some(r)) => finish_items(home, r).await.1,
+        Ok(None) => Vec::new(),
+        Err(e) => vec![format!("pending .env restores: {}", e.message)],
+    }
+}
+
+/// Applies the restores in a `PendingRestores` reply. The warnings say they come from an earlier
+/// clone, so they are not mistaken for the current command's.
+async fn finish_items(home: &Home, reply: Response) -> (usize, Vec<String>) {
+    let items = match reply {
+        Response::PendingRestores { items } => items,
+        _ => {
+            return (
+                0,
+                vec!["unexpected daemon reply to a pending .env restore request".into()],
+            )
+        }
     };
-    let mut warnings = Vec::new();
+    let (mut done, mut warnings) = (0, Vec::new());
     for item in items {
         match restore(&item) {
-            // Restored, or the user changed the value or removed the file: either way it is done.
+            // Restored, or the user changed the value or removed the file: either way it is done
+            // (a row left by a failed `done` request is finished again, harmlessly, next time).
             Ok(_) => {
+                done += 1;
                 if let Err(e) =
                     client::request(home, Request::PendingRestoreDone { id: item.id }).await
                 {
@@ -398,14 +437,14 @@ pub async fn finish_pending(home: &Home) -> Vec<String> {
                 }
             }
             Err(e) => warnings.push(format!(
-                "could not restore {} in {}: {}",
+                "could not restore {} in {} for an earlier clone: {}",
                 item.var,
                 item.file.display(),
                 e.message
             )),
         }
     }
-    warnings
+    (done, warnings)
 }
 
 #[cfg(test)]

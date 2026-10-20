@@ -239,3 +239,24 @@ async fn durable_flag() {
     assert_eq!(psql_url(&env, &durable.url, "show fsync"), "on");
     assert_eq!(psql_url(&env, &fast.url, "show fsync"), "off");
 }
+
+/// The install and extension checks run before the create queues: with the cap full, a missing
+/// extension is the answer, not cap_reached after the wait.
+#[tokio::test]
+async fn missing_extension_is_reported_before_queueing() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let ctx = ctx_with(&env, |c| c.max_clones = 1);
+    create(&ctx, args("main")).await.unwrap();
+    set_current_gen(&env, |g| g.extensions.push("no_such_ext".into()));
+    let e = create(
+        &ctx,
+        CloneCreateArgs {
+            wait_secs: Some(0),
+            ..args("main")
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::MissingExtension, "{e:?}");
+}

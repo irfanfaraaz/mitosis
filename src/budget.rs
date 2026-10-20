@@ -109,11 +109,22 @@ fn collect(ctx: &Ctx, want_ram: bool, want_disk: bool) -> Result<(Usage, u64)> {
         .into_iter()
         .filter(|c| c.status != CloneStatus::Stopping)
         .collect();
+    // A Sleeping row with an operation running is waking (or going to sleep): its server uses
+    // memory while the row still says Sleeping.
+    let busy: std::collections::HashSet<String> = ctx
+        .in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    let waking =
+        |r: &crate::state::CloneRow| r.status == CloneStatus::Sleeping && busy.contains(&r.id);
     let mut clones = Vec::with_capacity(rows.len());
     for r in &rows {
         let rss = r
             .pg_pid
-            .filter(|_| want_ram && r.status == CloneStatus::Ready)
+            .filter(|_| want_ram && (r.status == CloneStatus::Ready || waking(r)))
             .filter(|pid| process_start_time(*pid) == r.pg_start_time)
             .and_then(rss_bytes);
         let own = want_disk.then(|| private_size(&r.dir)).flatten();
@@ -137,12 +148,14 @@ fn collect(ctx: &Ctx, want_ram: bool, want_disk: bool) -> Result<(Usage, u64)> {
     }
     let running: Vec<u64> = clones.iter().filter_map(|c| c.rss_bytes).collect();
     let estimate = ram_estimate(&running);
-    // A clone that is still starting has no reading yet, but it will use memory. A sleeping one
-    // uses none: it counts for the cap and the disk only.
+    // A clone that is still starting (or waking) has no reading yet, but it will use memory. A
+    // sleeping one uses none: it counts for the cap and the disk only.
     let unread = if want_ram {
         rows.iter()
             .zip(&clones)
-            .filter(|(r, c)| r.status != CloneStatus::Sleeping && c.rss_bytes.is_none())
+            .filter(|(r, c)| {
+                (r.status != CloneStatus::Sleeping || waking(r)) && c.rss_bytes.is_none()
+            })
             .count() as u64
     } else {
         0
@@ -184,40 +197,66 @@ pub async fn usage(ctx: &Arc<Ctx>) -> Result<Usage> {
     snapshot(ctx, true).await.map(|(u, _)| u)
 }
 
+/// `max_clones` is reached: names the setting and up to three of the clones (`labels`: names,
+/// else ids).
+pub(crate) fn cap_reached(max_clones: usize, labels: &[String]) -> MitosisError {
+    let mut shown = labels
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if labels.len() > 3 {
+        shown.push_str(&format!(" and {} more", labels.len() - 3));
+    }
+    let of = if shown.is_empty() {
+        String::new()
+    } else {
+        format!(": {shown}")
+    };
+    MitosisError::new(
+        ErrorCode::CapReached,
+        format!("clone limit reached (max_clones = {max_clones}){of}"),
+    )
+    .with_hint(
+        "destroy one with `mitosis destroy <id-or-name>` (or the clone_destroy tool), or raise max_clones (mitosis config set max_clones <n>)",
+    )
+}
+
 /// The error for a create that ran out of wait: names the limit and the biggest clones.
 fn exhausted(u: &Usage, limit: Limit, estimate: u64) -> MitosisError {
+    // `; largest: a (1 GB), …`, or nothing when no clone uses any of it.
     let largest = |size: &dyn Fn(&CloneUsage) -> u64| {
-        let mut v: Vec<&CloneUsage> = u.clones.iter().collect();
+        let mut v: Vec<&CloneUsage> = u.clones.iter().filter(|c| size(c) > 0).collect();
         v.sort_by_key(|c| std::cmp::Reverse(size(c)));
-        v.iter()
+        let top = v
+            .iter()
             .take(3)
             .map(|c| {
                 let label = c.name.as_deref().unwrap_or(&c.id);
                 format!("{label} ({})", human(size(c)))
             })
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", ");
+        if top.is_empty() {
+            top
+        } else {
+            format!("; largest: {top}")
+        }
     };
     match limit {
-        Limit::Count => MitosisError::new(
-            ErrorCode::CapReached,
-            format!(
-                "clone limit of {} reached: {}",
-                u.max_clones,
-                u.clones
-                    .iter()
-                    .map(|c| c.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )
-        .with_hint(
-            "destroy one with `mitosis destroy <id-or-name>` (or the clone_destroy tool), or raise max_clones (mitosis config set max_clones <n>)",
-        ),
+        Limit::Count => {
+            let labels: Vec<String> = u
+                .clones
+                .iter()
+                .map(|c| c.name.clone().unwrap_or_else(|| c.id.clone()))
+                .collect();
+            cap_reached(u.max_clones, &labels)
+        }
         Limit::Ram => MitosisError::new(
             ErrorCode::BudgetFull,
             format!(
-                "ram_budget of {} is full: clones use {} and a new one needs about {}; largest: {}",
+                "ram_budget of {} is full: clones use {} and a new one needs about {}{}",
                 human(u.ram_budget.unwrap_or(0)),
                 human(u.ram_bytes),
                 human(estimate),
@@ -228,7 +267,7 @@ fn exhausted(u: &Usage, limit: Limit, estimate: u64) -> MitosisError {
         Limit::Disk => MitosisError::new(
             ErrorCode::BudgetFull,
             format!(
-                "disk_budget of {} is full: clones use {}; largest: {}",
+                "disk_budget of {} is full: clones use {}{}",
                 human(u.disk_budget.unwrap_or(0)),
                 human(u.disk_bytes),
                 largest(&|c| c.own_disk_bytes.unwrap_or(0)),
@@ -264,6 +303,18 @@ pub struct Admission {
 tokio::task_local! {
     /// Turns true when the client that sent the running request has hung up.
     pub(crate) static CLIENT_GONE: tokio::sync::watch::Receiver<bool>;
+    /// Turns true when the daemon starts shutting down.
+    pub(crate) static DAEMON_STOPPING: tokio::sync::watch::Receiver<bool>;
+}
+
+/// Resolves when the daemon starts shutting down; never, outside a daemon request.
+async fn daemon_stopping() {
+    if let Ok(mut rx) = DAEMON_STOPPING.try_with(|r| r.clone()) {
+        if rx.wait_for(|stopping| *stopping).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
 }
 
 /// Resolves when the client of the current request hangs up; never, outside a daemon request.
@@ -277,8 +328,9 @@ async fn client_gone() {
 }
 
 /// Waits in line (first come, first served) until a new clone fits the limits, at most `wait`.
-/// Wakes on `ctx.room`, and looks again every second as a fallback. If the client hangs up while
-/// it waits, it leaves the line (dropping its place); once admitted it is not cancelled.
+/// Wakes on `ctx.room`, and looks again every second as a fallback. If the client hangs up or the
+/// daemon starts shutting down while it waits, it leaves the line (dropping its place); once
+/// admitted it is not cancelled.
 pub async fn admit(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
     tokio::select! {
         r = admit_in_line(ctx, wait) => r,
@@ -286,6 +338,11 @@ pub async fn admit(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
             ErrorCode::InvalidRequest,
             "the client disconnected while the create was queued",
         )),
+        () = daemon_stopping() => Err(MitosisError::new(
+            ErrorCode::DaemonUnavailable,
+            "the daemon is shutting down",
+        )
+        .with_hint("try again: the next command starts the daemon")),
     }
 }
 
@@ -306,7 +363,7 @@ async fn sleep_least_recent_idle(ctx: &Arc<Ctx>) -> bool {
     idle.retain(|(r, _)| r.status == CloneStatus::Ready);
     idle.sort_by_key(|(_, since)| *since);
     for (row, _) in idle {
-        match crate::clones::sleep(ctx, &row.id, "evicted").await {
+        match crate::clones::sleep(ctx, &row.id, events::reason::EVICTED).await {
             Ok(()) => return true,
             Err(e) => crate::lifecycle::log(ctx, &format!("eviction: clone {}: {e}", row.id)),
         }
@@ -479,5 +536,82 @@ mod tests {
         let e = exhausted(&u, Limit::Disk, 0);
         assert!(e.message.contains("disk_budget"), "{}", e.message);
         assert_eq!(exhausted(&u, Limit::Count, 0).code, ErrorCode::CapReached);
+    }
+
+    #[test]
+    fn cap_message_names_the_setting_and_at_most_three() {
+        let labels: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let e = cap_reached(5, &labels);
+        assert_eq!(e.code, ErrorCode::CapReached);
+        assert_eq!(
+            e.message,
+            "clone limit reached (max_clones = 5): a, b, c and 2 more"
+        );
+        assert_eq!(
+            cap_reached(2, &labels[..2]).message,
+            "clone limit reached (max_clones = 2): a, b"
+        );
+        assert_eq!(
+            cap_reached(0, &[]).message,
+            "clone limit reached (max_clones = 0)"
+        );
+    }
+
+    #[test]
+    fn budget_message_has_no_empty_largest_list() {
+        let mut u = usage(0, 0, 0);
+        u.ram_budget = Some(1);
+        let e = exhausted(&u, Limit::Ram, 64);
+        assert!(!e.message.contains("largest"), "{}", e.message);
+        u.disk_budget = Some(1);
+        u.clones = vec![c("a", None, Some(0))];
+        let e = exhausted(&u, Limit::Disk, 0);
+        assert!(!e.message.contains("largest"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_waking_clone_counts_for_ram() {
+        let tmp = tempfile::Builder::new()
+            .prefix("mt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let ctx = Ctx::open(
+            crate::paths::Home::at(tmp.path().to_path_buf()),
+            crate::ctx::Config::default(),
+        )
+        .unwrap();
+        let row = crate::state::CloneRow {
+            id: "cb0550f".into(),
+            name: None,
+            template: "main".into(),
+            dir: ctx.home.clones_dir().join("cb0550f"),
+            port: 54320,
+            socket_dir: ctx.home.sockets_dir().join("cb0550f"),
+            password: "x".repeat(32),
+            database: "app".into(),
+            pg_pid: None,
+            pg_start_time: None,
+            parent_pid: None,
+            parent_start_time: None,
+            created_at: 0,
+            expires_at: i64::MAX,
+            durable: false,
+            status: CloneStatus::Sleeping,
+            generation: 1,
+            protected: false,
+            suspect: false,
+        };
+        ctx.store().insert_clone(&row).unwrap();
+        assert_eq!(
+            collect(&ctx, true, false).unwrap().0.ram_bytes,
+            0,
+            "asleep: no memory"
+        );
+        let _waking = crate::clones::mark(&ctx, &row.id, crate::ctx::InFlightOp::Create).unwrap();
+        assert_eq!(
+            collect(&ctx, true, false).unwrap().0.ram_bytes,
+            DEFAULT_RAM_ESTIMATE,
+            "waking: one estimate until it can be measured"
+        );
     }
 }

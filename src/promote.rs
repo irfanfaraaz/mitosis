@@ -84,6 +84,15 @@ pub async fn promote(ctx: &Ctx, id_or_name: &str, target: Option<&str>) -> Resul
         )));
     }
     let name = target.unwrap_or(&clone.template).to_string();
+    // A branch template's generations are layers on its base's; a promoted one would match no
+    // `base_gen`.
+    if name.contains('~') {
+        return Err(invalid(format!(
+            "clone {} comes from branch template {name}, which cannot take a promoted generation",
+            clone.name.as_deref().unwrap_or(&clone.id)
+        ))
+        .with_hint("promote into a plain template: use --template <template>"));
+    }
     let _guard = BuildGuard::take(ctx, &name)?;
 
     let dir = clone.dir.clone();

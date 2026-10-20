@@ -107,6 +107,9 @@ pub struct TemplateSettings {
     /// The git branch the base template's recorded checkout follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    /// Forget the base branch: layered builds then run on any branch, as before v1.0.
+    #[serde(default)]
+    pub base_branch_off: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

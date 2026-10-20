@@ -614,10 +614,15 @@ impl Store {
 
     /// Removes the template and all its generation rows (not their folders).
     /// Removes the template and its generation rows together, so a failure never leaves one half.
+    /// A base template takes its branch templates (`base = name`) with it.
     pub fn delete_template(&self, name: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM generations WHERE template = ?1", [name])?;
-        tx.execute("DELETE FROM templates WHERE name = ?1", [name])?;
+        tx.execute(
+            "DELETE FROM generations WHERE template = ?1 \
+             OR template IN (SELECT name FROM templates WHERE base = ?1)",
+            [name],
+        )?;
+        tx.execute("DELETE FROM templates WHERE name = ?1 OR base = ?1", [name])?;
         tx.commit()?;
         Ok(())
     }
@@ -1151,7 +1156,10 @@ mod tests {
             .unwrap();
         assert!(store.delete_template("main").is_err());
         assert_eq!(store.list_generations("main").unwrap().len(), 1);
-        store.conn.execute_batch("DROP TRIGGER no_tpl_delete").unwrap();
+        store
+            .conn
+            .execute_batch("DROP TRIGGER no_tpl_delete")
+            .unwrap();
         store.delete_template("main").unwrap();
         assert!(store.list_generations("main").unwrap().is_empty());
         assert!(store.get_template("main").unwrap().is_none());

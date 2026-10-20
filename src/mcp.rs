@@ -287,8 +287,10 @@ impl ServerHandler for Mitosis {}
 /// Serves the clone tools on stdin/stdout until stdin closes.
 pub async fn serve_stdio(home: Home) -> error::Result<()> {
     let internal = |e: String| MitosisError::new(ErrorCode::Internal, format!("mcp: {e}"));
-    // Restores a dead clone's `.env` value; warnings are best effort and stdout is MCP-only.
-    for w in envfile::finish_pending(&home).await {
+    // Restores a dead clone's `.env` value; warnings are best effort and stdout is MCP-only. Only
+    // when a daemon runs: a session that never calls a tool must not start one (clone_create
+    // finishes them anyway).
+    for w in envfile::finish_pending_if_running(&home).await {
         eprintln!("mitosis: {w}");
     }
     let service = Mitosis { home }

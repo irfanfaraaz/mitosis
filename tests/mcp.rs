@@ -2,101 +2,17 @@
 // same runtime ever waits on it.
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/cli.rs"]
+mod cli;
 mod common;
 
-use common::{seed, tmp_home};
+use cli::*;
+use common::seed;
 use mitosis::pg::discover;
 use mitosis::protocol::{CloneInfo, TemplateSource};
-use rmcp::model::{CallToolRequestParams, CallToolResult};
-use rmcp::service::RunningService;
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{RoleClient, ServiceExt};
 use serde_json::json;
-use std::path::Path;
-use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard};
 
 const SEED: &str = "create table t(id int); insert into t values (1)";
-
-/// A real daemon on the default port range: one test at a time.
-fn serial_home() -> (MutexGuard<'static, ()>, tempfile::TempDir) {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    (guard, tmp_home())
-}
-
-/// This binary's router port: not the default 54300, which a real daemon on this Mac may hold.
-fn router_port() -> String {
-    static PORT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PORT.get_or_init(|| {
-        let r = u16::from_str_radix(&mitosis::names::random_hex(2), 16).unwrap();
-        (60_250 + r % 700).to_string()
-    })
-    .clone()
-}
-
-fn mitosis(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mitosis"))
-        .args(args)
-        .env("MITOSIS_HOME", home)
-        .env("MITOSIS_ROUTER_PORT", router_port())
-        .output()
-        .expect("run mitosis")
-}
-
-fn ok(home: &Path, args: &[&str]) -> String {
-    let o = mitosis(home, args);
-    assert!(
-        o.status.success(),
-        "mitosis {args:?} failed: {}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
-/// Destroys every clone and stops the daemon, even when the test panics.
-struct Cleanup<'a>(&'a Path);
-
-impl Drop for Cleanup<'_> {
-    fn drop(&mut self) {
-        if self.0.join("daemon.sock").exists() {
-            let out = mitosis(self.0, &["list", "--json"]);
-            for c in serde_json::from_slice::<Vec<CloneInfo>>(&out.stdout).unwrap_or_default() {
-                let _ = mitosis(self.0, &["destroy", &c.id]);
-            }
-        }
-        let _ = mitosis(self.0, &["daemon", "stop"]);
-    }
-}
-
-type McpClient = RunningService<RoleClient, ()>;
-
-async fn mcp_client(home: &Path) -> McpClient {
-    let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mitosis")).configure(|c| {
-        c.arg("mcp")
-            .env("MITOSIS_HOME", home)
-            .env("MITOSIS_ROUTER_PORT", router_port());
-    });
-    ().serve(TokioChildProcess::new(cmd).expect("spawn mitosis mcp"))
-        .await
-        .expect("mcp handshake")
-}
-
-async fn call(client: &McpClient, tool: &'static str, args: serde_json::Value) -> CallToolResult {
-    let args = args.as_object().cloned().unwrap_or_default();
-    client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
-        .await
-        .expect("call tool")
-}
-
-fn result_text(r: &CallToolResult) -> String {
-    r.content
-        .iter()
-        .filter_map(|c| c.as_text())
-        .map(|t| t.text.as_str())
-        .collect()
-}
 
 /// The password in a clone URL.
 fn password(url: &str) -> &str {

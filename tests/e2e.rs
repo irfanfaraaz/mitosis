@@ -2,87 +2,20 @@
 // same runtime ever waits on it.
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/cli.rs"]
+mod cli;
 mod common;
 
-use common::{seed, tmp_home};
+use cli::*;
+use common::seed;
 use mitosis::pg::{discover, newest};
 use mitosis::protocol::{CloneInfo, TemplateSource};
-use rmcp::model::{CallToolRequestParams, CallToolResult};
-use rmcp::service::RunningService;
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{RoleClient, ServiceExt};
 use serde_json::json;
 use std::path::Path;
-use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const SEED: &str = "create table t(id int); insert into t values (1)";
-
-/// Each test runs a real daemon on the default port range, so they run one at a time: parallel
-/// daemons race for the same lowest free port.
-fn serial_home() -> (MutexGuard<'static, ()>, tempfile::TempDir) {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    (guard, tmp_home())
-}
-
-/// This binary's router port: not the default 54300, which a real daemon on this Mac may hold.
-/// Clone URLs here go through the router.
-fn router_port() -> String {
-    static PORT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PORT.get_or_init(|| {
-        let r = u16::from_str_radix(&mitosis::names::random_hex(2), 16).unwrap();
-        (60_250 + r % 700).to_string()
-    })
-    .clone()
-}
-
-fn mitosis(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mitosis"))
-        .args(args)
-        .env("MITOSIS_HOME", home)
-        .env("MITOSIS_ROUTER_PORT", router_port())
-        .output()
-        .expect("run mitosis")
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
-fn ok(home: &Path, args: &[&str]) -> String {
-    let o = mitosis(home, args);
-    assert!(
-        o.status.success(),
-        "mitosis {args:?} failed: {}",
-        stderr(&o)
-    );
-    stdout(&o)
-}
-
-fn list(home: &Path) -> Vec<CloneInfo> {
-    serde_json::from_str(&ok(home, &["list", "--json"])).expect("list --json parses")
-}
-
-/// Destroys every clone and stops the daemon, even when the test panics.
-struct Cleanup<'a>(&'a Path);
-
-impl Drop for Cleanup<'_> {
-    fn drop(&mut self) {
-        if self.0.join("daemon.sock").exists() {
-            let out = mitosis(self.0, &["list", "--json"]);
-            for c in serde_json::from_slice::<Vec<CloneInfo>>(&out.stdout).unwrap_or_default() {
-                let _ = mitosis(self.0, &["destroy", &c.id]);
-            }
-        }
-        let _ = mitosis(self.0, &["daemon", "stop"]);
-    }
-}
 
 #[test]
 fn cli_autostarts_daemon_and_clones() {
@@ -152,56 +85,6 @@ fn cli_bad_ttl() {
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("error:"), "{}", stderr(&o));
     assert!(!home.join("daemon.sock").exists(), "a daemon was started");
-}
-
-type McpClient = RunningService<RoleClient, ()>;
-
-/// Starts `mitosis mcp` on `home` as a child process and completes the MCP handshake.
-async fn mcp_client(home: &Path) -> McpClient {
-    mcp_client_in(home, None).await
-}
-
-/// Like `mcp_client`, with the server's working folder set (relative `env_file` paths resolve there).
-async fn mcp_client_in(home: &Path, cwd: Option<&Path>) -> McpClient {
-    let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mitosis")).configure(|c| {
-        c.arg("mcp")
-            .env("MITOSIS_HOME", home)
-            .env("MITOSIS_ROUTER_PORT", router_port());
-        if let Some(d) = cwd {
-            c.current_dir(d);
-        }
-    });
-    ().serve(TokioChildProcess::new(cmd).expect("spawn mitosis mcp"))
-        .await
-        .expect("mcp handshake")
-}
-
-async fn tool_names(client: &McpClient) -> Vec<String> {
-    let mut names: Vec<String> = client
-        .list_all_tools()
-        .await
-        .expect("list tools")
-        .into_iter()
-        .map(|t| t.name.into_owned())
-        .collect();
-    names.sort();
-    names
-}
-
-async fn call(client: &McpClient, tool: &'static str, args: serde_json::Value) -> CallToolResult {
-    let args = args.as_object().cloned().unwrap_or_default();
-    client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
-        .await
-        .expect("call tool")
-}
-
-fn result_text(r: &CallToolResult) -> String {
-    r.content
-        .iter()
-        .filter_map(|c| c.as_text())
-        .map(|t| t.text.as_str())
-        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -410,4 +293,151 @@ fn older_daemon_is_replaced() {
         home.join("daemon.sock").exists(),
         "a new daemon owns the socket"
     );
+}
+
+/// `top` puts the terminal back when a signal ends it, not only on `q`.
+#[test]
+fn top_restores_the_terminal_on_sigterm() {
+    use nix::sys::termios::{tcgetattr, LocalFlags};
+    use std::io::Read;
+    use std::process::Stdio;
+    let (_serial, tmp) = serial_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let slave = std::fs::File::from(pty.slave);
+    let mut master = std::fs::File::from(pty.master);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mitosis"))
+        .arg("top")
+        .env("MITOSIS_HOME", home)
+        .env("MITOSIS_ROUTER_PORT", router_port())
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("run mitosis top");
+    // Drains the screen output, so `top` never blocks on a full pty.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let s = seen.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            s.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !seen.lock().unwrap().contains("mitosis top") {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "top exited: {}",
+            seen.lock().unwrap()
+        );
+        assert!(Instant::now() < deadline, "top never drew");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let raw = tcgetattr(&slave).unwrap();
+    assert!(
+        !raw.local_flags.contains(LocalFlags::ICANON),
+        "top runs raw"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "top did not exit on SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(128 + 15), "{status:?}");
+    let back = tcgetattr(&slave).unwrap();
+    assert!(
+        back.local_flags
+            .contains(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG),
+        "the terminal is back to normal: {:?}",
+        back.local_flags
+    );
+}
+
+/// An MCP session that calls no tool starts no daemon (pending `.env` restores wait for one).
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_start_does_not_start_the_daemon() {
+    let (_serial, tmp) = serial_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let client = mcp_client(home).await;
+    assert!(!tool_names(&client).await.is_empty());
+    assert!(!home.join("daemon.sock").exists(), "a daemon was started");
+    client.cancel().await.expect("stop mcp client");
+}
+
+/// A repeated named `clone_create` returns the running clone; `fresh` needs a name and, with one,
+/// makes a new clone on the same URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_named_repeat_and_fresh() {
+    if discover().is_empty() {
+        println!("skipping: no Postgres installed");
+        return;
+    }
+    let (_serial, tmp) = serial_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let TemplateSource::Seed { command, .. } = seed(SEED) else {
+        unreachable!()
+    };
+    ok(home, &["template", "init", "--seed", &command]);
+    let client = mcp_client(home).await;
+    let create = |args: serde_json::Value| {
+        let client = &client;
+        async move {
+            let r = call(client, "clone_create", args).await;
+            (r.is_error == Some(true), result_text(&r))
+        }
+    };
+    let (err, text) = create(json!({"name": "n"})).await;
+    assert!(!err, "{text}");
+    let first: CloneInfo = serde_json::from_str(&text).unwrap();
+    assert!(!first.existing);
+    let (_, text) = create(json!({"name": "n"})).await;
+    let again: CloneInfo = serde_json::from_str(&text).unwrap();
+    assert!(again.existing && again.id == first.id);
+
+    let (err, text) = create(json!({"fresh": true})).await;
+    assert!(err, "{text}");
+    assert!(text.contains("--fresh needs a clone name"), "{text}");
+
+    let (err, text) = create(json!({"name": "n", "fresh": true})).await;
+    assert!(!err, "{text}");
+    let fresh: CloneInfo = serde_json::from_str(&text).unwrap();
+    assert!(!fresh.existing && fresh.id != first.id);
+    assert_eq!(
+        fresh.url, first.url,
+        "same name and password: same router URL"
+    );
+    client.cancel().await.expect("stop mcp client");
+}
+
+/// `mitosis env --var` takes only names a .env line can hold, checked before the daemon.
+#[test]
+fn env_refuses_a_bad_variable_name() {
+    let (_serial, tmp) = serial_home();
+    let home = tmp.path();
+    let o = mitosis(home, &["env", "x", "--var", "1BAD-NAME"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("not a valid variable name"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!home.join("daemon.sock").exists());
 }

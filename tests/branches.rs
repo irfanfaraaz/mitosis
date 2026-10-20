@@ -10,7 +10,8 @@ use mitosis::error::ErrorCode;
 use mitosis::lifecycle::reconcile;
 use mitosis::pg::{newest, psql};
 use mitosis::protocol::{
-    BranchArgs, CloneCreateArgs, CloneInfo, EventFilter, MigrateCmd, TemplateInfo, TemplateSource,
+    BranchArgs, CloneCreateArgs, CloneInfo, EventFilter, MigrateCmd, OnStale, TemplateInfo,
+    TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use mitosis::scheduler;
 use mitosis::templates::{self, branch_folder_slug, history, layered, refresh};
@@ -488,4 +489,253 @@ async fn masked_base_branch_is_masked() {
         .hint
         .unwrap_or_default()
         .contains("mitosis template refresh main"));
+}
+
+fn set(env: &TestEnv, settings: TemplateSettings) {
+    templates::set(
+        &env.ctx,
+        TemplateSetArgs {
+            name: "main".into(),
+            max_age_secs: None,
+            settings,
+            resume: false,
+        },
+    )
+    .expect("template set");
+}
+
+fn base_row(env: &TestEnv) -> mitosis::state::TemplateRow {
+    env.ctx.store().get_template("main").unwrap().unwrap()
+}
+
+const NO_BRANCH: &str = "does not know its own branch";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lazy_paths_never_guess_base_branch() {
+    let Some(env) = TestEnv::new() else { return };
+    if !git_installed() {
+        return;
+    }
+    let repo = repo(&env, "create table a(id int);");
+    // No migrate command and no migrations folder at init: nothing is recorded.
+    let command = migrate_command(&env);
+    let init = template_args(
+        "main",
+        TemplateSource::Seed {
+            command: command.clone(),
+            cwd: Some(repo.clone()),
+            path: None,
+        },
+    );
+    templates::init(&env.ctx, init).await.unwrap();
+    set(
+        &env,
+        TemplateSettings {
+            migrate: Some(MigrateCmd {
+                command,
+                cwd: repo.clone(),
+                path: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let t = base_row(&env);
+    assert_eq!((t.base_branch, t.repo_rel_cwd), (None, None));
+
+    git(&repo, &["switch", "-q", "-c", "feature"]);
+    write(&repo, "migrations/002.sql", "create table b(id int);");
+    commit_all(&repo, "feature");
+    let c = clone_branch(&env, "feature", &repo).await;
+    assert!(has_table(&env, &c, "b"));
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w.contains(NO_BRANCH)
+                && w.contains("mitosis template set main --base-branch <b>")),
+        "{:?}",
+        c.warnings
+    );
+    let t = base_row(&env);
+    assert_eq!(
+        t.base_branch, None,
+        "the feature branch must not become the base's"
+    );
+    assert_eq!(t.repo_rel_cwd, Some(PathBuf::new()));
+    // Once: the paths are recorded now.
+    let again = clone_branch(&env, "feature", &repo).await;
+    assert!(!again.warnings.iter().any(|w| w.contains(NO_BRANCH)));
+    // With no base branch, a layered refresh runs on any branch, as before v1.0.
+    assert_eq!(
+        layered(&env.ctx, "main", None).await.unwrap().current_gen,
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_migrate_clears_repo_paths() {
+    let Some(env) = TestEnv::new() else { return };
+    if !git_installed() {
+        return;
+    }
+    let repo = repo(&env, "create table a(id int);");
+    std::fs::create_dir(repo.join("backend")).unwrap();
+    write(&repo, "backend/README", "migrate from here");
+    commit_all(&repo, "backend");
+    base(&env, &repo, false, None).await;
+    assert_eq!(base_row(&env).repo_rel_cwd, Some(PathBuf::new()));
+
+    let psql = newest(&env.ctx.installs()).unwrap().bin("psql");
+    set(
+        &env,
+        TemplateSettings {
+            migrate: Some(MigrateCmd {
+                command: format!("cd .. && PSQL='{}' sh migrate.sh", psql.display()),
+                cwd: repo.join("backend"),
+                path: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let t = base_row(&env);
+    assert_eq!((t.repo_rel_cwd, t.repo_rel_migrations), (None, None));
+    assert_eq!(t.base_branch.as_deref(), Some("main"), "base_branch stays");
+
+    git(&repo, &["switch", "-q", "-c", "feature"]);
+    write(&repo, "migrations/002.sql", "create table b(id int);");
+    commit_all(&repo, "feature");
+    let c = clone_branch(&env, "feature", &repo).await;
+    assert!(has_table(&env, &c, "b"));
+    assert!(!c.warnings.iter().any(|w| w.contains(NO_BRANCH)));
+    let t = base_row(&env);
+    assert_eq!(t.repo_rel_cwd, Some(PathBuf::from("backend")));
+    assert_eq!(t.repo_rel_migrations, Some(PathBuf::from("migrations")));
+
+    // `--base-branch off` forgets it; a branch and off together are refused.
+    set(
+        &env,
+        TemplateSettings {
+            base_branch_off: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(base_row(&env).base_branch, None);
+    let both = templates::set(
+        &env.ctx,
+        TemplateSetArgs {
+            name: "main".into(),
+            max_age_secs: None,
+            settings: TemplateSettings {
+                base_branch: Some("main".into()),
+                base_branch_off: true,
+                ..Default::default()
+            },
+            resume: false,
+        },
+    );
+    assert_eq!(both.unwrap_err().code, ErrorCode::InvalidRequest);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn named_branch_clone_reused_is_not_rebuilt() {
+    let Some(env) = TestEnv::new() else { return };
+    if !git_installed() {
+        return;
+    }
+    let repo = repo(&env, "create table a(id int);");
+    base(&env, &repo, false, None).await;
+    git(&repo, &["switch", "-q", "-c", "feature"]);
+    let named = || CloneCreateArgs {
+        name: Some("work".into()),
+        ..args(Some(("feature", &repo)))
+    };
+    let first = create(&env.ctx, named()).await.unwrap();
+    assert!(first.rebuilt && !first.existing);
+    write(&repo, "migrations/002.sql", "create table b(id int);");
+    let again = create(&env.ctx, named()).await.unwrap();
+    assert!(again.existing);
+    assert!(
+        !again.rebuilt,
+        "the reused clone was made before the rebuild"
+    );
+    assert_eq!(again.id, first.id);
+
+    // A branch template takes no promoted generation.
+    let e = mitosis::promote::promote(&env.ctx, &first.id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.hint.unwrap_or_default().contains("--template"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_branch_rebuild_checks_branch_and_backs_off() {
+    let Some(env) = TestEnv::new() else { return };
+    if !git_installed() {
+        return;
+    }
+    let repo = repo(&env, "create table a(id int);");
+    base(&env, &repo, false, None).await;
+    set(
+        &env,
+        TemplateSettings {
+            on_stale: Some(OnStale::Refresh),
+            ..Default::default()
+        },
+    );
+    git(&repo, &["switch", "-q", "-c", "feature"]);
+    write(&repo, "migrations/002.sql", "create table b(id int);");
+    commit_all(&repo, "feature");
+    let first = clone_branch(&env, "feature", &repo).await;
+    assert!(first.rebuilt);
+    let row = || {
+        env.ctx
+            .store()
+            .get_template("main~feature")
+            .unwrap()
+            .unwrap()
+    };
+
+    // The checkout moved to main: the background rebuild is skipped, not run on main's files.
+    git(&repo, &["switch", "-q", "main"]);
+    let c = clone_branch(&env, "feature", &repo).await;
+    assert!(c.stale && c.refreshing && !c.rebuilt);
+    assert_eq!(c.generation, first.generation);
+    let skipped = || {
+        env.ctx
+            .store()
+            .list_events(&EventFilter {
+                template: Some("main~feature".into()),
+                kind: Some("template.skipped".into()),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    wait_for(30, "the skipped background build", || !skipped().is_empty()).await;
+    assert_eq!(skipped()[0].detail["op"], "branch");
+    assert_eq!(row().last_error, None);
+
+    // A failing rebuild is recorded and then waits out the back-off.
+    git(&repo, &["switch", "-q", "feature"]);
+    write(&repo, "migrations/003.sql", "select no_such_function();");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c = clone_branch(&env, "feature", &repo).await;
+    assert!(c.stale && c.refreshing);
+    wait_for(120, "the failed background build", || {
+        row().last_error.is_some()
+    })
+    .await;
+    assert!(row().last_attempt_at.is_some());
+    let c = clone_branch(&env, "feature", &repo).await;
+    assert!(
+        c.stale && !c.refreshing,
+        "a failed build waits out the back-off"
+    );
+    assert_eq!(c.generation, first.generation);
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w.contains("last background rebuild")),
+        "{:?}",
+        c.warnings
+    );
 }

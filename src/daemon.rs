@@ -106,6 +106,8 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
         ),
         Err(e) => log(&home, &format!("startup gc failed: {e}")),
     }
+    // Before the socket binds, so no diff is running: anything a diff left is a leftover.
+    lifecycle::remove_diff_leftovers(&ctx).await;
 
     // Safe to replace: we hold the lock, so no other daemon owns this socket.
     let sock = home.daemon_sock();
@@ -443,10 +445,14 @@ async fn dispatch(shared: &Shared, req: Request, gone: watch::Receiver<bool>) ->
         .and_then(|v| v["type"].as_str().map(String::from))
         .unwrap_or_default();
     let ctx = shared.ctx.clone();
+    let stopping = shared.shutdown.subscribe();
     let res = tokio::spawn(async move {
         let _token = token;
         crate::budget::CLIENT_GONE
-            .scope(gone, serve_one(ctx, req))
+            .scope(
+                gone,
+                crate::budget::DAEMON_STOPPING.scope(stopping, serve_one(ctx, req)),
+            )
             .await
     })
     .await

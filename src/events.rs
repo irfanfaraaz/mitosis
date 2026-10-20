@@ -39,6 +39,8 @@ pub mod reason {
     pub const RECOVERY: &str = "recovery";
     pub const FRESH: &str = "fresh";
     pub const FAILED: &str = "failed";
+    /// `clone.slept` only: put to sleep to make room under `ram_budget` (`IDLE` is the other).
+    pub const EVICTED: &str = "evicted";
 }
 
 /// Writes the event, then wakes the followers (they read the row from the store, so the order

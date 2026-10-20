@@ -131,6 +131,12 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
 /// migrations folder.
 type GitPaths = (Option<String>, Option<PathBuf>, Option<PathBuf>);
 
+/// Forgets the repo-relative paths, which belong to the migrate and migrations folders recorded
+/// when they were derived.
+fn clear_repo_paths(t: &mut TemplateRow) {
+    (t.repo_rel_cwd, t.repo_rel_migrations) = (None, None);
+}
+
 /// Writes `paths` into `t`; `base_branch` stays when `keep_branch` (it was given explicitly).
 fn record_git_paths(t: &mut TemplateRow, paths: GitPaths, keep_branch: bool) {
     if !keep_branch {
@@ -269,6 +275,9 @@ fn apply_settings(
     if s.mask.is_some() && s.mask_off {
         return Err(invalid("set --mask to a file or to off, not both"));
     }
+    if s.base_branch.is_some() && s.base_branch_off {
+        return Err(invalid("set --base-branch to a branch or to off, not both"));
+    }
     if s.keep == Some(0) {
         return Err(invalid("--keep must be at least 1"));
     }
@@ -306,6 +315,10 @@ fn apply_settings(
     } else if s.migrate.is_some() {
         t.migrate = s.migrate.clone();
     }
+    if s.migrate_off || s.migrate.is_some() {
+        // Re-derived from the new folder at the next `clone --branch` (or by `template init`).
+        clear_repo_paths(t);
+    }
     if let Some(a) = s.auto_migrate {
         t.auto_migrate = a;
     }
@@ -317,9 +330,11 @@ fn apply_settings(
     if let Some(o) = s.on_stale {
         t.on_stale = o;
     }
-    if let Some(b) = &s.base_branch {
+    if s.base_branch_off {
+        t.base_branch = None;
+    } else if let Some(b) = &s.base_branch {
         if b.trim().is_empty() {
-            return Err(invalid("--base-branch needs a branch name"));
+            return Err(invalid("--base-branch needs a branch name, or off"));
         }
         t.base_branch = Some(b.clone());
     }
@@ -1747,6 +1762,9 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
     let mut t = store.get_template(&name)?.ok_or_else(|| not_found(&name))?;
     t.database = database;
     t.source = args.source;
+    if t.migrations != args.migrations {
+        clear_repo_paths(&mut t);
+    }
     t.migrations = args.migrations;
     if let Some(m) = args.max_age_secs {
         t.max_age_secs = m;
@@ -2026,7 +2044,12 @@ pub struct BranchUse {
     pub stale: bool,
     /// A rebuild of it runs in the background.
     pub refreshing: bool,
+    /// For the clone's response.
+    pub warnings: Vec<String>,
 }
+
+/// How long `clone --branch` waits for another create's build of the same branch template.
+const BRANCH_BUILD_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// Where a branch build runs: the caller's checkout joined with the base's repo-relative paths.
 struct Checkout {
@@ -2048,14 +2071,17 @@ pub async fn ensure_branch(ctx: &Arc<Ctx>, base: &str, b: &BranchArgs) -> Result
         )));
     }
     let name = branch_template_name(base, &b.name);
-    let used = |rebuilt, stale, refreshing| BranchUse {
-        name: name.clone(),
-        rebuilt,
-        stale,
-        refreshing,
-    };
+    let mut warnings = Vec::new();
     loop {
-        let (row, base_row, base_cur, checkout) = branch_row(ctx, base, &name, b).await?;
+        let (row, base_row, base_cur, checkout, warning) = branch_row(ctx, base, &name, b).await?;
+        warnings.extend(warning);
+        let used = |rebuilt, stale, refreshing, warnings| BranchUse {
+            name: name.clone(),
+            rebuilt,
+            stale,
+            refreshing,
+            warnings,
+        };
         let cur = ctx.store().current(&name)?.map(|(_, g)| g);
         let m = checkout.migrations;
         let hash =
@@ -2064,36 +2090,49 @@ pub async fn ensure_branch(ctx: &Arc<Ctx>, base: &str, b: &BranchArgs) -> Result
             .as_ref()
             .is_some_and(|g| row.base_gen == Some(base_cur.gen) && g.migrations_hash == hash);
         if fresh {
-            return Ok(used(false, false, false));
+            return Ok(used(false, false, false, warnings));
         }
         if cur.is_some() && base_row.on_stale == OnStale::Refresh {
-            if claim_build(ctx, &name) {
+            // A failed background build waits out the same back-off as a template's own.
+            let start = crate::scheduler::may_retry(&row, now()) && claim_build(ctx, &name);
+            if start {
                 let (ctx, name, base, b) = (ctx.clone(), name.clone(), base.to_string(), b.clone());
-                tokio::spawn(async move {
-                    // Adopts the slot claimed above.
-                    let _guard = BuildGuard {
-                        ctx: &ctx,
-                        name: name.clone(),
-                    };
-                    if let Err(e) = build_branch(&ctx, &base, &name, &b).await {
-                        let first = e.message.lines().next().unwrap_or_default().to_string();
-                        crate::lifecycle::log(
-                            &ctx,
-                            &format!("background build of template {name} failed: {first}"),
-                        );
-                    }
-                });
+                tokio::spawn(async move { background_branch(&ctx, &base, &name, &b).await });
+            } else if let Some(e) = row
+                .last_error
+                .as_deref()
+                .filter(|_| !is_building(ctx, &name))
+            {
+                warnings.push(format!(
+                    "the last background rebuild of template {name} failed: {e}"
+                ));
             }
-            return Ok(used(false, true, true));
+            let refreshing = start || is_building(ctx, &name);
+            return Ok(used(false, true, refreshing, warnings));
         }
         match BuildGuard::take(ctx, &name) {
             Ok(_guard) => {
                 build_branch(ctx, base, &name, b).await?;
-                return Ok(used(true, false, false));
+                return Ok(used(true, false, false, warnings));
             }
             // Another clone is building it: wait for that build, then look again.
             Err(_) => {
+                let deadline = std::time::Instant::now() + BRANCH_BUILD_WAIT;
                 while is_building(ctx, &name) {
+                    if std::time::Instant::now() >= deadline {
+                        let log = ctx
+                            .home
+                            .logs_dir()
+                            .join(format!("template-{}.log", folder_stem(&name)));
+                        return Err(invalid(format!(
+                            "template {name} is still being built after {} minutes",
+                            BRANCH_BUILD_WAIT.as_secs() / 60
+                        ))
+                        .with_hint(format!(
+                            "try again later; the build log is {}",
+                            log.display()
+                        )));
+                    }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
@@ -2101,15 +2140,87 @@ pub async fn ensure_branch(ctx: &Arc<Ctx>, base: &str, b: &BranchArgs) -> Result
     }
 }
 
+/// The background rebuild `ensure_branch` started; the caller claimed the build slot of `name`.
+/// Skipped when the caller's checkout is no longer on the branch. The outcome is stored in
+/// `last_attempt_at` / `last_error`, which `may_retry` reads.
+async fn background_branch(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) {
+    // Adopts the slot claimed by the caller.
+    let _guard = BuildGuard {
+        ctx,
+        name: name.to_string(),
+    };
+    let root = b.repo_root.clone();
+    let current = blocking(move || Ok(git(&root, &["branch", "--show-current"])))
+        .await
+        .ok()
+        .flatten();
+    if current.as_deref() != Some(b.name.as_str()) {
+        let current = current.unwrap_or_default();
+        crate::lifecycle::log(
+            ctx,
+            &format!(
+                "background build of template {name} skipped: the checkout in {} is on {}",
+                b.repo_root.display(),
+                branch_label(&current)
+            ),
+        );
+        events::emit(
+            ctx,
+            events::TEMPLATE_SKIPPED,
+            None,
+            Some(name),
+            serde_json::json!({
+                "op": "branch",
+                "reason": "checkout on another branch",
+                "branch": current,
+                "wanted": b.name,
+            }),
+        );
+        return;
+    }
+    let started = now();
+    let res = build_branch(ctx, base, name, b).await;
+    let store = ctx.store();
+    let Ok(Some(mut t)) = store.get_template(name) else {
+        return;
+    };
+    t.last_attempt_at = Some(started);
+    t.last_error = res.as_ref().err().map(|e| {
+        let first = e.message.lines().next().unwrap_or_default();
+        let msg = match &e.hint {
+            Some(h) => format!("{first} ({h})"),
+            None => first.to_string(),
+        };
+        scrub(&msg, &source_secrets(&t.source))
+    });
+    let saved = store.update_template_settings(&t);
+    drop(store);
+    if let Some(e) = &t.last_error {
+        crate::lifecycle::log(
+            ctx,
+            &format!("background build of template {name} failed: {e}"),
+        );
+    }
+    if let Err(e) = saved {
+        crate::lifecycle::log(ctx, &format!("template {name}: store build result: {e}"));
+    }
+}
+
+/// What `branch_row` returns: the branch row, the base row and its current generation, where the
+/// build runs, and a warning for the clone's response.
+type BranchRow = (
+    TemplateRow,
+    TemplateRow,
+    GenerationRow,
+    Checkout,
+    Option<String>,
+);
+
 /// Reads the base and creates the branch template `name` when it has no row yet; marks it used.
 /// Fails when the base has no migrate command or its migrate folder is not in a git work tree.
-async fn branch_row(
-    ctx: &Ctx,
-    base: &str,
-    name: &str,
-    b: &BranchArgs,
-) -> Result<(TemplateRow, TemplateRow, GenerationRow, Checkout)> {
+async fn branch_row(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) -> Result<BranchRow> {
     let (mut base_row, base_cur) = ctx.store().current(base)?.ok_or_else(|| not_found(base))?;
+    let mut warning = None;
     let Some(migrate) = base_row.migrate.clone() else {
         return Err(invalid(format!(
             "template {base} has no migrate command, so it has no branch templates"
@@ -2131,11 +2242,17 @@ async fn branch_row(
                 "--branch needs it inside your git checkout: mitosis template set {base} --migrate \"…\" from there"
             )));
         }
+        // Only the paths: the branch checked out now is usually the caller's, not the base's.
         let store = ctx.store();
         if let Some(mut t) = store.get_template(base)? {
-            let keep = t.base_branch.is_some();
-            record_git_paths(&mut t, paths, keep);
+            (t.repo_rel_cwd, t.repo_rel_migrations) = (paths.1, paths.2);
             store.update_template_settings(&t)?;
+            if t.base_branch.is_none() {
+                warning = Some(format!(
+                    "template {base} does not know its own branch; run mitosis template set \
+                     {base} --base-branch <b> so it stops following other branches"
+                ));
+            }
             base_row = t;
         }
     }
@@ -2172,14 +2289,14 @@ async fn branch_row(
     let mut row = store.get_template(name)?.ok_or_else(|| not_found(name))?;
     (row.last_used, row.max_age_secs) = (Some(now()), base_row.max_age_secs);
     store.update_template_settings(&row)?;
-    Ok((row, base_row, base_cur, checkout))
+    Ok((row, base_row, base_cur, checkout, warning))
 }
 
 /// Layers a new generation of branch template `name` on the base's current generation, running the
 /// base's migrate command in the caller's checkout. A failed first build leaves no template. The
 /// caller holds the build slot of `name`.
 async fn build_branch(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) -> Result<()> {
-    let (row, base_row, base_cur, checkout) = branch_row(ctx, base, name, b).await?;
+    let (row, base_row, base_cur, checkout, _) = branch_row(ctx, base, name, b).await?;
     let Some(mut migrate) = base_row.migrate.clone() else {
         return Err(not_found(base));
     };

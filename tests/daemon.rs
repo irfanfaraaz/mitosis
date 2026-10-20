@@ -375,3 +375,71 @@ async fn config_reload_applies_new_cap() {
     assert_eq!(clones(&mut conn).await, 2);
     shutdown(root, handle).await;
 }
+
+/// A bad config.toml fails the request as invalid_request before any daemon is started.
+#[tokio::test]
+async fn ensure_daemon_refuses_an_invalid_config() {
+    let tmp = short_home();
+    std::fs::write(tmp.path().join("config.toml"), "colour = 1\n").unwrap();
+    let e = client::request(&Home::at(tmp.path().to_path_buf()), Request::Status)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest, "{e:?}");
+    assert!(e.message.contains("colour"), "{}", e.message);
+    assert!(
+        !tmp.path().join("daemon.sock").exists(),
+        "no daemon started"
+    );
+}
+
+/// A create waiting for room leaves the queue when the daemon shuts down, rather than being
+/// admitted during the drain and starting Postgres as the daemon exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_create_leaves_on_shutdown() {
+    let Some(env) = TestEnv::new() else { return };
+    let root = env.tmp.path().to_path_buf();
+    let config = Config {
+        max_clones: 1,
+        ..env.ctx.config()
+    };
+    let handle = start(&root, config).await;
+    let mut conn = Conn::open(&root).await;
+    conn.ok(Request::TemplateInit(template_args("main", seed(SEED))))
+        .await;
+    conn.ok(Request::CloneCreate(clone_args())).await;
+    let mut waiter = Conn::open(&root).await;
+    let queued = tokio::spawn(async move {
+        waiter
+            .send(Request::CloneCreate(CloneCreateArgs {
+                wait_secs: Some(120),
+                ..clone_args()
+            }))
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Response::Usage(u) = conn.ok(Request::Usage).await {
+            if u.queued > 0 {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the create never queued");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let started = Instant::now();
+    shutdown(&root, handle).await;
+    let reply = tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .expect("the queued create answered")
+        .unwrap();
+    assert_eq!(reply.result.unwrap_err().code, ErrorCode::DaemonUnavailable);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the drain did not wait for the queue"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.join("clones")).unwrap().count(),
+        1,
+        "no second clone was made"
+    );
+}

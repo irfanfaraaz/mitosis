@@ -22,6 +22,10 @@ const EXIT_GRACE: Duration = Duration::from_millis(500);
 /// Exit status of `mitosis daemon` when another daemon already holds the home's lock.
 pub const EXIT_ALREADY_RUNNING: u8 = 3;
 const POLL: Duration = Duration::from_millis(50);
+/// Times `ensure_daemon` starts the daemon again after the lock holder went away without binding.
+const RESPAWNS: u32 = 3;
+/// How often `ensure_daemon` asks launchd whether a kickstarted service still runs.
+const SERVICE_GRACE: Duration = Duration::from_secs(1);
 
 fn unavailable(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::DaemonUnavailable, msg)
@@ -72,12 +76,19 @@ fn mismatch(theirs: u64) -> MitosisError {
 }
 
 fn mismatch_text(theirs: Option<u64>) -> MitosisError {
+    // A newer daemon would come back as the same newer one after a restart by this older client.
+    let hint = match theirs {
+        Some(v) if v > u64::from(PROTOCOL_VERSION) => {
+            "the daemon is from a newer mitosis: run that newer binary (see `which -a mitosis`)"
+        }
+        _ => "restart the daemon: mitosis daemon stop",
+    };
     let theirs = theirs.map_or("unknown".to_string(), |v| v.to_string());
     MitosisError::new(
         ErrorCode::ProtocolMismatch,
         format!("daemon speaks protocol {theirs}, this client speaks protocol {PROTOCOL_VERSION}"),
     )
-    .with_hint("restart the daemon: mitosis daemon stop")
+    .with_hint(hint)
 }
 
 /// Sends a raw line to a daemon speaking protocol `v` and returns its parsed reply, if any.
@@ -265,6 +276,30 @@ pub async fn follow_events(
     }
 }
 
+/// Spawns `current_exe() daemon` for `home` in its own session, logging to `log_path`.
+fn spawn_daemon(home: &Home, log_path: &std::path::Path) -> Result<std::process::Child> {
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("daemon")
+        .current_dir("/")
+        .env("MITOSIS_HOME", &home.root)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(std::io::Error::from)
+        });
+    }
+    Ok(cmd.spawn()?)
+}
+
 /// Starts `current_exe() daemon` in its own session and waits until its socket accepts connections.
 pub async fn ensure_daemon(home: &Home) -> Result<()> {
     home.ensure_dirs()?;
@@ -279,30 +314,18 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
     let mut child = if kicked {
         None
     } else {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("daemon")
-            .current_dir("/")
-            .env("MITOSIS_HOME", &home.root)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
-        // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
-        unsafe {
-            cmd.pre_exec(|| {
-                nix::unistd::setsid()
-                    .map(|_| ())
-                    .map_err(std::io::Error::from)
-            });
-        }
-        Some(cmd.spawn()?)
+        Some(spawn_daemon(home, &log_path)?)
     };
 
     let mut deadline = Instant::now() + START_TIMEOUT;
     let mut exited = false;
+    // A service launchd started logs to service.log; when it is not running a moment after the
+    // kickstart (its binary is gone, say), it is not coming up.
+    let service_log = home.logs_dir().join("service.log");
+    let mut next_service_check = Instant::now() + SERVICE_GRACE;
+    // Our daemon found the lock taken; the holder has not bound the socket yet.
+    let mut lost_lock = false;
+    let mut respawns = 0;
     loop {
         if UnixStream::connect(home.daemon_sock()).await.is_ok() {
             return Ok(());
@@ -312,14 +335,37 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
                 exited = true;
                 // Lost the lock to another daemon, which may still be reconciling before it binds:
                 // keep the long wait. Any other exit is a failed start: give a racer a moment only.
-                if status.code() != Some(i32::from(EXIT_ALREADY_RUNNING)) {
+                if status.code() == Some(i32::from(EXIT_ALREADY_RUNNING)) {
+                    lost_lock = true;
+                } else {
                     deadline = deadline.min(Instant::now() + EXIT_GRACE);
                 }
             }
         }
+        // The holder let go without binding: an old daemon that removed its socket and drained,
+        // or a daemon that saw a client's lock probe. Start ours again rather than wait it out.
+        if kicked && !exited && Instant::now() >= next_service_check {
+            next_service_check = Instant::now() + SERVICE_GRACE;
+            let running =
+                tokio::task::spawn_blocking(|| service::status().is_ok_and(|s| s.running))
+                    .await
+                    .unwrap_or(true);
+            if !running {
+                exited = true;
+                deadline = deadline.min(Instant::now() + EXIT_GRACE);
+            }
+        }
+        if lost_lock && respawns < RESPAWNS && lock_free(home) {
+            child = Some(spawn_daemon(home, &log_path)?);
+            (exited, lost_lock) = (false, false);
+            respawns += 1;
+        }
         if Instant::now() >= deadline {
-            let tail = crate::pg::cluster::log_tail(&log_path, 10);
-            let why = if exited {
+            let shown = if kicked { &service_log } else { &log_path };
+            let tail = crate::pg::cluster::log_tail(shown, 10);
+            let why = if kicked && exited {
+                "the mitosis login service stopped before the daemon was ready"
+            } else if exited {
                 "the mitosis daemon exited before it was ready"
             } else {
                 "the mitosis daemon did not start within 30 s"
@@ -329,8 +375,44 @@ pub async fn ensure_daemon(home: &Home) -> Result<()> {
             } else {
                 format!("\n{tail}")
             };
-            return Err(unavailable(why).with_hint(format!("see {}{tail}", log_path.display())));
+            return Err(unavailable(why).with_hint(format!("see {}{tail}", shown.display())));
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_free_sees_a_held_daemon_lock() {
+        let tmp = tempfile::Builder::new()
+            .prefix("mt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = Home::at(tmp.path().to_path_buf());
+        assert!(lock_free(&home), "no lock file yet");
+        let f = std::fs::File::create(home.daemon_lock()).unwrap();
+        let held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        assert!(!lock_free(&home), "a daemon holds the lock");
+        drop(held);
+        assert!(lock_free(&home), "the lock was let go");
+    }
+
+    #[test]
+    fn mismatch_hint_is_not_circular_for_a_newer_daemon() {
+        let newer = mismatch_text(Some(u64::from(PROTOCOL_VERSION) + 1));
+        assert!(
+            newer.hint.as_deref().unwrap().contains("newer"),
+            "{newer:?}"
+        );
+        let older = mismatch_text(Some(1));
+        assert_eq!(
+            older.hint.as_deref(),
+            Some("restart the daemon: mitosis daemon stop")
+        );
     }
 }

@@ -351,8 +351,16 @@ async fn startup(
             .ok()
             .flatten()
             .is_some_and(|r| r.status == CloneStatus::Ready && r.port == row.port);
-        if same || tries >= 3 {
+        if same {
             break (row, tracked, close);
+        }
+        if tries >= 3 {
+            // Slept, woken or moved under this connection three times: say so rather than try
+            // a port that may not answer.
+            drop(tracked);
+            let label = row.name.as_deref().unwrap_or(&row.id);
+            let msg = format!("clone {label} is changing state; retry");
+            return refuse(&mut client, "57P03", &msg, None).await;
         }
     };
     match params.iter_mut().find(|(k, _)| k == "database") {

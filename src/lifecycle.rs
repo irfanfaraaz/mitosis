@@ -4,7 +4,7 @@ use crate::clones::{
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::events::{self, reason};
-use crate::names::is_clone_id;
+use crate::names::{is_clone_id, random_hex};
 use crate::pg::{control_state, psql, running_server, stop, ControlState, RunningPg};
 use crate::proc_util::{has_exited, is_alive, process_start_time};
 use crate::protocol::{GcFailure, GcReport};
@@ -105,7 +105,7 @@ pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
 
 /// Client backends other than this check's own session, from `pg_stat_activity`: the users of
 /// the direct port, whom the router cannot see. Blocking work runs off the runtime.
-async fn client_backends(ctx: &Ctx, row: &CloneRow) -> Result<usize> {
+pub(crate) async fn client_backends(ctx: &Ctx, row: &CloneRow) -> Result<usize> {
     let install = install_for(ctx, &row.dir).ok_or_else(|| {
         internal(format!(
             "no Postgres install found for {}",
@@ -163,7 +163,11 @@ pub(crate) async fn idle_clones(ctx: &Ctx, now: i64) -> Result<Vec<(CloneRow, i6
                     continue;
                 }
                 Err(e) => {
-                    log(ctx, &format!("idle check of clone {}: {e}", row.id));
+                    // A crashed server fails the check every pass until gc recovers it: say it once
+                    // there, not here every 30 s.
+                    if postmaster_running(&row) {
+                        log(ctx, &format!("idle check of clone {}: {e}", row.id));
+                    }
                     continue;
                 }
             }
@@ -834,7 +838,9 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
     }
 
     for (name, path) in entries(&ctx.home.sockets_dir()) {
-        let res = if is_build_socket_name(&name) {
+        let res = if diff_tag(&name, "d", "").is_some() {
+            continue; // a diff's, maybe running now; daemon start removes leftovers
+        } else if is_build_socket_name(&name) {
             // Holding the build set keeps a new build from taking its guard and reusing this folder.
             let building = ctx.building.lock().unwrap_or_else(|e| e.into_inner());
             if !building.is_empty() {
@@ -857,29 +863,26 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
         done(report, path, res);
     }
 
+    // `logs/upgrade-*` work folders: an upgrade runs as a build, so with no build running they
+    // are leftovers of a crash. The build set is held across the removal, as for build sockets.
+    for (name, path) in entries(&ctx.home.logs_dir()) {
+        if !name.starts_with("upgrade-") || !path.is_dir() {
+            continue;
+        }
+        let building = ctx.building.lock().unwrap_or_else(|e| e.into_inner());
+        if !building.is_empty() {
+            break;
+        }
+        let res = remove_path(&path);
+        drop(building);
+        done(report, path, res);
+    }
+
     let templates_dir = ctx.home.templates_dir();
     // Read guard: a commit renames a folder to `<name>@<gen>` and inserts its row under the write
     // guard, so a generation folder is never seen here without its row.
-    let _swap = ctx.template_swap.read().await;
-    // By file name: every generation folder sits directly in templates/.
-    let gen_dirs: Result<HashSet<String>> = {
-        let store = ctx.store();
-        store.list_templates().and_then(|ts| {
-            let mut dirs = HashSet::new();
-            for t in ts {
-                dirs.extend(
-                    store
-                        .list_generations(&t.name)?
-                        .into_iter()
-                        .filter_map(|g| {
-                            g.dir.file_name().map(|f| f.to_string_lossy().into_owned())
-                        }),
-                );
-            }
-            Ok(dirs)
-        })
-    };
-    let gen_dirs = match gen_dirs {
+    let swap = ctx.template_swap.read().await;
+    let gen_dirs = match generation_folders(ctx) {
         Ok(d) => d,
         Err(e) => {
             // Without the rows nothing in templates/ can be judged; leave it all for the next gc.
@@ -889,21 +892,54 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
         }
     };
     let mut leftovers = Vec::new();
+    let mut rowless = Vec::new();
     for (file, path) in entries(&templates_dir) {
         if gen_dirs.contains(&file) {
             continue;
         }
-        if let Some(l) = parse_leftover(&file) {
-            leftovers.push((l, path));
-        } else if parse_gen_dir(&file).is_some() {
-            // A generation folder with no row: a commit that crashed, or a prune that did not finish.
+        if diff_tag(&file, ".diff-", "").is_some() {
+            continue; // a diff's, maybe running now; daemon start removes leftovers
+        } else if diff_tag(&file, GC_TRASH, "").is_some() {
+            // Moved aside by a gc that stopped before removing it.
             let res = remove_data_dir(ctx, path.clone()).await;
             done(report, path, res);
+        } else if let Some(l) = parse_leftover(&file) {
+            leftovers.push((l, path));
+        } else if parse_gen_dir(&file).is_some() || migrated_rowless(ctx, &file, &path) {
+            // A generation folder with no row: a commit that crashed, or a prune that did not
+            // finish (also the plain-named folder of a v0.1 store's migrated generation).
+            rowless.push(path);
         } else {
             foreign(ctx, &path);
         }
     }
     restore_old_templates(ctx, &templates_dir, &gen_dirs, &mut leftovers, report);
+    drop(swap);
+    for path in rowless {
+        // A clone that read the row before a prune dropped it may still be copying the folder
+        // under the read guard: the write guard waits for it, and the check is repeated there.
+        // Only the rename is guarded; stopping a stray server can take a while and would stall
+        // every commit and create.
+        let moved = {
+            let _swap = ctx.template_swap.write().await;
+            let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+            match generation_folders(ctx) {
+                Ok(dirs) if file.as_ref().is_some_and(|f| dirs.contains(f)) => continue,
+                Ok(_) => {
+                    let trash = templates_dir.join(format!("{GC_TRASH}{}", random_hex(4)));
+                    std::fs::rename(&path, &trash)
+                        .map(|()| trash)
+                        .map_err(|e| internal(format!("move {} aside: {e}", path.display())))
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let res = match moved {
+            Ok(trash) => remove_data_dir(ctx, trash).await,
+            Err(e) => Err(e),
+        };
+        done(report, path, res);
+    }
     for (l, path) in leftovers {
         // A running build owns its own leftovers (its side folder, the folders its prune removes).
         let tpl = match &l {
@@ -921,6 +957,76 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
             done(report, path, res);
         }
     }
+}
+
+/// Prefix of a row-less generation folder gc moved aside to remove (`.gc-<8 hex>`).
+const GC_TRASH: &str = ".gc-";
+
+/// The file names of every generation folder the store knows (they all sit in `templates/`).
+fn generation_folders(ctx: &Ctx) -> Result<HashSet<String>> {
+    let store = ctx.store();
+    let mut dirs = HashSet::new();
+    for t in store.list_templates()? {
+        dirs.extend(
+            store
+                .list_generations(&t.name)?
+                .into_iter()
+                .filter_map(|g| g.dir.file_name().map(|f| f.to_string_lossy().into_owned())),
+        );
+    }
+    Ok(dirs)
+}
+
+/// True for `templates/<name>` named like a template that exists, holding a cluster, that no
+/// generation row names (the caller checked): a v0.1 store's migrated generation 1 whose prune
+/// crashed between dropping the row and moving the folder.
+fn migrated_rowless(ctx: &Ctx, file: &str, path: &Path) -> bool {
+    crate::names::validate_name("template", file).is_ok()
+        && path.join("PG_VERSION").is_file()
+        && ctx.store().get_template(file).ok().flatten().is_some()
+}
+
+/// The 8-hex tag of a name `diff` makes (`<prefix><tag><suffix>`), else `None`.
+fn diff_tag<'a>(name: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    name.strip_prefix(prefix)
+        .and_then(|r| r.strip_suffix(suffix))
+        .filter(|t| t.len() == 8 && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Removes what a diff left behind when the daemon crashed or stopped under it: its base folder
+/// `templates/.diff-<tag>` (stopping the server in it first), `sockets/d<tag>` and
+/// `logs/diff-<tag>.log`. Only at daemon start, before the socket binds: no diff runs then, and
+/// nothing records the running ones. Logs, never fails; returns what it removed.
+pub async fn remove_diff_leftovers(ctx: &Ctx) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let found = [
+        (ctx.home.templates_dir(), ".diff-", ""),
+        (ctx.home.sockets_dir(), "d", ""),
+        (ctx.home.logs_dir(), "diff-", ".log"),
+    ]
+    .into_iter()
+    .flat_map(|(dir, prefix, suffix)| {
+        entries(&dir)
+            .into_iter()
+            .filter(move |(name, _)| diff_tag(name, prefix, suffix).is_some())
+            .map(move |(_, path)| (path, prefix == ".diff-"))
+    })
+    .collect::<Vec<_>>();
+    for (path, base) in found {
+        let res = if base {
+            remove_data_dir(ctx, path.clone()).await
+        } else {
+            remove_path(&path)
+        };
+        match res {
+            Ok(()) => removed.push(path),
+            Err(e) => log(ctx, &format!("diff leftover {}: {e}", path.display())),
+        }
+    }
+    if !removed.is_empty() {
+        log(ctx, &format!("removed {} diff leftover(s)", removed.len()));
+    }
+    removed
 }
 
 /// A v0.1 swap that crashed between its two renames leaves `.<name>.old-*` but no `templates/<name>`.
@@ -1079,6 +1185,130 @@ mod tests {
         assert!(!row.dir.exists());
     }
 
+    #[tokio::test]
+    async fn destroy_during_wake_or_sleep_says_busy() {
+        let (_tmp, ctx) = tmp_ctx();
+        let row = fake_clone(&ctx, "cb0550c", CloneStatus::Sleeping);
+        let _m = mark(&ctx, &row.id, InFlightOp::Create).unwrap(); // what a wake or sleep holds
+        let e = destroy(&ctx, &row.id).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(
+            e.message.contains("waking or going to sleep"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("still starting"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn destroy_forgets_router_activity() {
+        let (_tmp, ctx) = tmp_ctx();
+        let row = fake_clone(&ctx, "cb0550d", CloneStatus::Ready);
+        ctx.router().last_active.insert(row.id.clone(), now());
+        destroy(&ctx, &row.id).await.unwrap();
+        assert_eq!(ctx.router().last_active(&row.id), None);
+    }
+
+    #[tokio::test]
+    async fn idle_check_of_a_dead_server_is_not_logged() {
+        let (_tmp, ctx) = tmp_ctx();
+        let row = fake_clone(&ctx, "cb0550e", CloneStatus::Ready); // no server runs
+        let idle = idle_clones(&ctx, now()).await.unwrap();
+        assert!(
+            idle.iter().all(|(r, _)| r.id != row.id),
+            "a failed check is not idle"
+        );
+        let log =
+            std::fs::read_to_string(ctx.home.logs_dir().join("daemon.log")).unwrap_or_default();
+        assert!(!log.contains("idle check"), "{log}");
+    }
+
+    #[test]
+    fn unused_reservations_are_dropped() {
+        let (_tmp, ctx) = tmp_ctx();
+        let t = now();
+        let res = |name: &str, last_used: i64| crate::state::ReservationRow {
+            name: name.into(),
+            port: 54321,
+            password: "x".repeat(32),
+            template: "main".into(),
+            last_used,
+        };
+        ctx.store()
+            .upsert_reservation(&res("old", t - RESERVATION_KEEP_SECS - 10))
+            .unwrap();
+        ctx.store()
+            .upsert_reservation(&res("recent", t - 10))
+            .unwrap();
+        drop_unused_reservations(&ctx, t);
+        assert!(ctx.store().get_reservation("old").unwrap().is_none());
+        assert!(ctx.store().get_reservation("recent").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn diff_leftovers_go_at_daemon_start_only() {
+        let (_tmp, ctx) = tmp_ctx();
+        let home = &ctx.home;
+        let base = home.templates_dir().join(".diff-0123abcd");
+        let sock = home.sockets_dir().join("d0123abcd");
+        let log = home.logs_dir().join("diff-0123abcd.log");
+        let not_diff = home.templates_dir().join(".diff-notours");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&sock).unwrap();
+        std::fs::write(&log, "x").unwrap();
+        std::fs::create_dir(&not_diff).unwrap();
+        // gc may run beside a diff: it leaves them be, and does not call them foreign.
+        reconcile(ctx.clone(), now()).await.unwrap();
+        assert!(base.is_dir() && sock.is_dir() && log.is_file());
+        let daemon_log = std::fs::read_to_string(home.logs_dir().join("daemon.log")).unwrap();
+        assert!(!daemon_log.contains("0123abcd"), "{daemon_log}");
+
+        let removed = remove_diff_leftovers(&ctx).await;
+        assert_eq!(removed.len(), 3, "{removed:?}");
+        assert!(!base.exists() && !sock.exists() && !log.exists());
+        assert!(not_diff.is_dir(), "not a name diff makes");
+    }
+
+    #[tokio::test]
+    async fn gc_removes_rowless_and_crash_leftover_folders() {
+        let (_tmp, ctx) = tmp_ctx();
+        let home = &ctx.home;
+        let src = crate::protocol::TemplateSource::Seed {
+            command: "true".into(),
+            cwd: None,
+            path: None,
+        };
+        ctx.store()
+            .insert_template(&crate::state::TemplateRow::new("old", "app", src, None, 0))
+            .unwrap();
+        // A v0.1 store's migrated generation whose prune crashed after its row went.
+        let migrated = home.templates_dir().join("old");
+        std::fs::create_dir(&migrated).unwrap();
+        std::fs::write(migrated.join("PG_VERSION"), "17\n").unwrap();
+        let rowless = home.templates_dir().join("main@3");
+        std::fs::create_dir(&rowless).unwrap();
+        let trash = home.templates_dir().join(".gc-0123abcd");
+        std::fs::create_dir(&trash).unwrap();
+        let upgrade = home.logs_dir().join("upgrade-main-1700000000");
+        std::fs::create_dir(&upgrade).unwrap();
+        // A plain folder of no template, or with no cluster in it, stays.
+        let foreign = home.templates_dir().join("notes");
+        std::fs::create_dir(&foreign).unwrap();
+
+        let report = reconcile(ctx.clone(), now()).await.unwrap();
+        for p in [&migrated, &rowless, &trash, &upgrade] {
+            assert!(!p.exists(), "{} left: {report:?}", p.display());
+            assert!(report.orphan_folders_removed.contains(p), "{report:?}");
+        }
+        assert!(foreign.is_dir());
+        let left: Vec<_> = entries(&home.templates_dir())
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.starts_with(GC_TRASH))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
     // The daemon runs these on a multi-thread runtime, so they must be Send.
     #[allow(dead_code)]
     fn futures_are_send(ctx: &'static Ctx, arc: Arc<Ctx>) {
@@ -1086,6 +1316,7 @@ mod tests {
         send(reap_expired(ctx, 0));
         send(reconcile(arc.clone(), 0));
         send(idle_pass(ctx, 0));
+        send(remove_diff_leftovers(ctx));
         send(destroy_after_parent_exit(Watch {
             ctx: arc,
             id: String::new(),

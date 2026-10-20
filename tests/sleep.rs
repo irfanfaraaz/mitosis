@@ -326,3 +326,35 @@ async fn concurrent_wakes_start_once() {
     assert_eq!(events(&env, "clone.woke", &a.id), 1);
     assert_eq!(status(&env, &a.id), "ready");
 }
+
+/// A direct-port session that opened after the idle check chose the clone stops the sleep:
+/// `sleep` looks at `pg_stat_activity` again before it stops the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn sleep_rechecks_direct_backends() {
+    let Some(env) = setup().await else { return };
+    let a = create(&env.ctx, args(None)).await.unwrap();
+    let installs = env.ctx.installs();
+    let mut busy = Command::new(newest(&installs).unwrap().bin("psql"))
+        .arg(&a.direct_url)
+        .args(["-X", "-Atc", "select pg_sleep(30)"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait until the session is in pg_stat_activity.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while psql_url(
+        &env,
+        &a.direct_url,
+        "select count(*) from pg_stat_activity where query like 'select pg_sleep%'",
+    ) == "0"
+    {
+        assert!(Instant::now() < deadline, "the session never showed up");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let e = sleep(&env.ctx, &a.id, "idle").await.unwrap_err();
+    let _ = busy.kill();
+    let _ = busy.wait();
+    assert!(e.message.contains("open connections"), "{}", e.message);
+    assert_eq!(status(&env, &a.id), "ready");
+}

@@ -84,11 +84,6 @@ async fn parent_exit_reaps() {
         &env.ctx,
         CloneCreateArgs {
             parent_pid: Some(pid),
-            fresh: false,
-            protect: false,
-            env: None,
-            wait_secs: None,
-            branch: None,
             ..args("main")
         },
     )
@@ -315,11 +310,6 @@ async fn reconcile_destroys_clone_of_dead_parent() {
         &env.ctx,
         CloneCreateArgs {
             parent_pid: Some(pid),
-            fresh: false,
-            protect: false,
-            env: None,
-            wait_secs: None,
-            branch: None,
             ..args("main")
         },
     )

@@ -293,7 +293,8 @@ struct SettingsFlags {
     /// Masking file (TOML: columns to mask, row subsets) applied to every build, or off.
     #[arg(long)]
     mask: Option<std::path::PathBuf>,
-    /// The git branch the template's checkout follows; layered builds skip on other branches.
+    /// The git branch the template's checkout follows (layered builds skip on other branches),
+    /// or off.
     #[arg(long)]
     base_branch: Option<String>,
 }
@@ -358,7 +359,8 @@ impl SettingsFlags {
             on_stale: enum_arg(self.on_stale)?,
             mask,
             mask_off,
-            base_branch: self.base_branch,
+            base_branch: self.base_branch.clone().filter(|b| b != "off"),
+            base_branch_off: self.base_branch.as_deref() == Some("off"),
         };
         Ok((max_age_secs, settings))
     }
@@ -500,6 +502,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             // No daemon start: a stopped daemon reads the file when it next starts.
             client::request_if_running(&home, Request::ConfigReload).await?;
             println!("{key} = {}", value.trim());
+            // The file is written, but an environment variable of this shell still wins.
+            if let Some((var, value)) = Config::env_override(&home, &key)? {
+                eprintln!("note: {var} is set and overrides this; the value in effect is {value}");
+            }
         }
         Cmd::Template { command } => template(&home, command).await?,
         Cmd::Pg { command } => pg(&home, command).await?,
@@ -584,6 +590,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             var,
             direct,
         } => {
+            // The printed line goes into a .env file: the same names `--env-var` accepts.
+            envfile::check_var(&var)?;
             let clones = match client::request(&home, Request::CloneList).await? {
                 Response::Clones { clones } => clones,
                 other => return Err(unexpected(other)),
@@ -598,6 +606,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     )
                     .with_hint("see running clones with `mitosis list`")
                 })?;
+            // A sleeping clone's URL works (the router wakes it); these two do not.
+            let not_usable = match c.status.as_str() {
+                "starting" => Some("is still starting; try again in a moment"),
+                "stopping" => Some("is being destroyed"),
+                _ => None,
+            };
+            if let Some(why) = not_usable {
+                return Err(MitosisError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("clone {id_or_name} {why}"),
+                ));
+            }
             println!("{var}={}", if direct { &c.direct_url } else { &c.url });
         }
         Cmd::List { json } => {
@@ -1235,11 +1255,17 @@ impl Drop for RawTerminal {
     }
 }
 
-/// Waits up to 2 s for a key; true when it asks to quit (`q` or Ctrl-C).
+/// Waits up to 2 s for a key; true when it asks to quit (`q` or Ctrl-C). Reads everything
+/// waiting at once, so a multi-byte key (an arrow) causes one redraw, not one per byte.
 fn quit_key() -> bool {
     use std::io::Read;
-    let mut b = [0u8; 1];
-    matches!(std::io::stdin().read(&mut b), Ok(1) if matches!(b[0], b'q' | b'Q' | 3))
+    let mut b = [0u8; 64];
+    matches!(std::io::stdin().read(&mut b), Ok(n) if asks_to_quit(&b[..n]))
+}
+
+/// True when the bytes read from the terminal hold `q`, `Q` or Ctrl-C.
+fn asks_to_quit(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| matches!(b, b'q' | b'Q' | 3))
 }
 
 /// `off`, `listening on 127.0.0.1:54300`, or why the router is not listening.
@@ -1326,7 +1352,30 @@ fn draw_top(u: &budget::Usage, router: &Option<crate::protocol::RouterStatus>) {
 }
 
 async fn top(home: &Home) -> Result<()> {
-    let _terminal = RawTerminal::enter()?;
+    use tokio::signal::unix::{signal, SignalKind};
+    let terminal = RawTerminal::enter()?;
+    // ISIG is off, but `kill`, a closed terminal or a logout still send these. Without a handler
+    // the process dies with the terminal left raw.
+    let sig = |k: SignalKind| {
+        signal(k).map_err(|e| MitosisError::new(ErrorCode::Internal, format!("signals: {e}")))
+    };
+    let mut term = sig(SignalKind::terminate())?;
+    let mut hup = sig(SignalKind::hangup())?;
+    let mut int = sig(SignalKind::interrupt())?;
+    let signo = tokio::select! {
+        r = top_loop(home) => return r,
+        _ = term.recv() => libc::SIGTERM,
+        _ = hup.recv() => libc::SIGHUP,
+        _ = int.recv() => libc::SIGINT,
+    };
+    drop(terminal);
+    // The usual exit status of a process ended by that signal. Exits at once: the key-reading
+    // thread may still be blocked in a read.
+    std::process::exit(128 + signo);
+}
+
+/// `top`'s draw-and-wait loop; ends on `q` or Ctrl-C.
+async fn top_loop(home: &Home) -> Result<()> {
     loop {
         let router = match client::request(home, Request::Status).await? {
             Response::Status(s) => s.router,
@@ -1494,5 +1543,17 @@ mod tests {
         assert_eq!(s.auto_migrate, Some(true));
         assert_eq!(s.on_stale, Some(crate::protocol::OnStale::Refresh));
         assert!(Cli::try_parse_from(["mitosis", "template", "set", "--mode", "fast"]).is_err());
+    }
+
+    #[test]
+    fn top_reads_a_whole_key_at_once() {
+        assert!(asks_to_quit(b"q") && asks_to_quit(b"Q") && asks_to_quit(&[3]));
+        // An arrow key is three bytes: one read, no quit.
+        assert!(!asks_to_quit(b"\x1b[A"));
+        assert!(
+            asks_to_quit(b"\x1b[Aq"),
+            "a q behind other keys still quits"
+        );
+        assert!(!asks_to_quit(b""));
     }
 }
