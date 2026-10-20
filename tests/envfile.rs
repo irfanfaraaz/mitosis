@@ -2,9 +2,10 @@ mod common;
 
 use common::*;
 use mitosis::client;
+use mitosis::clones;
 use mitosis::daemon::run;
 use mitosis::envfile::{create_clone, finish_pending, get_var};
-use mitosis::error::Result;
+use mitosis::error::{ErrorCode, Result};
 use mitosis::lifecycle::reap_expired;
 use mitosis::paths::Home;
 use mitosis::protocol::{CloneCreateArgs, CloneInfo, Request, Response};
@@ -56,20 +57,14 @@ impl Fixture {
     }
 
     async fn clone(&self, ttl_secs: u64, file: &Path) -> CloneInfo {
-        let args = CloneCreateArgs {
-            template: "main".into(),
-            name: None,
-            ttl_secs,
-            durable: false,
-            parent_pid: None,
-            fresh: false,
-            protect: false,
-            env: None,
-            wait_secs: None,
-        };
-        create_clone(&self.home, args, Some(file.to_path_buf()), None)
-            .await
-            .unwrap()
+        create_clone(
+            &self.home,
+            args(None, ttl_secs),
+            Some(file.to_path_buf()),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn destroy(&self, id: &str) {
@@ -87,6 +82,27 @@ impl Fixture {
     async fn stop(self) {
         let _ = client::request(&self.home, Request::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(30), self.daemon).await;
+    }
+}
+
+fn args(name: Option<&str>, ttl_secs: u64) -> CloneCreateArgs {
+    CloneCreateArgs {
+        template: "main".into(),
+        name: name.map(String::from),
+        ttl_secs,
+        durable: false,
+        parent_pid: None,
+        fresh: false,
+        protect: false,
+        env: None,
+        wait_secs: None,
+    }
+}
+
+fn fresh(name: &str) -> CloneCreateArgs {
+    CloneCreateArgs {
+        fresh: true,
+        ..args(Some(name), 7200)
     }
 }
 
@@ -233,5 +249,117 @@ async fn git_warning_when_not_ignored() {
         "{:?}",
         b.warnings
     );
+    fx.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_restore_is_finished_before_a_new_create_reads_the_file() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let file = fx.dotenv("DATABASE_URL=old\n");
+    let a = create_clone(&fx.home, args(Some("x"), 1), Some(file.clone()), None)
+        .await
+        .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(
+        reap_expired(&fx.env.ctx, now() + 5).await.unwrap(),
+        vec![a.id]
+    );
+    assert_eq!(fx.env.ctx.store().list_pending_restores().unwrap().len(), 1);
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Same name, so the same URL the pending restore looks for.
+    let b = create_clone(&fx.home, args(Some("x"), 7200), Some(file.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(b.url, a.url);
+    assert_eq!(
+        get_var(&read(&file), "DATABASE_URL").as_deref(),
+        Some(&*b.url)
+    );
+    fx.destroy(&b.id).await;
+    assert_eq!(read(&file), "DATABASE_URL=old\n");
+    fx.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_without_env_file_keeps_env_on_the_clone() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let file = fx.dotenv("DATABASE_URL=old\n");
+    let a = create_clone(&fx.home, args(Some("x"), 7200), Some(file.clone()), None)
+        .await
+        .unwrap();
+    let b = create_clone(&fx.home, fresh("x"), None, None)
+        .await
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(a.url, b.url);
+    assert_eq!(
+        get_var(&read(&file), "DATABASE_URL").as_deref(),
+        Some(&*b.url)
+    );
+    fx.destroy(&b.id).await;
+    assert_eq!(read(&file), "DATABASE_URL=old\n");
+    fx.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_with_missing_template_keeps_the_old_clone() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let file = fx.dotenv("DATABASE_URL=old\n");
+    let a = create_clone(&fx.home, args(Some("x"), 7200), Some(file.clone()), None)
+        .await
+        .unwrap();
+    let e = create_clone(
+        &fx.home,
+        CloneCreateArgs {
+            template: "mian".into(),
+            ..fresh("x")
+        },
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::TemplateNotFound);
+    let row = fx.env.ctx.store().get_clone("x").unwrap().unwrap();
+    assert_eq!(row.id, a.id, "the old clone was not destroyed");
+    assert_eq!(
+        get_var(&read(&file), "DATABASE_URL").as_deref(),
+        Some(&*a.url)
+    );
+    fx.destroy(&a.id).await;
+    assert_eq!(read(&file), "DATABASE_URL=old\n");
+    fx.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_failing_after_destroy_leaves_a_pending_restore() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let file = fx.dotenv("DATABASE_URL=old\n");
+    let a = create_clone(&fx.home, args(Some("x"), 7200), Some(file.clone()), None)
+        .await
+        .unwrap();
+    // The test's own Ctx shares the daemon's state.db; this setting makes the create fail at its
+    // disk check, after the old clone was destroyed.
+    let mut cfg = fx.env.ctx.config();
+    cfg.min_free_bytes = u64::MAX;
+    fx.env.ctx.set_config(cfg);
+    let e = clones::create(&fx.env.ctx, fresh("x")).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::LowDisk);
+    assert!(fx.env.ctx.store().get_clone(&a.id).unwrap().is_none());
+    let pending = fx.env.ctx.store().list_pending_restores().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].url, a.url);
+
+    assert!(finish_pending(&fx.home).await.is_empty());
+    assert_eq!(read(&file), "DATABASE_URL=old\n");
     fx.stop().await;
 }

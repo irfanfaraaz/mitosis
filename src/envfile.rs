@@ -23,8 +23,6 @@ fn invalid(msg: impl Into<String>) -> MitosisError {
 struct Found {
     /// Start of the line.
     start: usize,
-    /// Start of the variable name (after indent and `export `).
-    var_pos: usize,
     /// Just after the `=`.
     value_start: usize,
     /// End of the line's text, before `\r\n` / `\n`.
@@ -33,20 +31,16 @@ struct Found {
     end: usize,
 }
 
-/// `^\s*(export\s+)?VAR\s*=` on one line; returns `(var_pos, value_start)`.
-fn match_line(text: &str, start: usize, content_end: usize, var: &str) -> Option<(usize, usize)> {
-    let line = &text[start..content_end];
-    let mut rest = line.trim_start();
-    let mut pos = start + (line.len() - rest.len());
+/// `^\s*(export\s+)?VAR\s*=` on one line; returns the offset just after the `=`.
+fn match_line(text: &str, start: usize, content_end: usize, var: &str) -> Option<usize> {
+    let mut rest = text[start..content_end].trim_start();
     if let Some(r) = rest.strip_prefix("export") {
         if r.starts_with(char::is_whitespace) {
-            let r = r.trim_start();
-            pos += rest.len() - r.len();
-            rest = r;
+            rest = r.trim_start();
         }
     }
     let after = rest.strip_prefix(var)?.trim_start().strip_prefix('=')?;
-    Some((pos, content_end - after.len()))
+    Some(content_end - after.len())
 }
 
 fn find(text: &str, var: &str) -> Option<Found> {
@@ -58,10 +52,9 @@ fn find(text: &str, var: &str) -> Option<Found> {
         if text[start..content_end].ends_with('\r') {
             content_end -= 1;
         }
-        if let Some((var_pos, value_start)) = match_line(text, start, content_end, var) {
+        if let Some(value_start) = match_line(text, start, content_end, var) {
             return Some(Found {
                 start,
-                var_pos,
                 value_start,
                 content_end,
                 end,
@@ -100,13 +93,14 @@ fn set_raw(text: &str, var: &str, raw: &str) -> String {
     }
 }
 
-/// Sets the first `VAR=` line (keeping indent and `export `), or appends one. The value is
-/// written as it is: a clone URL needs no quoting.
+/// Sets the first `VAR=` line (keeping everything up to and including the `=`, so a restore of
+/// the raw value gives back the identical line), or appends one. The value is written as it is: a
+/// clone URL needs no quoting.
 pub fn set_var(text: &str, var: &str, value: &str) -> String {
     if let Some(f) = find(text, var) {
         return format!(
-            "{}{var}={value}{}",
-            &text[..f.var_pos],
+            "{}{value}{}",
+            &text[..f.value_start],
             &text[f.content_end..]
         );
     }
@@ -274,15 +268,17 @@ pub async fn create_clone(
     env_file: Option<PathBuf>,
     env_var: Option<String>,
 ) -> Result<CloneInfo> {
-    args.env = match (env_file, env_var) {
-        (Some(f), v) => Some(env_target(f, v)?),
-        (None, Some(_)) => return Err(invalid("an env variable needs an env file")),
-        (None, None) => None,
+    if env_file.is_none() && env_var.is_some() {
+        return Err(invalid("an env variable needs an env file"));
+    }
+    // Before `env_target` reads `previous`: a restore left by a dead clone must put the user's
+    // value back first, or the dead clone's URL is recorded as `previous` and the value is lost.
+    let mut pending = finish_pending(home).await;
+    args.env = match env_file {
+        Some(f) => Some(env_target(f, env_var)?),
+        None => None,
     };
     let env = args.env.clone();
-    // Before this create writes the file: a restore left by a dead clone must see the value the
-    // clone put there, not the new URL, or the user's own value is lost.
-    let mut pending = finish_pending(home).await;
     let mut info = match client::request(home, Request::CloneCreate(args)).await? {
         Response::CloneCreated(info) => info,
         // Not the reply itself: it holds a password-bearing URL.
@@ -395,8 +391,19 @@ mod tests {
         assert_eq!(get_var(t, "DATABASE_URL").as_deref(), Some("old"));
         assert_eq!(
             set_var(t, "DATABASE_URL", "new"),
-            "  export DATABASE_URL=new\n"
+            "  export DATABASE_URL =new\n"
         );
+    }
+
+    #[test]
+    fn env_restore_keeps_spaces_around_equals() {
+        let original = "A=1\n  export DATABASE_URL = old # c\nB=2\n";
+        let previous = get_raw(original, "DATABASE_URL");
+        let url = "postgres://postgres:pw@127.0.0.1:54321/app";
+        let written = set_var(original, "DATABASE_URL", url);
+        assert_eq!(get_var(&written, "DATABASE_URL").as_deref(), Some(url));
+        let restored = set_raw(&written, "DATABASE_URL", previous.as_deref().unwrap());
+        assert_eq!(restored, original);
     }
 
     #[test]
@@ -428,6 +435,7 @@ mod tests {
             ("DATABASE_URL=\"a b # c\"", "\n"),
             ("DATABASE_URL=x # comment", "\n"),
             ("export DATABASE_URL='q' # c", "\r\n"),
+            ("export DATABASE_URL = old", "\n"),
             ("DATABASE_URL=", "\r\n"),
         ] {
             let original = format!("A=1{eol}{line}{eol}B=2{eol}");

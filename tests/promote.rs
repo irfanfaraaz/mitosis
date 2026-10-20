@@ -56,6 +56,28 @@ async fn promote_creates_generation_and_clone_keeps_url() {
 }
 
 #[tokio::test]
+async fn promote_refuses_a_suspect_clone() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(v text)").await;
+    let c = create(
+        &env.ctx,
+        CloneCreateArgs {
+            name: Some("s".into()),
+            ..clone_args("main")
+        },
+    )
+    .await
+    .unwrap();
+    let mut row = env.ctx.store().get_clone(&c.id).unwrap().unwrap();
+    row.suspect = true;
+    env.ctx.store().update_clone(&row).unwrap();
+    let e = promote(&env.ctx, &c.id, None).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.hint.unwrap_or_default().contains("--fresh"));
+    assert_eq!(history(&env.ctx, "main").unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn promote_to_new_template() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", "create table t(v text)").await;

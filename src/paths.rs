@@ -95,9 +95,11 @@ impl Home {
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| n != ".DS_Store")
                 .collect();
-            // Own-named entries alone (say a stray `clones/`) don't prove the folder is ours.
+            // Own-named entries alone (say a stray `clones/`) don't prove the folder is ours; a
+            // hand-written `config.toml` alone (set up before the first run) does not make it foreign.
             let has_db = names.iter().any(|n| n == "state.db");
-            let mut foreign: Vec<String> = if !names.is_empty() && !has_db {
+            let only_config = names.iter().all(|n| n == "config.toml");
+            let mut foreign: Vec<String> = if !only_config && !has_db {
                 names
             } else {
                 names
@@ -215,6 +217,20 @@ mod tests {
         let e = h.ensure_dirs().unwrap_err();
         assert_eq!(e.code, ErrorCode::ForeignHome);
         assert!(!h.marker().exists());
+    }
+
+    #[test]
+    fn root_with_only_config_toml_is_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Home::at(tmp.path().join("m"));
+        std::fs::create_dir(&h.root).unwrap();
+        std::fs::write(h.config_file(), "max_clones = 4\n").unwrap();
+        h.ensure_dirs().unwrap();
+        assert!(h.marker().is_file());
+        assert_eq!(
+            std::fs::read_to_string(h.config_file()).unwrap(),
+            "max_clones = 4\n"
+        );
     }
 
     #[test]

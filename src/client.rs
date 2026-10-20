@@ -92,6 +92,14 @@ async fn raw_exchange(home: &Home, line: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&buf).ok()
 }
 
+/// True when no daemon holds the home's lock. Taken and dropped at once (the drop unlocks).
+fn lock_free(home: &Home) -> bool {
+    match std::fs::File::open(home.daemon_lock()) {
+        Ok(f) => nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok(),
+        Err(_) => true,
+    }
+}
+
 /// Shuts down a daemon that speaks the older protocol `v` and waits until its socket is gone.
 async fn replace_old(home: &Home, v: u64) -> Result<()> {
     // The shutdown request is the one message every version understands.
@@ -103,9 +111,12 @@ async fn replace_old(home: &Home, v: u64) -> Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
     let probe = format!(r#"{{"v":{PROTOCOL_VERSION},"request":{{"type":"status"}}}}"#);
     loop {
-        // Done when nothing answers, or a daemon of our version (a concurrent client replaced it).
+        // Done when nothing answers and the lock is free, or a daemon of our version answers (a
+        // concurrent client replaced it). The old daemon removes its socket before it drains its
+        // work and drops the lock; a daemon spawned before that would exit as already running.
         match raw_exchange(home, &probe).await {
-            None => return Ok(()),
+            None if lock_free(home) => return Ok(()),
+            None => {}
             Some(r) if r["v"].as_u64() >= Some(u64::from(PROTOCOL_VERSION)) => return Ok(()),
             Some(_) => {}
         }

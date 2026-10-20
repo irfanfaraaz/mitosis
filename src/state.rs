@@ -708,24 +708,6 @@ impl Store {
         Ok(())
     }
 
-    /// Drops the one record for `file` and `var` and returns its `previous`: a `--fresh` create
-    /// takes over the entry, so the destroy of the old clone must not restore it.
-    pub fn take_env_record(
-        &self,
-        clone_id: &str,
-        file: &Path,
-        var: &str,
-    ) -> Result<Option<Option<String>>> {
-        Ok(self
-            .conn
-            .query_row(
-                "DELETE FROM env_records WHERE clone_id = ?1 AND file = ?2 AND var = ?3 RETURNING previous",
-                params![clone_id, file.to_string_lossy(), var],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?)
-    }
-
     pub fn add_pending_restore(&self, rec: &PendingRestore) -> Result<()> {
         self.conn.execute(
             "INSERT INTO pending_restores (file, var, previous, url) VALUES (?1,?2,?3,?4)",

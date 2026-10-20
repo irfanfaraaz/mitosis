@@ -111,7 +111,7 @@ async fn reconcile_adopts_live_clone() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
     let a = create(&env.ctx, args("main")).await.unwrap();
-    let report = reconcile(restarted(&env), now(), None).await.unwrap();
+    let report = reconcile(restarted(&env), now()).await.unwrap();
     assert_eq!(report.adopted, vec![a.id.clone()]);
     assert!(report.destroyed.is_empty() && report.records_dropped.is_empty());
     assert!(
@@ -141,7 +141,7 @@ async fn reconcile_removes_orphan_folder() {
         std::fs::create_dir(d).unwrap();
     }
 
-    let report = reconcile(ctx.clone(), now(), None).await.unwrap();
+    let report = reconcile(ctx.clone(), now()).await.unwrap();
     for p in [&orphan, &sock, &build_sock, &building, &old] {
         assert!(
             report.orphan_folders_removed.contains(p),
@@ -175,7 +175,7 @@ async fn gc_leaves_foreign_entries_alone() {
     let hidden = ctx.home.templates_dir().join(".main.backup-1");
     std::fs::create_dir(&hidden).unwrap();
 
-    let report = reconcile(ctx.clone(), now(), None).await.unwrap();
+    let report = reconcile(ctx.clone(), now()).await.unwrap();
     assert!(report.orphan_folders_removed.is_empty(), "{report:?}");
     for p in [&repo.join("README.md"), &file, &sock_file, &hidden] {
         assert!(p.exists(), "{} was removed", p.display());
@@ -225,7 +225,7 @@ async fn reconcile_restores_template_from_old_folder() {
     std::fs::create_dir(t.join("other")).unwrap();
     std::fs::create_dir(t.join(".other.old-3")).unwrap();
 
-    let report = reconcile(ctx.clone(), now(), None).await.unwrap();
+    let report = reconcile(ctx.clone(), now()).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(t.join("main/PG_VERSION")).unwrap(),
         "newest"
@@ -256,7 +256,7 @@ async fn reconcile_drops_record_without_folder() {
     )
     .unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
-    let report = reconcile(restarted(&env), now(), None).await.unwrap();
+    let report = reconcile(restarted(&env), now()).await.unwrap();
     assert_eq!(report.records_dropped, vec![a.id.clone()]);
     assert!(report.destroyed.is_empty() && report.adopted.is_empty());
     assert!(list(&env.ctx).unwrap().is_empty());
@@ -296,7 +296,7 @@ async fn reconcile_undoes_half_created() {
         .clone_dir(&env.ctx.home.templates_dir().join("main@1"), &dir)
         .unwrap();
 
-    let report = reconcile(restarted(&env), now(), None).await.unwrap();
+    let report = reconcile(restarted(&env), now()).await.unwrap();
     assert_eq!(report.destroyed, vec![id.clone()]);
     assert!(!dir.exists());
     assert!(env.ctx.store().get_clone(&id).unwrap().is_none());
@@ -322,7 +322,7 @@ async fn reconcile_destroys_clone_of_dead_parent() {
     .await
     .unwrap();
     kill(child);
-    let report = reconcile(restarted(&env), now(), None).await.unwrap();
+    let report = reconcile(restarted(&env), now()).await.unwrap();
     assert_eq!(report.destroyed, vec![a.id.clone()]);
     assert!(report.adopted.is_empty());
     assert!(!env.ctx.home.clones_dir().join(&a.id).exists());

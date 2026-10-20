@@ -222,7 +222,7 @@ A daemon started by launchd does not get your terminal's access to `~/Documents`
 
 ## Reboot recovery and suspect clones
 
-After a reboot, Mitosis starts again named clones, protected clones and parentless CLI clones that are still inside their TTL, on the same folder, port and password. Clones whose session is gone are destroyed.
+After a reboot, or when a clone's server dies (a full disk, a manual stop), Mitosis starts again named clones, protected clones and parentless CLI clones that are still inside their TTL, on the same folder, port and password. Clones whose session is gone are destroyed.
 
 Before restarting, it reads the cluster's control state. A clone that did not shut down cleanly and ran with `fsync=off` is *suspect*. An unnamed suspect clone is destroyed. A named one is started and marked `suspect` in `list --json`, in the clone reply and in `doctor`. Reset it with `mitosis clone --name <x> --fresh`. Durable clones use normal Postgres crash recovery and are not suspect.
 
@@ -243,7 +243,7 @@ It works even when the daemon cannot start. Each check is `ok`, `warn` or `fail`
 - free disk against `min_free_disk`
 - templates: stale, migrations changed, last refresh error, paused
 - suspect clones, orphan folders and stale rows (a read-only look, nothing is deleted)
-- `.env` files that still point at a destroyed clone, and pending restores
+- `.env` records whose clone is gone, and pending restores
 - the macOS privacy case above
 
 The exit code is 1 when any check fails. `--fix` does two safe things only: it finishes pending `.env` restores and runs `gc`. Everything else is a printed hint.
@@ -255,6 +255,8 @@ Nothing to do by hand.
 - The store migrates by itself on first use, in one transaction. Existing templates become generation 1.
 - The first 0.2 command replaces a running 0.1 daemon (the protocol is v2). If the old daemon cannot be stopped, the error tells you how.
 - Your 0.1 templates and clones keep working.
+- A `mitosis mcp` server started by 0.1 keeps the old code: its tool calls fail with `protocol_mismatch` until you restart the agent session. Its clones survive.
+- 0.2 migrates the store, and 0.1 cannot read it afterwards. There is no downgrade.
 
 ## How it works
 

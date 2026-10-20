@@ -288,12 +288,12 @@ async fn gc_keeps_reservation_of_running_clone() {
     let mut r = env.ctx.store().get_reservation("x").unwrap().unwrap();
     r.last_used = now() - 31 * 86_400;
     env.ctx.store().upsert_reservation(&r).unwrap();
-    mitosis::lifecycle::reconcile(env.ctx.clone(), now(), None)
+    mitosis::lifecycle::reconcile(env.ctx.clone(), now())
         .await
         .unwrap();
     assert!(env.ctx.store().get_reservation("x").unwrap().is_some());
     destroy(&env.ctx, "x").await.unwrap();
-    mitosis::lifecycle::reconcile(env.ctx.clone(), now(), None)
+    mitosis::lifecycle::reconcile(env.ctx.clone(), now())
         .await
         .unwrap();
     assert!(env.ctx.store().get_reservation("x").unwrap().is_none());

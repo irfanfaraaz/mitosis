@@ -323,7 +323,7 @@ async fn crashed_build_leaves_no_generation() {
     drop(ctx); // the daemon dies mid-build
 
     let ctx = Arc::new(Ctx::open(home(), Config::default()).unwrap());
-    let report = reconcile(ctx.clone(), now(), None).await.unwrap();
+    let report = reconcile(ctx.clone(), now()).await.unwrap();
     assert!(report.orphan_folders_removed.contains(&side), "{report:?}");
     assert!(side_folders(&ctx).is_empty());
     let store = ctx.store();

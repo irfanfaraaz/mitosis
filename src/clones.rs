@@ -93,7 +93,50 @@ pub fn suspect_warning(row: &CloneRow) -> String {
 
 pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneInfo> {
     let started = Instant::now();
-    let mut info = create_inner(ctx, &mut args).await?;
+    // The `.env` records a `--fresh` took from the clone it destroyed.
+    let mut taken = Vec::new();
+    let mut info = match create_inner(ctx, &mut args, &mut taken).await {
+        Ok(info) => info,
+        Err(e) => {
+            // The old clone is gone and its files still hold its URL: the next client command
+            // puts the user's values back.
+            for rec in &taken {
+                if let Err(pe) = ctx.store().add_pending_restore(rec) {
+                    log(ctx, &format!("pending restore of {}: {pe}", rec.var));
+                }
+            }
+            return Err(e);
+        }
+    };
+    // The new clone takes over the old one's entries, each keeping the user's `previous`; the one
+    // named by `args.env` is recorded below.
+    for mut rec in taken {
+        if args
+            .env
+            .as_ref()
+            .is_some_and(|t| t.file == rec.file && t.var == rec.var)
+        {
+            continue;
+        }
+        if rec.url != info.url {
+            match envfile::rewrite(&rec.file, &rec.var, &rec.url, &info.url) {
+                Ok(_) => rec.url = info.url.clone(),
+                // The file still holds the old URL, which is what a later restore looks for.
+                Err(e) => info.warnings.push(format!(
+                    "could not update {} in {}: {}",
+                    rec.var,
+                    rec.file.display(),
+                    e.message
+                )),
+            }
+        }
+        if let Err(e) = ctx.store().add_env_record(&info.id, &rec) {
+            info.warnings.push(format!(
+                "could not remember the .env entry, so it will not be restored: {}",
+                e.message
+            ));
+        }
+    }
     // Also for a reused or `--fresh` clone: the client writes its URL into the file either way.
     if let Some(t) = &args.env {
         let rec = PendingRestore {
@@ -115,11 +158,12 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
 }
 
 /// A named create when a clone of that name exists: its info if it can be reused (`existing`),
-/// an error if not, `None` after `--fresh` destroyed it.
+/// an error if not, `None` after `--fresh` destroyed it (its `.env` records are then in `taken`).
 async fn reuse_named(
     ctx: &Arc<Ctx>,
     name: &str,
     args: &mut CloneCreateArgs,
+    taken: &mut Vec<PendingRestore>,
 ) -> Result<Option<CloneInfo>> {
     let found = ctx
         .store()
@@ -145,32 +189,34 @@ async fn reuse_named(
             return Err(invalid(format!("clone {name} is protected"))
                 .with_hint(format!("mitosis destroy {name} --force")));
         }
-        // The new clone takes over the .env entry, so the old one must not restore it: its
+        // Checked before the destroy, so a typo or a missing install does not cost the old clone.
+        let (_, gen) = ctx
+            .store()
+            .current(&args.template)?
+            .ok_or_else(|| template_missing(&args.template))?;
+        let install = ctx.install_major(gen.pg_major).await?;
+        let ext = gen.extensions.clone();
+        blocking(move || check_extensions(&install, &ext)).await?;
+        // The new clone takes over all .env entries, so the old one must not restore them: their
         // `previous` is the user's value, the one to put back when the new clone goes.
-        let taken = match &mut args.env {
-            Some(t) => {
-                let prev = ctx.store().take_env_record(&row.id, &t.file, &t.var)?;
-                if let Some(p) = &prev {
-                    t.previous = p.clone();
-                }
-                prev.map(|p| (t.clone(), p))
-            }
-            None => None,
+        let recs = {
+            let store = ctx.store();
+            let recs = store.env_records(&row.id)?;
+            store.delete_env_records(&row.id)?;
+            recs
         };
+        if let Some(t) = &mut args.env {
+            if let Some(r) = recs.iter().find(|r| r.file == t.file && r.var == t.var) {
+                t.previous = r.previous.clone();
+            }
+        }
         if let Err(e) = destroy(ctx, &row.id).await {
-            if let Some((t, previous)) = taken {
-                let url = to_info(&row, 0).url;
-                let rec = PendingRestore {
-                    id: 0,
-                    file: t.file,
-                    var: t.var,
-                    previous,
-                    url,
-                };
-                let _ = ctx.store().add_env_record(&row.id, &rec);
+            for rec in &recs {
+                let _ = ctx.store().add_env_record(&row.id, rec);
             }
             return Err(e);
         }
+        *taken = recs;
         return Ok(None);
     }
     if row.template != args.template {
@@ -227,7 +273,11 @@ fn template_missing(name: &str) -> MitosisError {
     .with_hint(format!("mitosis template init {name} --seed \"…\""))
 }
 
-async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<CloneInfo> {
+async fn create_inner(
+    ctx: &Arc<Ctx>,
+    args: &mut CloneCreateArgs,
+    taken: &mut Vec<PendingRestore>,
+) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
         validate_name("clone", name)?;
     }
@@ -239,7 +289,7 @@ async fn create_inner(ctx: &Arc<Ctx>, args: &mut CloneCreateArgs) -> Result<Clon
         return Err(invalid("ttl must be greater than zero"));
     }
     if let Some(name) = args.name.clone() {
-        if let Some(info) = reuse_named(ctx, &name, args).await? {
+        if let Some(info) = reuse_named(ctx, &name, args, taken).await? {
             return Ok(info);
         }
     }

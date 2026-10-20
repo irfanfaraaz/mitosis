@@ -1095,9 +1095,7 @@ async fn start_build_server(
                     .map_err(at("start"))?;
                 let _ = std::fs::remove_dir(&opts.socket_dir);
                 tried.insert(opts.port);
-                let leased = ctx.store().leased_ports().map_err(at("start"))?;
-                opts.port = pick_port(ctx.config().port_range, &leased, &tried, &HashSet::new())
-                    .map_err(at("start"))?;
+                opts.port = build_port(ctx, &tried).map_err(at("start"))?;
                 opts.socket_dir = build_socket_dir(ctx, opts.port);
             }
             Err(e) => return Err(("start", e)),
@@ -1377,18 +1375,22 @@ async fn layered_steps(
     extensions_and_stop(ctx, install, dir, opts, database, pg).await
 }
 
+/// A free port for a build server, skipping `skip`. Reserved ports too: a named clone's stable URL
+/// must not lose its port to a build server.
+fn build_port(ctx: &Ctx, skip: &HashSet<u16>) -> Result<u16> {
+    let (leased, reserved) = {
+        let store = ctx.store();
+        (store.leased_ports()?, store.reserved_ports()?)
+    };
+    pick_port(ctx.config().port_range, &leased, skip, &reserved)
+}
+
 /// Options for a private build server of `name` on a free port. Truncates the build log, so an
 /// error tail belongs to this build.
 fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
     let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
     std::fs::File::create(&log)?;
-    let leased = ctx.store().leased_ports()?;
-    let port = pick_port(
-        ctx.config().port_range,
-        &leased,
-        &HashSet::new(),
-        &HashSet::new(),
-    )?;
+    let port = build_port(ctx, &HashSet::new())?;
     Ok(StartOptions {
         port,
         socket_dir: build_socket_dir(ctx, port),
@@ -1563,6 +1565,32 @@ fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_port_skips_reserved_ports() {
+        let tmp = tempfile::Builder::new()
+            .prefix("mt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        // A random 20-port slice of 55000-59999, so parallel tests rarely meet.
+        let lo = 55_000 + u16::from_str_radix(&random_hex(2), 16).unwrap() % 250 * 20;
+        let config = crate::ctx::Config {
+            port_range: lo..=lo + 19,
+            ..crate::ctx::Config::default()
+        };
+        let ctx = Ctx::open(crate::paths::Home::at(tmp.path().to_path_buf()), config).unwrap();
+        let lowest = build_port(&ctx, &HashSet::new()).unwrap();
+        ctx.store()
+            .upsert_reservation(&crate::state::ReservationRow {
+                name: "x".into(),
+                port: lowest,
+                password: "pw".into(),
+                template: "main".into(),
+                last_used: 0,
+            })
+            .unwrap();
+        assert_ne!(build_port(&ctx, &HashSet::new()).unwrap(), lowest);
+    }
 
     // Built at runtime so no `scheme://user:password@host` literal sits in the source.
     fn url(scheme: &str, user: &str, pass: &str, rest: &str) -> String {

@@ -272,8 +272,7 @@ async fn destroy_after_parent_exit(watch: Watch) {
 /// Brings the store and the home folder back in line after a crash; safe while requests are served.
 /// Clones with an in-flight create and templates with a running build are left alone.
 /// A failure on one entry is logged to `logs/daemon.log` and the rest still run.
-/// `boot_time` (`proc_util::boot_time()`) tells which dead servers died in a reboot.
-pub async fn reconcile(ctx: Arc<Ctx>, now: i64, boot_time: Option<i64>) -> Result<GcReport> {
+pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
     let mut report = GcReport::default();
     let ids: Vec<String> = ctx
         .store()
@@ -290,31 +289,36 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64, boot_time: Option<i64>) -> Resul
             Some(row) if row.id == id => row,
             _ => continue,
         };
-        if let Err(e) = reconcile_clone(&ctx, &row, now, boot_time, &mut report).await {
+        if let Err(e) = reconcile_clone(&ctx, &row, now, &mut report).await {
             log(&ctx, &format!("gc: clone {id}: {e}"));
             failed(&mut report, id, &e);
         }
     }
     remove_orphans(&ctx, &mut report).await;
+    drop_unused_reservations(&ctx, now);
+    Ok(report)
+}
+
+/// Drops name reservations unused for 30 days whose name has no clone; logs, never fails. Run by
+/// gc and, for a long-running daemon, once a day by the reaper.
+pub fn drop_unused_reservations(ctx: &Ctx, now: i64) {
     match ctx
         .store()
         .drop_stale_reservations(now.saturating_sub(RESERVATION_KEEP_SECS))
     {
         Ok(names) if !names.is_empty() => log(
-            &ctx,
+            ctx,
             &format!("gc: dropped unused reservations: {}", names.join(", ")),
         ),
-        Err(e) => log(&ctx, &format!("gc: reservations: {e}")),
+        Err(e) => log(ctx, &format!("gc: reservations: {e}")),
         _ => {}
     }
-    Ok(report)
 }
 
 async fn reconcile_clone(
     ctx: &Arc<Ctx>,
     row: &CloneRow,
     now: i64,
-    boot_time: Option<i64>,
     report: &mut GcReport,
 ) -> Result<()> {
     let dir = ctx.home.clones_dir().join(&row.id);
@@ -328,9 +332,11 @@ async fn reconcile_clone(
         return Ok(());
     }
     let running = row.status == CloneStatus::Ready && postmaster_running(row);
-    let rebooted = boot_time.is_some_and(|b| row.pg_start_time.is_some_and(|t| (t as i64) < b));
-    if row.status == CloneStatus::Ready && !running && rebooted {
-        return recover_after_reboot(ctx, row, now, report).await;
+    // Whether the machine rebooted or the server just died (a full disk, a manual stop, a
+    // logout), a clone someone may want back is restarted, never destroyed outright.
+    let kept = row.name.is_some() || row.protected || row.parent_pid.is_none();
+    if row.status == CloneStatus::Ready && !running && kept {
+        return recover_dead(ctx, row, now, report).await;
     }
     let keep = running
         && row.expires_at > now
@@ -363,10 +369,11 @@ async fn drop_clone(ctx: &Ctx, row: &CloneRow, report: &mut GcReport) -> Result<
     Ok(())
 }
 
-/// A Ready clone whose server died in a reboot. Named, protected and parentless clones are
-/// restarted; a non-durable one that did not shut down cleanly is suspect (fsync was off), and
-/// a suspect clone without a name is destroyed instead. Everything else is destroyed as in v0.1.
-async fn recover_after_reboot(
+/// A named, protected or parentless Ready clone whose server is gone (a reboot or a crash). It is
+/// restarted; a non-durable one that did not shut down cleanly is suspect (fsync was off), and a
+/// suspect clone without a name is destroyed instead, as is an expired one or one whose parent
+/// exited.
+async fn recover_dead(
     ctx: &Arc<Ctx>,
     row: &CloneRow,
     now: i64,
@@ -375,8 +382,7 @@ async fn recover_after_reboot(
     let parent_gone = row
         .parent_pid
         .is_some_and(|p| !parent_alive(p, row.parent_start_time));
-    let kept = row.name.is_some() || row.protected || row.parent_pid.is_none();
-    if parent_gone || !kept || row.expires_at <= now {
+    if parent_gone || row.expires_at <= now {
         return drop_clone(ctx, row, report).await;
     }
     let Ok(mark) = mark(ctx, &row.id, InFlightOp::Create) else {
@@ -739,7 +745,7 @@ mod tests {
         let (_tmp, ctx) = tmp_ctx();
         let row = fake_clone(&ctx, "cb0550a", CloneStatus::Creating);
         let m = mark(&ctx, &row.id, InFlightOp::Create).unwrap();
-        let report = reconcile(ctx.clone(), now(), None).await.unwrap();
+        let report = reconcile(ctx.clone(), now()).await.unwrap();
         assert!(
             report.destroyed.is_empty() && report.orphan_folders_removed.is_empty(),
             "{report:?}"
@@ -747,7 +753,7 @@ mod tests {
         assert!(row.dir.is_dir() && ctx.store().get_clone(&row.id).unwrap().is_some());
 
         drop(m); // the create "crashed": now it is debris
-        let report = reconcile(ctx.clone(), now(), None).await.unwrap();
+        let report = reconcile(ctx.clone(), now()).await.unwrap();
         assert_eq!(report.destroyed, vec![row.id.clone()]);
         assert!(!row.dir.exists() && ctx.store().get_clone(&row.id).unwrap().is_none());
     }
@@ -789,7 +795,7 @@ mod tests {
     fn futures_are_send(ctx: &'static Ctx, arc: Arc<Ctx>) {
         fn send<T: Send>(_: T) {}
         send(reap_expired(ctx, 0));
-        send(reconcile(arc.clone(), 0, None));
+        send(reconcile(arc.clone(), 0));
         send(destroy_after_parent_exit(Watch {
             ctx: arc,
             id: String::new(),

@@ -22,6 +22,8 @@ use tokio::sync::{mpsc, watch};
 
 const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(10);
 const REAP_EVERY: Duration = Duration::from_secs(30);
+/// Seconds between drops of unused name reservations by a long-running daemon (gc also does it).
+const RESERVATIONS_EVERY_SECS: i64 = 24 * 3600;
 /// Longest request line accepted; a longer one closes the connection.
 const MAX_LINE: usize = 1 << 20;
 
@@ -88,7 +90,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
             home.root.display()
         ),
     );
-    match lifecycle::reconcile(ctx.clone(), now(), crate::proc_util::boot_time()).await {
+    match lifecycle::reconcile(ctx.clone(), now()).await {
         Ok(r) => log(
             &home,
             &format!(
@@ -161,6 +163,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
 async fn reaper(shared: Shared, mut shutdown: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(REAP_EVERY);
     tick.tick().await; // the first tick is immediate; startup gc just ran
+    let mut reservations_dropped = now(); // wall clock: a monotonic one stops while the Mac sleeps
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
@@ -176,6 +179,11 @@ async fn reaper(shared: Shared, mut shutdown: watch::Receiver<bool>) {
             ),
             Ok(_) => {}
             Err(e) => log(&shared.ctx.home, &format!("reaper failed: {e}")),
+        }
+        let t = now();
+        if t.saturating_sub(reservations_dropped) >= RESERVATIONS_EVERY_SECS {
+            lifecycle::drop_unused_reservations(&shared.ctx, t);
+            reservations_dropped = t;
         }
     }
 }
@@ -396,9 +404,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
             ctx.store().delete_pending_restore(id)?;
             Response::Ok
         }
-        Request::Gc => Response::Gc(
-            lifecycle::reconcile(ctx.clone(), now(), crate::proc_util::boot_time()).await?,
-        ),
+        Request::Gc => Response::Gc(lifecycle::reconcile(ctx.clone(), now()).await?),
         Request::Status => {
             let (clones, templates) = blocking(&ctx, |ctx| {
                 let store = ctx.store();

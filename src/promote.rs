@@ -66,6 +66,16 @@ pub async fn promote(ctx: &Ctx, id_or_name: &str, target: Option<&str>) -> Resul
             clone.id, clone.status
         )));
     }
+    // Possibly corrupt data must not become what every new clone copies.
+    if clone.suspect {
+        let n = clone.name.as_deref().unwrap_or(&clone.id);
+        return Err(invalid(format!(
+            "clone {n} may hold lost or corrupt writes after an unclean shutdown"
+        ))
+        .with_hint(format!(
+            "run `mitosis clone --name {n} --fresh` first, or destroy it"
+        )));
+    }
     let name = target.unwrap_or(&clone.template).to_string();
     let _guard = BuildGuard::take(ctx, &name)?;
 

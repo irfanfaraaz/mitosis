@@ -44,11 +44,6 @@ fn listed(env: &TestEnv, id: &str) -> CloneInfo {
         .expect("clone listed")
 }
 
-/// A reboot as the daemon sees it: every recorded server started before this boot time.
-fn fake_boot() -> Option<i64> {
-    Some(now() + 10)
-}
-
 /// Clean shutdown, as at a normal reboot.
 fn pg_ctl_stop(env: &TestEnv, info: &CloneInfo) {
     let installs = env.ctx.installs();
@@ -87,9 +82,7 @@ async fn named_clone_restarts_after_reboot() {
     let a = create(&env.ctx, args(Some("x"), false)).await.unwrap();
     psql_url(&env, &a.url, "insert into t values (2)");
     pg_ctl_stop(&env, &a);
-    let report = reconcile(env.ctx.clone(), now(), fake_boot())
-        .await
-        .unwrap();
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
     assert!(report.adopted.contains(&a.id), "{report:?}");
     assert!(report.warnings.is_empty(), "{report:?}");
     assert_eq!(psql_url(&env, &a.url, "select count(*) from t"), "2");
@@ -105,9 +98,7 @@ async fn unclean_fsync_off_named_clone_is_suspect() {
     template(&env, "main", SEED).await;
     let y = create(&env.ctx, args(Some("y"), false)).await.unwrap();
     kill_9(&env, &y);
-    let report = reconcile(env.ctx.clone(), now(), fake_boot())
-        .await
-        .unwrap();
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
     assert!(report.adopted.contains(&y.id), "{report:?}");
     assert!(row(&env, &y.id).unwrap().suspect);
     assert_eq!(psql_url(&env, &y.url, "select 1"), "1");
@@ -128,9 +119,7 @@ async fn unclean_unnamed_clone_is_destroyed() {
     let c = create(&env.ctx, args(None, false)).await.unwrap();
     let dir = row(&env, &c.id).unwrap().dir;
     kill_9(&env, &c);
-    let report = reconcile(env.ctx.clone(), now(), fake_boot())
-        .await
-        .unwrap();
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
     assert_eq!(report.destroyed, vec![c.id.clone()], "{report:?}");
     assert!(row(&env, &c.id).is_none());
     assert!(!dir.exists());
@@ -143,9 +132,7 @@ async fn durable_unclean_clone_is_not_suspect() {
     let d = create(&env.ctx, args(Some("d"), true)).await.unwrap();
     psql_url(&env, &d.url, "insert into t values (2)");
     kill_9(&env, &d);
-    let report = reconcile(env.ctx.clone(), now(), fake_boot())
-        .await
-        .unwrap();
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
     assert!(report.adopted.contains(&d.id), "{report:?}");
     assert!(!row(&env, &d.id).unwrap().suspect);
     assert!(report.warnings.is_empty(), "{report:?}");
@@ -153,13 +140,38 @@ async fn durable_unclean_clone_is_not_suspect() {
 }
 
 #[tokio::test]
-async fn dead_postmaster_without_reboot_keeps_v01_behaviour() {
+async fn dead_named_clone_restarts_without_reboot() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
     let z = create(&env.ctx, args(Some("z"), false)).await.unwrap();
+    psql_url(&env, &z.url, "insert into t values (2)");
+    // No reboot: the server simply died (a manual stop, a full disk). It is restarted, not destroyed.
     pg_ctl_stop(&env, &z);
-    // The machine booted long before the server started: it simply died, so v0.1 destroys it.
-    let report = reconcile(env.ctx.clone(), now(), Some(1)).await.unwrap();
-    assert_eq!(report.destroyed, vec![z.id.clone()], "{report:?}");
-    assert!(row(&env, &z.id).is_none());
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert!(report.adopted.contains(&z.id), "{report:?}");
+    assert!(report.destroyed.is_empty(), "{report:?}");
+    assert_eq!(psql_url(&env, &z.url, "select count(*) from t"), "2");
+    assert_eq!(listed(&env, &z.id).url, z.url);
+}
+
+#[tokio::test]
+async fn dead_unnamed_clone_with_parent_is_destroyed() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    // This test process is a live parent, so only the dead server decides.
+    let c = create(
+        &env.ctx,
+        CloneCreateArgs {
+            parent_pid: Some(std::process::id() as i32),
+            ..args(None, false)
+        },
+    )
+    .await
+    .unwrap();
+    let dir = row(&env, &c.id).unwrap().dir;
+    pg_ctl_stop(&env, &c);
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert_eq!(report.destroyed, vec![c.id.clone()], "{report:?}");
+    assert!(row(&env, &c.id).is_none());
+    assert!(!dir.exists());
 }

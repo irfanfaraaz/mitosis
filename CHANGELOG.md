@@ -21,7 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - RAM and disk budgets, a FIFO queue with `--wait`, the `budget_full` error code, and `mitosis top`.
 - `<home>/config.toml`, `mitosis config` and `mitosis config set`, with new env vars `MITOSIS_RAM_BUDGET`, `MITOSIS_DISK_BUDGET`, `MITOSIS_QUEUE_WAIT` and `MITOSIS_CLONE_DISK_WARN`.
 - Login service: `mitosis service install`, `uninstall` and `status` (launchd user agent).
-- Reboot recovery for named, protected and parentless clones, and suspect-clone detection.
+- Reboot and crash recovery for named, protected and parentless clones, and suspect-clone detection.
 - `mitosis doctor [--fix] [--json]`.
 - MCP `clone_create` gains `name`, `fresh`, `env_file`, `env_var` and `wait_secs`; its reply gains `generation`, `existing`, `stale`, `refreshing`, `suspect`, `duration_ms` and `warnings`.
 
@@ -31,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Asking again for a running named clone returns the existing clone (`existing: true`).
 - Daemon protocol is v2. The first 0.2 command replaces a running 0.1 daemon.
 - The state store migrates from 0.1 by itself.
+- 0.2 migrates the store, and 0.1 cannot read it afterwards. There is no downgrade.
 - A bad config value or env var is an `invalid_request` naming the key, before any daemon starts.
 
 ### Fixed
