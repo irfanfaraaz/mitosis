@@ -136,9 +136,9 @@ The clone keeps running on the same port. The target must use the same Postgres 
 ## Upgrade a template to a newer Postgres
 
 ```sh
-brew install postgresql@17     # a second major, as the target (or the source)
-mitosis template upgrade main --to 17
-mitosis template upgrade main --to 17 --as main17   # keep the original as it is
+# The template runs on Postgres 17; Postgres 18 is installed too.
+mitosis template upgrade main --to 18
+mitosis template upgrade main --to 18 --as main18   # keep the original as it is
 ```
 
 You need the target major installed next to the current one. Mitosis runs `pg_upgrade --clone` and falls back to `--copy` if clone mode is refused. Without `--as`, the result is a new generation, so `template rollback` returns to the old major. Later builds use the current generation's major.
@@ -224,7 +224,7 @@ A daemon started by launchd does not get your terminal's access to `~/Documents`
 
 After a reboot, Mitosis starts again named clones, protected clones and parentless CLI clones that are still inside their TTL, on the same folder, port and password. Clones whose session is gone are destroyed.
 
-Before restarting, it reads the cluster's control state. A clone that did not shut down cleanly and ran with `fsync=off` is *suspect*. An unnamed suspect clone is destroyed. A named one is started and marked `suspect` in `list`, in the clone reply and in `doctor`. Reset it with `mitosis clone --name <x> --fresh`. Durable clones use normal Postgres crash recovery and are not suspect.
+Before restarting, it reads the cluster's control state. A clone that did not shut down cleanly and ran with `fsync=off` is *suspect*. An unnamed suspect clone is destroyed. A named one is started and marked `suspect` in `list --json`, in the clone reply and in `doctor`. Reset it with `mitosis clone --name <x> --fresh`. Durable clones use normal Postgres crash recovery and are not suspect.
 
 ## Doctor
 
