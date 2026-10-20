@@ -54,6 +54,10 @@ pub struct Ctx {
     router: Mutex<RouterState>,
     /// Clone id → the lock one wake or sleep of that clone holds; others wait on it.
     pub(crate) waking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test hook: background layered builds skipped because the checkout was on another branch
+    /// (only the first such skip leaves an event).
+    #[doc(hidden)]
+    pub layered_skips: AtomicUsize,
 }
 
 impl Ctx {
@@ -95,6 +99,7 @@ impl Ctx {
             events_tx: tokio::sync::broadcast::channel(EVENT_CHANNEL).0,
             router,
             waking: Mutex::new(HashMap::new()),
+            layered_skips: AtomicUsize::new(0),
         })
     }
 

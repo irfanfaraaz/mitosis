@@ -75,7 +75,7 @@ change in any release.
 
 - `MITOSIS_HOME` and `MITOSIS_PG_RELEASES_URL` stay.
 
-- `router_listen` accepts `127.0.0.1`, `::1`, `0.0.0.0` and `::`. `router_port` accepts a port
+- `router_listen` accepts `127.0.0.1`, `0.0.0.0` and `::`. `router_port` accepts a port
   from 1 to 65535 outside `port_range` (54320-54999).
 
 - New keys may appear. A new key's default keeps the old behaviour.
@@ -85,8 +85,9 @@ change in any release.
 - Template and clone names match `^[a-z0-9][a-z0-9_-]{0,62}$`. Branch templates (`<base>~<branch>`)
   are the only names with `~`.
 
-- A clone name may not look like a clone id (`c` plus 6 lowercase hex digits, such as
+- A new clone name may not look like a clone id (`c` plus 6 lowercase hex digits, such as
   `cafe123`), because the router takes the database name for a name first and an id second.
+  A clone that already has such a name (from 0.2) keeps it and can still be reused.
 
 ### Daemon protocol
 
@@ -116,8 +117,8 @@ The router URL keeps this format:
 postgres://postgres:<password>@127.0.0.1:<router_port>/<clone name or id>
 ```
 
-`url` always holds this form while `router = on`, even when `router_listen` is `::1`,
-`0.0.0.0` or `::`. `direct_url` keeps the v0.2 form (the clone's own port) and is also stable.
+`url` always holds this form while `router = on`, even when `router_listen` is `0.0.0.0`
+or `::`. `direct_url` keeps the v0.2 form (the clone's own port) and is also stable.
 
 ## What is not covered
 

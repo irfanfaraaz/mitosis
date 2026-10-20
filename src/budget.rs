@@ -197,6 +197,20 @@ pub async fn usage(ctx: &Arc<Ctx>) -> Result<Usage> {
     snapshot(ctx, true).await.map(|(u, _)| u)
 }
 
+/// The setting that waking one more sleeping clone without a request (gc's wakes) would break,
+/// if any: a wake adds a running server, so only awake clones count toward `max_clones`, and its
+/// memory toward `ram_budget`; disk does not grow.
+pub(crate) async fn wake_blocked(ctx: &Arc<Ctx>) -> Result<Option<&'static str>> {
+    let (mut usage, estimate) = snapshot(ctx, false).await?;
+    usage.clones.retain(|c| c.status != "sleeping");
+    usage.disk_budget = None;
+    Ok(fits(&usage, estimate).map(|limit| match limit {
+        Limit::Count => "max_clones",
+        Limit::Ram => "ram_budget",
+        Limit::Disk => "disk_budget",
+    }))
+}
+
 /// `max_clones` is reached: names the setting and up to three of the clones (`labels`: names,
 /// else ids).
 pub(crate) fn cap_reached(max_clones: usize, labels: &[String]) -> MitosisError {

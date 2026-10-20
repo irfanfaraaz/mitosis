@@ -463,3 +463,21 @@ async fn reused_pid_of_a_dead_session_is_another_session() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// A 0.2 clone named like an id can still be reused; a new clone may not take such a name.
+#[tokio::test]
+async fn id_shaped_name_only_refused_for_new_clones() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let e = create(&env.ctx, named("cafe123")).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.message.contains("looks like a clone id"), "{e}");
+    // What 0.2 allowed: rename a clone's row to the id-shaped name.
+    let a = create(&env.ctx, named("old")).await.unwrap();
+    let mut row = env.ctx.store().get_clone(&a.id).unwrap().unwrap();
+    row.name = Some("cafe123".into());
+    env.ctx.store().update_clone(&row).unwrap();
+    let b = create(&env.ctx, named("cafe123")).await.unwrap();
+    assert!(b.existing);
+    assert_eq!(b.id, a.id);
+}

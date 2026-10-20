@@ -57,11 +57,21 @@ impl Fixture {
         router: bool,
         listening: bool,
     ) -> Fixture {
-        let root = env.tmp.path().to_path_buf();
         let config = Config {
             router,
             ..env.ctx.config()
         };
+        Fixture::launch_with(serial, env, config, listening).await
+    }
+
+    /// A daemon on `env`'s home with `config`.
+    async fn launch_with(
+        serial: MutexGuard<'static, ()>,
+        env: TestEnv,
+        config: Config,
+        listening: bool,
+    ) -> Fixture {
+        let root = env.tmp.path().to_path_buf();
         let port = config.router_port;
         let daemon = tokio::spawn(run(Home::at(root.clone()), config));
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -451,9 +461,51 @@ async fn router_off_at_daemon_start_wakes_sleeping_clones() {
     template(&env, "main", SEED).await;
     sleeping_clone(&env, "a").await;
     let fx = Fixture::launch(serial, env, false, false).await;
-    let info = fx.status("a").await;
-    assert_eq!(info.status, "ready");
+    // Woken by a task once the daemon accepts.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let info = loop {
+        let info = fx.status("a").await;
+        if info.status == "ready" {
+            break info;
+        }
+        assert!(Instant::now() < deadline, "never woke: {}", info.status);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(info.url, info.direct_url);
     assert_eq!(psql_url(&fx.env, &info.url, "select count(*) from t"), "1");
+    fx.stop().await;
+}
+
+/// The startup wakes stay within the budget: with room for one running clone, one of two
+/// sleeping clones is started and the other stays asleep with a warning in the daemon log.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_wakes_stop_at_the_budget() {
+    let serial = serial();
+    let Some(env) = TestEnv::new() else {
+        return;
+    };
+    template(&env, "main", SEED).await;
+    sleeping_clone(&env, "a").await;
+    sleeping_clone(&env, "b").await;
+    let config = Config {
+        router: false,
+        max_clones: 1,
+        ..env.ctx.config()
+    };
+    let fx = Fixture::launch_with(serial, env, config, false).await;
+    let log = fx.home.logs_dir().join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("sleeping clones left asleep")
+    {
+        assert!(Instant::now() < deadline, "the wake task never finished");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut statuses = [fx.status("a").await.status, fx.status("b").await.status];
+    statuses.sort();
+    assert_eq!(statuses, ["ready", "sleeping"]);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("mitosis wake <clone>"), "{text}");
     fx.stop().await;
 }

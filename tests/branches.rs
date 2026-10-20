@@ -17,6 +17,7 @@ use mitosis::scheduler;
 use mitosis::templates::{self, branch_folder_slug, history, layered, refresh};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MIGRATE_SH: &str = r#"set -e
@@ -284,16 +285,17 @@ async fn base_skips_auto_migrate_on_other_branch() {
     }
 
     // The next tick skips again (the skipped build released its slot) without another event.
-    // `tick` claims the slot before it returns, so a free slot afterwards means that run ended.
+    // `layered_skips` counts each skip after its event decision, so a higher count means the
+    // second one ran.
+    let skips = || env.ctx.layered_skips.load(Ordering::SeqCst);
     wait_for(30, "the first skip to release its slot", || {
         !templates::is_building(&env.ctx, "main")
     })
     .await;
+    let first = skips();
+    assert!(first >= 1);
     scheduler::tick(&env.ctx, now()).await;
-    wait_for(30, "the second skip to release its slot", || {
-        !templates::is_building(&env.ctx, "main")
-    })
-    .await;
+    wait_for(30, "the second skip", || skips() > first).await;
     assert_eq!(skipped().len(), 1);
     assert_eq!(env.ctx.store().list_generations("main").unwrap().len(), 1);
 }

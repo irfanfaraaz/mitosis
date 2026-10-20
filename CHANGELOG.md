@@ -6,13 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-10-20
 
 ### Added
 
 - A router: every clone is reached through one fixed port (`router_port`, default 54300), picked by database name, at `postgres://postgres:<password>@127.0.0.1:54300/<clone name or id>`. Passwords stay end to end, query cancels are routed, and containers use `host.docker.internal`. New config keys `router`, `router_port` and `router_listen`.
 - `clone`, `list` and the MCP replies carry `direct_url` (the clone's own port) next to `url`. `mitosis env <clone> --direct` prints the direct URL, waking a sleeping clone first.
-- Sleep and wake: idle clones stop and wake on the first router connection (`idle_sleep`), the status `sleeping`, `mitosis wake <clone>`, and eviction of idle clones to fit the RAM budget before a request queues. Clones sleep only while the router is listening; with the router off or its port taken they keep running, and the daemon starts clones that were asleep. `idle_reap` destroys idle unnamed, unprotected clones.
+- Sleep and wake: idle clones stop and wake on the first router connection (`idle_sleep`), the status `sleeping`, `mitosis wake <clone>`, and eviction of idle clones to fit the RAM budget before a request queues. Clones sleep only while the router is listening; with the router off or its port taken they keep running, and the daemon starts clones that were asleep (as far as `max_clones` and `ram_budget` allow). `idle_reap` destroys idle unnamed, unprotected clones.
 - `mitosis diff <clone> [--table <t> [--limit N]] [--json]` and the MCP tool `clone_diff`: schema changes, row counts and changed rows against the template generation the clone came from.
 - Masking and subsets: `template init|set --mask <file>` with the strategies `email`, `name`, `hash`, `null`, `redact`, `const:<value>` and `keep`, and `[subset]` filters or percents that keep foreign keys valid. A masked template never holds the raw values.
 - Per-branch templates: `mitosis clone --branch [<branch>]`, MCP `clone_create` `branch`, `template set --base-branch`, and gc of unused branch templates.
@@ -30,8 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Idle clones sleep after 10 minutes by default (`idle_sleep`), and a sleeping clone's direct URL refuses connections until it wakes.
 - After a reboot or a dead server, recovered named, protected and parentless clones come back `sleeping` while the router is listening, instead of being started at once.
 - Daemon protocol is v3. The first 1.0 command replaces a running 0.2 daemon.
-- `router_listen` accepts only `127.0.0.1`, `::1`, `0.0.0.0` or `::`, and `router_port` must be outside `port_range` (54320-54999).
-- Clone names that look like a clone id (`c` plus 6 hex digits, such as `cafe123`) are refused, because the router would take them for that id.
+- `router_listen` accepts only `127.0.0.1`, `0.0.0.0` or `::`, and `router_port` must be outside `port_range` (54320-54999).
+- New clone names that look like a clone id (`c` plus 6 hex digits, such as `cafe123`) are refused, because the router would take them for that id. An existing clone with such a name can still be reused, and `mitosis doctor` warns about it.
 - The CLI, `--json` output, MCP tools, config keys, error codes and daemon protocol are now frozen until 2.0; see [COMPATIBILITY.md](COMPATIBILITY.md). Contract tests pin them.
 - Renames made before the freeze (no aliases, since 1.0 is the first stable release):
   - `template init` / `template set`: `--mode` is now `--every-mode`, matching the `every_mode` field.

@@ -103,16 +103,23 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     } else {
         None
     };
-    match lifecycle::reconcile(ctx.clone(), now()).await {
-        Ok(r) => log(
-            &home,
-            &format!(
-                "startup gc: {}",
-                serde_json::to_string(&r).unwrap_or_default()
-            ),
-        ),
-        Err(e) => log(&home, &format!("startup gc failed: {e}")),
-    }
+    // Sleeping clones to start again (router not listening) are woken after the socket accepts.
+    let to_wake = match lifecycle::reconcile_deferred(ctx.clone(), now()).await {
+        Ok((r, to_wake)) => {
+            log(
+                &home,
+                &format!(
+                    "startup gc: {}",
+                    serde_json::to_string(&r).unwrap_or_default()
+                ),
+            );
+            to_wake
+        }
+        Err(e) => {
+            log(&home, &format!("startup gc failed: {e}"));
+            Vec::new()
+        }
+    };
     // Before the socket binds, so no diff is running: anything a diff left is a leftover.
     lifecycle::remove_diff_leftovers(&ctx).await;
 
@@ -135,6 +142,10 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
     scheduler::run(ctx.clone(), shutdown_rx.clone());
     let router = router_listener.map(|l| crate::router::spawn(ctx.clone(), l));
+    if !to_wake.is_empty() {
+        let c = ctx.clone();
+        tokio::spawn(async move { lifecycle::wake_sleepers(&c, to_wake).await });
+    }
 
     let mut last_accept_log: Option<std::time::Instant> = None;
     loop {

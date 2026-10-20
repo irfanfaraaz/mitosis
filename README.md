@@ -111,11 +111,11 @@ This exposes the router to the network. Each clone's password still protects it,
 
 ### Router off, or its port taken
 
-`mitosis config set router off` turns the router off. Then `url` is the `direct_url`, and clones never sleep, because only the router can wake them. Clones that were asleep are started again when the daemon starts.
+`mitosis config set router off` turns the router off. Then `url` is the `direct_url`, and clones never sleep, because only the router can wake them. Clones that were asleep are started again after the daemon starts, most recently used first, as far as `max_clones` and `ram_budget` allow; the rest stay asleep until `mitosis wake <clone>` or `mitosis env <clone> --direct` starts them.
 
 If another process holds the router port, `mitosis doctor` fails and names the process. The daemon tries again every minute, so the router comes back by itself when the port frees up. Until then, clones do not go to sleep and still answer on their `direct_url`, and `mitosis env <clone> --direct` prints it (waking the clone first if it sleeps; `mitosis wake <clone>` does that too). Pick another port with `mitosis config set router_port <port>` and `mitosis daemon stop`. A new port changes every router URL, and `.env` files written with the old one keep it: re-run `mitosis clone --name <x> --env-file <file>` (with the clone's own `--template`, `--durable` and `--protect` flags) to write the new URL.
 
-`router_listen` takes `127.0.0.1` (the default), `::1`, `0.0.0.0` or `::`; any other address would not answer on the `127.0.0.1` URL. `router_port` must be outside the clone ports (54320-54999).
+`router_listen` takes `127.0.0.1` (the default), `0.0.0.0` or `::`; any other address (`::1` too) would not answer on the `127.0.0.1` URL. `router_port` must be outside the clone ports (54320-54999).
 
 `mitosis daemon stop`, and the daemon restart that a binary upgrade brings, end every open router connection; the clones keep running. Clients reconnect, or use a pool that does. Direct connections are not affected.
 
@@ -542,8 +542,8 @@ Most of it is automatic.
 - **Protocol 3.** The first 1.0 command replaces a running 0.2 daemon. Your clones keep running. A `mitosis mcp` server started by 0.2 keeps the old code: its tool calls fail with `protocol_mismatch` until you restart the agent session. Its clones survive.
 - **The store migrates by itself** on first use, in one transaction. 1.0 migrates the store, and 0.2 cannot read it afterwards. There is no downgrade.
 - **New clones return router URLs.** `clone`, `list`, MCP and `.env` injection now give `postgres://postgres:<password>@127.0.0.1:54300/<clone>`. A `.env` file written by 0.2 keeps its direct URL, which works only while the clone is awake. To switch it to the router URL, re-run `mitosis clone --name <x> --env-file <file>` with the clone's own `--template`, `--durable` and `--protect` flags. With other flags it is refused (the hint suggests `--fresh`, which throws the clone's data away). Idle clones now sleep after 10 minutes, and a sleeping clone refuses its direct URL; so either switch the `.env` entry, or keep the old behaviour with `mitosis config set idle_sleep off`.
-- **After a reboot,** named and protected clones come back `sleeping` and wake on first use (with the router off or its port taken, they are started at once).
-- **Clone names that look like a clone id** (`c` plus 6 hex digits, such as `cafe123`) are refused by `clone --name`, because the router would take them for that id. A 0.2 clone with such a name keeps running and can still be listed, used and destroyed; `clone --name` on it is refused.
+- **After a reboot,** named and protected clones come back `sleeping` and wake on first use (with the router off or its port taken, they are started at once, as far as `max_clones` and `ram_budget` allow).
+- **New clone names that look like a clone id** (`c` plus 6 hex digits, such as `cafe123`) are refused by `clone --name`, because the router would take them for that id. A 0.2 clone with such a name keeps running and can still be listed, used, reused with `clone --name` (also `--fresh`) and destroyed; `mitosis doctor` warns about it, since router URLs by that name may reach the clone with that id. Recreate it under another name to fix that.
 
 The CLI, `--json` and MCP names were made consistent before the freeze. Scripts written for 0.2 need these changes (the CHANGELOG `### Changed` list has the rest):
 

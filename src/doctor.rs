@@ -1145,6 +1145,26 @@ fn check_suspect(snap: &Snapshot) -> Check {
     summarize("suspect_clones", f, "none")
 }
 
+/// Clones from 0.2 whose name looks like a clone id (new names may not).
+fn check_clone_names(snap: &Snapshot) -> Check {
+    let f = snap
+        .clones
+        .iter()
+        .filter_map(|c| c.name.as_deref())
+        .filter(|n| crate::names::is_clone_id(n))
+        .map(|n| {
+            (
+                Level::Warn,
+                format!(
+                    "clone {n} has a name that looks like a clone id: router URLs by that name \
+                     may reach the clone with that id; rename by recreating"
+                ),
+            )
+        })
+        .collect();
+    summarize("clone_names", f, "none look like clone ids")
+}
+
 fn check_gc(home: &Home, snap: &Snapshot, daemon_up: bool) -> Check {
     let orphans = orphan_folders(home, snap);
     let mut f: Vec<(Level, String)> = orphans
@@ -1373,6 +1393,7 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     if let StoreView::Ready(snap) = &view {
         out.push(check_templates(snap));
         out.push(check_suspect(snap));
+        out.push(check_clone_names(snap));
         out.push(check_gc(home, snap, daemon_up));
         out.push(check_env(snap));
         out.push(check_privacy(snap, &svc));

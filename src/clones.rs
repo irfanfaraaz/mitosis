@@ -361,7 +361,7 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
     let branch = match args.branch.take() {
         Some(b) => {
             if let Some(name) = &args.name {
-                validate_name("clone", name)?;
+                check_clone_name(ctx, name)?;
             }
             let used = crate::templates::ensure_branch(ctx, &args.template, &b).await?;
             args.template = used.name.clone();
@@ -585,13 +585,28 @@ fn template_missing(name: &str) -> MitosisError {
     .with_hint(format!("mitosis template init {name} --seed \"…\""))
 }
 
+/// `clone --name`: the name rules, with the id-shape rule only for a name no clone has yet, so a
+/// 0.2 clone named like an id can still be reused or recreated with `--fresh`.
+fn check_clone_name(ctx: &Ctx, name: &str) -> Result<()> {
+    validate_name("clone", name)?;
+    let exists = ctx
+        .store()
+        .list_clones()?
+        .iter()
+        .any(|c| c.name.as_deref() == Some(name));
+    if exists {
+        return Ok(());
+    }
+    crate::names::check_new_clone_name(name)
+}
+
 async fn create_inner(
     ctx: &Arc<Ctx>,
     args: &mut CloneCreateArgs,
     taken: &mut Vec<PendingRestore>,
 ) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
-        validate_name("clone", name)?;
+        check_clone_name(ctx, name)?;
     }
     if args.protect && args.name.is_none() {
         return Err(invalid("a protected clone needs a name")

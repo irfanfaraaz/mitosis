@@ -40,6 +40,8 @@ pub struct RouterState {
     /// `(pid, secret key)` from `BackendKeyData` → clone id, for cancel requests.
     pub cancel: HashMap<(i32, Vec<u8>), String>,
     pub status: RouterStatus,
+    /// The port is bound (`bind` succeeded); `status.listening` turns true once `spawn` accepts.
+    bound: bool,
     /// Connection number → (clone id, notified to close that connection).
     closers: HashMap<u64, (String, Arc<Notify>)>,
     next_conn: u64,
@@ -57,6 +59,7 @@ impl RouterState {
                 port,
                 error: None,
             },
+            bound: false,
             closers: HashMap::new(),
             next_conn: 0,
         }
@@ -81,10 +84,14 @@ impl RouterState {
     }
 }
 
-/// True while the router is on and listening: only then can a sleeping clone be woken by a
-/// connection, so only then may clones be put to sleep.
+/// True while the router is on and its port is bound (connections queue until `spawn` accepts
+/// them): only then can a sleeping clone be woken by a connection, so only then may clones be put
+/// to sleep.
 pub fn listening(ctx: &Ctx) -> bool {
-    ctx.config().router && ctx.router().status.listening
+    ctx.config().router && {
+        let r = ctx.router();
+        r.bound || r.status.listening
+    }
 }
 
 /// The warning `clone` responses carry while the router is on but not listening.
@@ -109,34 +116,30 @@ fn retry_interval() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Binds `router_listen:router_port` once and records the outcome in the status. On failure the
-/// status holds the error and `router.failed` is recorded (once per distinct error). The daemon
-/// binds before its startup gc, so recovery knows whether the router can wake clones.
+/// Binds `router_listen:router_port` once and records the outcome: on success the port counts as
+/// bound (see `listening`); `spawn` reports it listening once it accepts. On failure the status
+/// holds the error and `router.failed` is recorded (once per distinct error). The daemon binds
+/// before its startup gc, so recovery knows whether the router can wake clones.
 pub async fn bind(ctx: &Ctx) -> Option<TcpListener> {
     let cfg = ctx.config();
     let addr = SocketAddr::new(cfg.router_listen, cfg.router_port);
     match TcpListener::bind(addr).await {
         Ok(l) => {
-            ctx.router().status = RouterStatus {
-                listening: true,
+            let mut r = ctx.router();
+            r.bound = true;
+            r.status = RouterStatus {
+                listening: false,
                 listen: addr.ip().to_string(),
                 port: addr.port(),
                 error: None,
             };
-            log(ctx, &format!("router listening on {addr}"));
-            events::emit(
-                ctx,
-                events::ROUTER_STARTED,
-                None,
-                None,
-                json!({ "listen": addr.to_string() }),
-            );
             Some(l)
         }
         Err(e) => {
             let error = format!("cannot listen on {addr}: {e}");
             let first = {
                 let mut r = ctx.router();
+                r.bound = false;
                 let first = r.status.error.as_deref() != Some(error.as_str());
                 r.status = RouterStatus {
                     listening: false,
@@ -179,6 +182,18 @@ pub fn spawn(ctx: Arc<Ctx>, listener: Option<TcpListener>) -> JoinHandle<()> {
             tokio::time::sleep(retry_interval()).await;
             listener = bind(&ctx).await;
         };
+        ctx.router().status.listening = true;
+        let addr = listener
+            .local_addr()
+            .map_or_else(|_| "?".to_string(), |a| a.to_string());
+        log(&ctx, &format!("router listening on {addr}"));
+        events::emit(
+            &ctx,
+            events::ROUTER_STARTED,
+            None,
+            None,
+            json!({ "listen": addr }),
+        );
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {

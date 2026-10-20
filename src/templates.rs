@@ -882,7 +882,10 @@ pub(crate) async fn background(ctx: &Ctx, name: &str, mode: RefreshMode) {
     if mode == RefreshMode::Layered {
         match off_base_branch(ctx, name).await {
             Ok(Some((base_branch, current))) => {
-                return emit_skipped(ctx, name, &base_branch, &current);
+                emit_skipped(ctx, name, &base_branch, &current);
+                ctx.layered_skips
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return;
             }
             Ok(None) => {}
             Err(e) => crate::lifecycle::log(ctx, &format!("template {name}: branch check: {e}")),

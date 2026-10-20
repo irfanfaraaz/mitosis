@@ -385,9 +385,19 @@ async fn destroy_after_parent_exit(watch: Watch) {
 
 /// Brings the store and the home folder back in line after a crash; safe while requests are served.
 /// Clones with an in-flight create and templates with a running build are left alone.
-/// A failure on one entry is logged to `logs/daemon.log` and the rest still run.
+/// A failure on one entry is logged to `logs/daemon.log` and the rest still run. Sleeping clones
+/// that nothing would wake (router not listening) are woken at the end, within the budget.
 pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
+    let (mut report, to_wake) = reconcile_deferred(ctx.clone(), now).await?;
+    report.warnings.extend(wake_sleepers(&ctx, to_wake).await);
+    Ok(report)
+}
+
+/// `reconcile` without the wakes: also returns the sleeping clones to wake, for the daemon's
+/// startup gc, which hands them to `wake_sleepers` on a task once its socket accepts.
+pub async fn reconcile_deferred(ctx: Arc<Ctx>, now: i64) -> Result<(GcReport, Vec<String>)> {
     let mut report = GcReport::default();
+    let mut to_wake = Vec::new();
     let ids: Vec<String> = ctx
         .store()
         .list_clones()?
@@ -403,7 +413,7 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
             Some(row) if row.id == id => row,
             _ => continue,
         };
-        if let Err(e) = reconcile_clone(&ctx, &row, now, &mut report).await {
+        if let Err(e) = reconcile_clone(&ctx, &row, now, &mut report, &mut to_wake).await {
             log(&ctx, &format!("gc: clone {id}: {e}"));
             failed(&mut report, id, &e);
         }
@@ -425,7 +435,80 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
             "failed": report.failed.len(),
         }),
     );
-    Ok(report)
+    Ok((report, to_wake))
+}
+
+/// Wakes the sleeping clones `ids` (from `reconcile_deferred`) one by one, most recently active
+/// first, while the router is not listening and the budget has room for one more running server;
+/// returns the warnings (also logged). The rest stay asleep with one warning naming them.
+pub async fn wake_sleepers(ctx: &Arc<Ctx>, ids: Vec<String>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut rows: Vec<(CloneRow, std::time::SystemTime)> = Vec::new();
+    for id in ids {
+        let row = match ctx.store().get_clone(&id) {
+            Ok(Some(row)) if row.status == CloneStatus::Sleeping => row,
+            _ => continue,
+        };
+        // A data folder's mtime moves when its server stops (postmaster.pid goes): the sleep
+        // time, which follows the clone's last activity.
+        let dir = row.dir.clone();
+        let stopped = tokio::task::spawn_blocking(move || std::fs::metadata(dir)?.modified())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        rows.push((row, stopped));
+    }
+    rows.sort_by_key(|(_, stopped)| std::cmp::Reverse(*stopped));
+    let mut left: Vec<String> = Vec::new();
+    let mut why = String::new();
+    for (row, _) in rows {
+        let label = row.name.clone().unwrap_or_else(|| row.id.clone());
+        if !left.is_empty() {
+            left.push(label);
+            continue;
+        }
+        // The router came up meanwhile (its bind retry): a connection wakes the rest.
+        if crate::router::listening(ctx) {
+            break;
+        }
+        match crate::budget::wake_blocked(ctx).await {
+            Ok(None) => {}
+            Ok(Some(limit)) => why = format!("waking more would exceed {limit}"),
+            Err(e) => why = format!("the budget check failed: {e}"),
+        }
+        if !why.is_empty() {
+            left.push(label);
+            continue;
+        }
+        match crate::clones::wake(ctx, &row.id).await {
+            Ok((woken, ws)) => {
+                let suspect = woken.suspect.then(|| suspect_warning(&woken));
+                for w in ws.into_iter().chain(suspect) {
+                    log(ctx, &format!("gc: clone {}: {w}", row.id));
+                    warnings.push(w);
+                }
+            }
+            Err(e) => {
+                let w = format!(
+                    "clone {label} sleeps and could not be started ({e}); mitosis wake {label} \
+                     starts it"
+                );
+                log(ctx, &format!("gc: {w}"));
+                warnings.push(w);
+            }
+        }
+    }
+    if !left.is_empty() {
+        let w = format!(
+            "sleeping clones left asleep ({why}): {}; mitosis wake <clone> (or mitosis env \
+             <clone> --direct) starts one",
+            left.join(", ")
+        );
+        log(ctx, &format!("gc: {w}"));
+        warnings.push(w);
+    }
+    warnings
 }
 
 /// True when git says `branch` does not exist in the repository of `dir` (`rev-parse --verify`
@@ -512,10 +595,11 @@ async fn drop_branch_templates(ctx: &Ctx, now: i64, report: &mut GcReport) {
                 let why = if gone { "branch deleted" } else { "unused" };
                 log(ctx, &format!("gc: dropped template {} ({why})", t.name));
                 let build_log = crate::templates::build_log_path(&ctx.home, &t.name);
-                if let Err(e) = std::fs::remove_file(&build_log) {
-                    if e.kind() != ErrorKind::NotFound {
-                        log(ctx, &format!("gc: remove {}: {e}", build_log.display()));
-                    }
+                // `remove_path` ignores NotFound and names the path in its error.
+                if let Ok(Err(e)) =
+                    tokio::task::spawn_blocking(move || remove_path(&build_log)).await
+                {
+                    log(ctx, &format!("gc: {e}"));
                 }
                 events::emit(
                     ctx,
@@ -555,6 +639,7 @@ async fn reconcile_clone(
     row: &CloneRow,
     now: i64,
     report: &mut GcReport,
+    to_wake: &mut Vec<String>,
 ) -> Result<()> {
     let dir = ctx.home.clones_dir().join(&row.id);
     if !dir.exists() {
@@ -567,7 +652,7 @@ async fn reconcile_clone(
         return Ok(());
     }
     if row.status == CloneStatus::Sleeping {
-        return reconcile_sleeping(ctx, row, now, report).await;
+        return reconcile_sleeping(ctx, row, now, report, to_wake).await;
     }
     let running = row.status == CloneStatus::Ready && postmaster_running(row);
     // Whether the machine rebooted or the server just died (a full disk, a manual stop, a
@@ -600,12 +685,13 @@ async fn reconcile_clone(
 /// A sleeping clone keeps sleeping under the TTL and parent rules of a running one. A server
 /// left running by a wake or sleep that crashed half-way is stopped, so Sleeping means stopped.
 /// While the router is not listening (off, or its port taken) nothing would wake it on connect,
-/// so it is started again instead.
+/// so it goes on `to_wake` (see `wake_sleepers`).
 async fn reconcile_sleeping(
     ctx: &Arc<Ctx>,
     row: &CloneRow,
     now: i64,
     report: &mut GcReport,
+    to_wake: &mut Vec<String>,
 ) -> Result<()> {
     let parent_gone = row
         .parent_pid
@@ -641,12 +727,7 @@ async fn reconcile_sleeping(
         ctx.store().update_clone(&row)?;
     }
     if !crate::router::listening(ctx) {
-        let (woken, warnings) = crate::clones::wake(ctx, &row.id).await?;
-        let suspect = woken.suspect.then(|| suspect_warning(&woken));
-        for w in warnings.into_iter().chain(suspect) {
-            log(ctx, &format!("gc: clone {}: {w}", row.id));
-            report.warnings.push(w);
-        }
+        to_wake.push(row.id.clone());
     }
     report.adopted.push(row.id.clone());
     if let Some(pid) = row.parent_pid {

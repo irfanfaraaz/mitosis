@@ -150,7 +150,7 @@ const KEYS: [KeySpec; 11] = [
     KeySpec {
         key: "router_listen",
         env: "MITOSIS_ROUTER_LISTEN",
-        want: "127.0.0.1, ::1, 0.0.0.0 or ::",
+        want: "127.0.0.1, 0.0.0.0 or ::",
         example: "127.0.0.1",
     },
     KeySpec {
@@ -271,13 +271,13 @@ fn parse_idle(v: &str) -> Option<Option<Duration>> {
     }
 }
 
-/// Loopback or every interface only: `url` always names `127.0.0.1`, which any other single
-/// address would not answer on.
+/// `127.0.0.1` or every interface only: `url` always names `127.0.0.1`, which any other single
+/// address (including `::1`) would not answer on. On macOS `::` is dual-stack, so it answers too.
 fn parse_listen(v: &str) -> Option<IpAddr> {
     let ip: IpAddr = v.parse().ok()?;
     let ok = match ip {
         IpAddr::V4(a) => a == Ipv4Addr::LOCALHOST || a.is_unspecified(),
-        IpAddr::V6(a) => a.is_loopback() || a.is_unspecified(),
+        IpAddr::V6(a) => a.is_unspecified(),
     };
     ok.then_some(ip)
 }
@@ -596,6 +596,7 @@ mod tests {
             ("MITOSIS_ROUTER_LISTEN", "192.168.1.5"),
             ("MITOSIS_ROUTER_LISTEN", "127.0.0.2"),
             ("MITOSIS_ROUTER_LISTEN", "fe80::1"),
+            ("MITOSIS_ROUTER_LISTEN", "::1"),
             ("MITOSIS_ROUTER_PORT", "54320"),
             ("MITOSIS_ROUTER_PORT", "54999"),
         ] {
@@ -603,7 +604,7 @@ mod tests {
             let e = Config::default().layered(&home, &env).unwrap_err();
             assert!(e.message.starts_with(k), "{e}");
         }
-        for ok in ["127.0.0.1", "::1", "0.0.0.0", "::"] {
+        for ok in ["127.0.0.1", "0.0.0.0", "::"] {
             let env = |n: &str| (n == "MITOSIS_ROUTER_LISTEN").then(|| ok.to_string());
             let (c, _) = Config::default().layered(&home, &env).unwrap();
             assert_eq!(c.router_listen.to_string(), ok);
