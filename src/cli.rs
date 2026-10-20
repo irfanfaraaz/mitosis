@@ -5,12 +5,13 @@ use crate::daemon;
 use crate::doctor;
 use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events;
 use crate::mcp;
 use crate::names::{format_duration, parse_duration, validate_name};
 use crate::paths::Home;
 use crate::protocol::{
-    CloneCreateArgs, CloneInfo, MigrateCmd, Request, Response, TemplateInfo, TemplateInitArgs,
-    TemplateSetArgs, TemplateSettings, TemplateSource,
+    CloneCreateArgs, CloneInfo, EventFilter, EventRow, MigrateCmd, Request, Response, TemplateInfo,
+    TemplateInitArgs, TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::service;
 use crate::templates::now;
@@ -98,6 +99,32 @@ enum Cmd {
     },
     /// Remove expired clones and leftovers.
     Gc,
+    /// What the daemon did and why: creates, destroys, builds, rollbacks, gc, recovery, queue waits.
+    Events {
+        /// Keep running and print new events as they happen.
+        #[arg(long)]
+        follow: bool,
+        /// Only events of this clone (name or id).
+        #[arg(long)]
+        clone: Option<String>,
+        /// Only events of this template.
+        #[arg(long)]
+        template: Option<String>,
+        /// Only this kind (`clone.created`) or group (`clone`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only events from this long ago, like 30m, 2h or 1d.
+        #[arg(long)]
+        since: Option<String>,
+        /// A JSON array; with --follow one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download and manage Postgres builds (the only commands that ever download).
+    Pg {
+        #[command(subcommand)]
+        command: PgCmd,
+    },
     /// Check the home, config, daemon, Postgres installs and templates for problems.
     Doctor {
         /// Finish pending .env restores and run gc.
@@ -286,6 +313,21 @@ impl SettingsFlags {
 }
 
 #[derive(Subcommand)]
+enum PgCmd {
+    /// Download, verify and unpack the newest build of a Postgres major into the Mitosis home.
+    Install {
+        major: u32,
+        /// An exact minor (17.9), or a release tag (17.9.1), instead of the newest.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// List the builds installed by `pg install` and which ones Mitosis uses.
+    List,
+    /// Remove an installed build by major (17) or version (17.9).
+    Remove { spec: String },
+}
+
+#[derive(Subcommand)]
 enum ServiceCmd {
     /// Install and start the login service for this binary and home.
     Install,
@@ -408,6 +450,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             println!("{key} = {}", value.trim());
         }
         Cmd::Template { command } => template(&home, command).await?,
+        Cmd::Pg { command } => pg(&home, command).await?,
         Cmd::Clone {
             template,
             name,
@@ -543,6 +586,70 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             return Ok(ExitCode::from(doctor::exit_code(&checks)));
         }
+        Cmd::Events {
+            follow,
+            clone,
+            template,
+            kind,
+            since,
+            json,
+        } => {
+            let since = match since {
+                Some(d) => Some(now().saturating_sub(parse_duration(&d)?.as_secs() as i64)),
+                None => None,
+            };
+            let filter = EventFilter {
+                clone,
+                template,
+                kind,
+                since,
+                limit: None,
+            };
+            let show = |e: &EventRow| -> Result<()> {
+                if json {
+                    println!("{}", serde_json::to_string(e)?);
+                } else {
+                    println!(
+                        "{}  {}  {}  {}",
+                        events::local_time(e.ts),
+                        e.kind,
+                        events::row_label(e),
+                        events::short_detail(&e.detail)
+                    );
+                }
+                Ok(())
+            };
+            if follow {
+                let mut failed = None;
+                client::follow_events(&home, filter, |e| {
+                    if failed.is_none() {
+                        failed = show(&e).err();
+                    }
+                })
+                .await?;
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+            } else {
+                match client::request(
+                    &home,
+                    Request::Events {
+                        filter,
+                        follow: false,
+                    },
+                )
+                .await?
+                {
+                    Response::Events { events } if json => print_json(&events)?,
+                    Response::Events { events } => {
+                        for e in &events {
+                            show(e)?;
+                        }
+                    }
+                    other => return Err(unexpected(other)),
+                }
+            }
+        }
         Cmd::Gc => match client::request(&home, Request::Gc).await? {
             Response::Gc(r) => {
                 println!(
@@ -612,6 +719,54 @@ fn print_config(entries: &[ConfigEntry]) {
             e.source.label()
         );
     }
+}
+
+/// Runs in this process, not the daemon; the blocking download and unpack go to a worker thread.
+async fn pg(home: &Home, cmd: PgCmd) -> Result<()> {
+    use crate::pg::managed;
+    let h = home.clone();
+    let blocking =
+        |e: tokio::task::JoinError| MitosisError::new(ErrorCode::Internal, e.to_string());
+    match cmd {
+        PgCmd::Install { major, version } => {
+            let src = managed::ReleaseSource::from_env();
+            let i = tokio::task::spawn_blocking(move || {
+                managed::install(&h, major, version.as_deref(), &src)
+            })
+            .await
+            .map_err(blocking)??;
+            println!("{}", i.dir.join("bin").display());
+        }
+        PgCmd::List => {
+            let installs = tokio::task::spawn_blocking(move || managed::list(&h))
+                .await
+                .map_err(blocking)??;
+            if installs.is_empty() {
+                println!("no managed Postgres builds (mitosis pg install <major>)");
+            } else {
+                let rows = installs
+                    .iter()
+                    .map(|i| {
+                        vec![
+                            i.version.clone(),
+                            if i.used { "yes" } else { "no" }.to_string(),
+                            i.dir.display().to_string(),
+                        ]
+                    })
+                    .collect();
+                print_table(&["VERSION", "USED", "PATH"], rows);
+            }
+        }
+        PgCmd::Remove { spec } => {
+            let r = tokio::task::spawn_blocking(move || {
+                managed::remove(&h, &spec, &|bin| managed::used_by_store(&h, bin))
+            })
+            .await
+            .map_err(blocking)??;
+            println!("removed Postgres {}", r.version);
+        }
+    }
+    Ok(())
 }
 
 async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {

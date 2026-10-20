@@ -5,6 +5,7 @@
 use crate::clones::{mark, stop_and_remove};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events::reason;
 use crate::names::validate_name;
 use crate::pg::{
     psql, read_pg_version, running_server, start, stop, wait_ready, PgInstall, RunningPg,
@@ -243,7 +244,7 @@ async fn run(
                 .flatten()
                 .filter(|r| r.id == clone.id)
                 .unwrap_or_else(|| clone.clone());
-            let removed = match stop_and_remove(ctx, &row).await {
+            let removed = match stop_and_remove(ctx, &row, reason::FAILED).await {
                 Ok(()) => "it was destroyed".to_string(),
                 Err(re) => format!("it could not be removed ({re}); run `mitosis gc`"),
             };

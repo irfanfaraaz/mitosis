@@ -3,6 +3,7 @@
 use crate::clone_backend::{free_space, private_size};
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events;
 use crate::proc_util::{process_start_time, rss_bytes};
 use crate::state::CloneStatus;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,16 @@ pub enum Limit {
     Count,
     Ram,
     Disk,
+}
+
+impl Limit {
+    fn name(self) -> &'static str {
+        match self {
+            Limit::Count => "count",
+            Limit::Ram => "ram",
+            Limit::Disk => "disk",
+        }
+    }
 }
 
 /// The limit a new clone would break, if any.
@@ -273,7 +284,19 @@ async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
         tokio::time::timeout(wait.max(MIN_LINE_WAIT), ctx.admission.clone().lock_owned()).await;
     let Ok(turn) = turn else {
         let (u, est) = snapshot(ctx, false).await?;
-        return Err(fits(&u, est).map_or_else(
+        let limit = fits(&u, est);
+        events::emit(
+            ctx,
+            events::QUEUE_TIMEOUT,
+            None,
+            None,
+            serde_json::json!({
+                "limit": limit.map(Limit::name),
+                "waited_ms": u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "behind_other_creates": limit.is_none(),
+            }),
+        );
+        return Err(limit.map_or_else(
             || {
                 MitosisError::new(
                     ErrorCode::CapReached,
@@ -285,6 +308,7 @@ async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
         ));
     };
     let deadline = start + wait;
+    let mut waited_for_room = false;
     loop {
         // Registered before the check, so a destroy right after it is not missed.
         let woken = ctx.room.notified();
@@ -292,6 +316,17 @@ async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
         woken.as_mut().enable();
         let (u, est) = snapshot(ctx, false).await?;
         let Some(limit) = fits(&u, est) else {
+            if waited_for_room {
+                events::emit(
+                    ctx,
+                    events::QUEUE_WAITED,
+                    None,
+                    None,
+                    serde_json::json!({
+                        "waited_ms": u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    }),
+                );
+            }
             return Ok(Admission {
                 _turn: turn,
                 waited: start.elapsed(),
@@ -299,8 +334,19 @@ async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
         };
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
+            events::emit(
+                ctx,
+                events::QUEUE_TIMEOUT,
+                None,
+                None,
+                serde_json::json!({
+                    "limit": limit.name(),
+                    "waited_ms": u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                }),
+            );
             return Err(exhausted(&u, limit, est));
         }
+        waited_for_room = true;
         let _ = tokio::time::timeout(left.min(RECHECK), woken).await;
     }
 }

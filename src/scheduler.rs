@@ -14,6 +14,11 @@ use tokio::sync::watch;
 /// try when the template has no `--every` interval.
 const RETRY_SECS: u64 = 3_600;
 
+/// Events older than this are dropped by the scheduler.
+const EVENT_KEEP_SECS: i64 = 30 * 24 * 3600;
+/// The event log keeps at most this many rows, the newest.
+const EVENT_KEEP_ROWS: u32 = 50_000;
+
 fn secs(s: u64) -> i64 {
     i64::try_from(s).unwrap_or(i64::MAX)
 }
@@ -116,6 +121,12 @@ fn plan(ctx: &Ctx, now: i64) -> Result<Vec<(String, RefreshMode)>> {
 /// Starts every build due at `now` (each on its own task, skipping templates with a build
 /// running), then prunes every template, so a lowered `--keep` applies without a new build.
 pub async fn tick(ctx: &Arc<Ctx>, now: i64) {
+    let pruned = ctx
+        .store()
+        .prune_events(now.saturating_sub(EVENT_KEEP_SECS), EVENT_KEEP_ROWS);
+    if let Err(e) = pruned {
+        crate::lifecycle::log(ctx, &format!("scheduler: prune events: {e}"));
+    }
     let c = ctx.clone();
     // Hashing migration folders reads files: off the runtime.
     match tokio::task::spawn_blocking(move || plan(&c, now)).await {

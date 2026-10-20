@@ -3,6 +3,7 @@ use crate::clone_backend::{free_space, private_size};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events::{self, reason};
 use crate::lifecycle::log;
 use crate::names::{new_clone_id, random_hex, validate_name};
 use crate::pg::{
@@ -210,7 +211,7 @@ async fn reuse_named(
                 t.previous = r.previous.clone();
             }
         }
-        if let Err(e) = destroy(ctx, &row.id).await {
+        if let Err(e) = destroy_for(ctx, &row.id, reason::FRESH).await {
             for rec in &recs {
                 let _ = ctx.store().add_env_record(&row.id, rec);
             }
@@ -348,11 +349,22 @@ async fn create_inner(
             }
             info.warnings = warnings;
             info.waited_ms = waited_ms;
+            events::emit_clone(
+                ctx,
+                events::CLONE_CREATED,
+                &row,
+                serde_json::json!({
+                    "generation": row.generation,
+                    "durable": row.durable,
+                    "protected": row.protected,
+                    "waited_ms": waited_ms,
+                }),
+            );
             Ok(info)
         }
         Err(e) => {
             // A failed cleanup leaves the row in Stopping for gc; the caller still gets the cause.
-            if let Err(ce) = stop_and_remove(ctx, &row).await {
+            if let Err(ce) = stop_and_remove(ctx, &row, reason::FAILED).await {
                 let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
                 if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log) {
                     let _ = writeln!(f, "mitosis: cleanup after failed create failed: {ce}");
@@ -765,8 +777,14 @@ pub async fn destroy_with(
     }
 }
 
-/// Destroys regardless of protection (the reaper, the parent watcher and `--fresh` use it).
+/// Destroys regardless of protection, as a user's request (see `destroy_for`).
 pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
+    destroy_for(ctx, id_or_name, reason::USER).await
+}
+
+/// Destroys regardless of protection (the reaper, the parent watcher and `--fresh` use it);
+/// `why` is the `reason` of the `clone.destroyed` event.
+pub(crate) async fn destroy_for(ctx: &Ctx, id_or_name: &str, why: &str) -> Result<String> {
     let row = ctx.store().get_clone(id_or_name)?.ok_or_else(|| {
         MitosisError::new(
             ErrorCode::CloneNotFound,
@@ -789,7 +807,7 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
         Err(InFlightOp::Create) => return Err(starting()), // Ready, but create has not returned yet
         Err(InFlightOp::Destroy) => return Ok(row.id), // user, reaper or parent watcher got there first
     };
-    stop_and_remove(ctx, &row).await?;
+    stop_and_remove(ctx, &row, why).await?;
     Ok(row.id)
 }
 
@@ -819,8 +837,9 @@ fn remove_if_present(path: &Path, dir: bool) -> Result<()> {
 
 /// Marks the clone Stopping, stops its Postgres, removes its folders and log, then drops the row.
 /// If Postgres may still be running, nothing is removed and the error is returned.
-/// A missing row is fine: the folders are still cleaned up.
-pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
+/// A missing row is fine: the folders are still cleaned up. Records `clone.destroyed` with `why`
+/// as its reason once the clone is gone.
+pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Result<()> {
     ctx.store()
         .set_clone_status(&row.id, CloneStatus::Stopping)?;
     let dir = ctx.home.clones_dir().join(&row.id);
@@ -849,6 +868,14 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
     .await?;
     restore_env(ctx, &row.id);
     let deleted = ctx.store().delete_clone(&row.id);
+    if deleted.is_ok() {
+        events::emit_clone(
+            ctx,
+            events::CLONE_DESTROYED,
+            row,
+            serde_json::json!({ "reason": why }),
+        );
+    }
     // Every destroy path ends here (user, --fresh, reaper, parent watch, gc, failed create).
     ctx.room.notify_waiters();
     deleted
@@ -998,7 +1025,7 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(create(ctx, args));
         send(destroy(ctx, "x"));
-        send(stop_and_remove(ctx, row));
+        send(stop_and_remove(ctx, row, "user"));
         send(restart(ctx, Box::leak(Box::new(row.clone()))));
     }
 }

@@ -1,6 +1,7 @@
-use crate::clones::{destroy, install_for, mark, restart, stop_and_remove, suspect_warning};
+use crate::clones::{destroy_for, install_for, mark, restart, stop_and_remove, suspect_warning};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events::{self, reason};
 use crate::names::is_clone_id;
 use crate::pg::{control_state, running_server, stop, ControlState, RunningPg};
 use crate::proc_util::{has_exited, is_alive, process_start_time};
@@ -86,7 +87,7 @@ pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
         if in_flight(ctx, &row.id) {
             continue;
         }
-        match destroy(ctx, &row.id).await {
+        match destroy_for(ctx, &row.id, reason::TTL).await {
             Ok(id) => reaped.push(id),
             Err(e) if e.code == ErrorCode::CloneNotFound => {}
             Err(e) => log(ctx, &format!("reaper: clone {}: {e}", row.id)),
@@ -248,7 +249,7 @@ async fn destroy_after_parent_exit(watch: Watch) {
     let (ctx, id) = (&watch.ctx, &watch.id);
     let deadline = tokio::time::Instant::now() + STARTING_WAIT;
     loop {
-        match destroy(ctx, id).await {
+        match destroy_for(ctx, id, reason::PARENT).await {
             Ok(_) => break,
             Err(e) if e.code == ErrorCode::CloneNotFound => break,
             // destroy refuses a clone whose create has not finished; a slow create can take a while.
@@ -296,6 +297,19 @@ pub async fn reconcile(ctx: Arc<Ctx>, now: i64) -> Result<GcReport> {
     }
     remove_orphans(&ctx, &mut report).await;
     drop_unused_reservations(&ctx, now);
+    events::emit(
+        &ctx,
+        events::GC,
+        None,
+        None,
+        serde_json::json!({
+            "adopted": report.adopted.len(),
+            "destroyed": report.destroyed.len(),
+            "orphan_folders_removed": report.orphan_folders_removed.len(),
+            "records_dropped": report.records_dropped.len(),
+            "failed": report.failed.len(),
+        }),
+    );
     Ok(report)
 }
 
@@ -327,7 +341,7 @@ async fn reconcile_clone(
         let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
             return Ok(());
         };
-        stop_and_remove(ctx, row).await?; // also clears its socket folder and log
+        stop_and_remove(ctx, row, reason::GC).await?; // also clears its socket folder and log
         report.records_dropped.push(row.id.clone());
         return Ok(());
     }
@@ -348,7 +362,7 @@ async fn reconcile_clone(
             return Ok(());
         };
         // Stops only a server identified exactly (recorded pid + start time, or cwd in `dir`).
-        stop_and_remove(ctx, row).await?;
+        stop_and_remove(ctx, row, reason::GC).await?;
         report.destroyed.push(row.id.clone());
         return Ok(());
     }
@@ -364,7 +378,7 @@ async fn drop_clone(ctx: &Ctx, row: &CloneRow, report: &mut GcReport) -> Result<
     let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
         return Ok(());
     };
-    stop_and_remove(ctx, row).await?;
+    stop_and_remove(ctx, row, reason::RECOVERY).await?;
     report.destroyed.push(row.id.clone());
     Ok(())
 }
@@ -414,11 +428,27 @@ async fn recover_dead(
             }
             row.suspect = true;
             ctx.store().update_clone(&row)?;
+            events::emit_clone(
+                ctx,
+                events::CLONE_SUSPECT,
+                &row,
+                serde_json::json!({ "cause": "unclean shutdown with fsync off" }),
+            );
         }
     }
     let (old_pid, old_start, old_port) = (row.pg_pid, row.pg_start_time, row.port);
     match restart(ctx, &mut row).await {
         Ok(warnings) => {
+            events::emit_clone(
+                ctx,
+                events::RECOVERY,
+                &row,
+                serde_json::json!({
+                    "restarted": true,
+                    "suspect": row.suspect,
+                    "port_moved": row.port != old_port,
+                }),
+            );
             report.adopted.push(row.id.clone());
             let suspect = row.suspect.then(|| suspect_warning(&row));
             for w in warnings.into_iter().chain(suspect) {
@@ -695,6 +725,7 @@ fn restore_old_templates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clones::destroy;
     use crate::paths::Home;
 
     fn tmp_ctx() -> (tempfile::TempDir, Arc<Ctx>) {

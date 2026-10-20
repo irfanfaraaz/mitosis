@@ -88,6 +88,9 @@ pub async fn upgrade(
     let new_name = as_name.unwrap_or(name);
     let (created, expected, gen) = reserve(ctx, &row, new_name, as_name.is_some(), cur.gen)?;
     let res = run(ctx, &old, &target, &cur, new_name, gen, expected, created).await;
+    if let Err(e) = &res {
+        crate::events::emit_template_failed(ctx, new_name, gen, "upgrade", e);
+    }
     if res.is_err() && created {
         // A failed upgrade leaves no new template behind.
         let store = ctx.store();

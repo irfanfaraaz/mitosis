@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod envfile;
 pub mod error;
+pub mod events;
 pub mod lifecycle;
 pub mod mcp;
 pub mod names;

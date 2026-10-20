@@ -2,6 +2,7 @@ use crate::clone_backend::apparent_size;
 use crate::clones::START_TRIES;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events;
 use crate::names::{random_hex, validate_name};
 use crate::pg::{
     initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
@@ -380,6 +381,13 @@ pub async fn rollback(ctx: &Ctx, name: &str, to: Option<u32>) -> Result<Template
         t.paused = true;
         store.update_template_settings(&t)?;
     }
+    events::emit(
+        ctx,
+        events::TEMPLATE_ROLLED_BACK,
+        None,
+        Some(name),
+        serde_json::json!({ "from": cur.gen, "to": target.gen }),
+    );
     template_info(ctx, name)
 }
 
@@ -1231,6 +1239,9 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         expected,
     )
     .await;
+    if let Err(e) = &built {
+        events::emit_template_failed(ctx, &name, gen, "build", e);
+    }
     let store = ctx.store();
     if let Err(e) = built {
         // A failed first build leaves no template behind.
@@ -1316,6 +1327,9 @@ async fn layered_held(
         Ok(ext) => Ok(ext),
         Err((step, e)) => Err(fail(ctx, &install, &side, &log, &secrets, step, e).await),
     };
+    if let Err(e) = &result {
+        events::emit_template_failed(ctx, name, gen, "layered", e);
+    }
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let row = GenerationRow {
         template: name.to_string(),
@@ -1331,7 +1345,10 @@ async fn layered_held(
         from_clone: None,
         from_gen: Some(cur.gen),
     };
-    commit_built(ctx, &install, &log, &secrets, row, cur.gen).await?;
+    if let Err(e) = commit_built(ctx, &install, &log, &secrets, row, cur.gen).await {
+        events::emit_template_failed(ctx, name, gen, "layered", &e);
+        return Err(e);
+    }
     if manual {
         let store = ctx.store();
         let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
@@ -1499,6 +1516,26 @@ pub async fn commit_generation(
             ),
         );
     }
+    let kind = match gen.kind {
+        GenKind::Promoted => events::TEMPLATE_PROMOTED,
+        GenKind::Upgraded => events::TEMPLATE_UPGRADED,
+        GenKind::Full | GenKind::Layered => events::TEMPLATE_BUILT,
+    };
+    events::emit(
+        ctx,
+        kind,
+        None,
+        Some(&gen.template),
+        serde_json::json!({
+            "gen": gen.gen,
+            "kind": gen.kind,
+            "current": current,
+            "pg_major": gen.pg_major,
+            "size_bytes": gen.size_bytes,
+            "from_clone": gen.from_clone,
+            "from_gen": gen.from_gen,
+        }),
+    );
     prune(ctx, &gen.template).await;
     Ok(current)
 }
@@ -1507,8 +1544,8 @@ pub async fn commit_generation(
 /// folders, renamed aside under the write guard (no clonefile reads them meanwhile) and deleted
 /// outside it. Failures are logged; gc removes what is left.
 pub(crate) async fn prune(ctx: &Ctx, name: &str) {
-    let doomed = match prune_rows(ctx, name) {
-        Ok(d) => d,
+    let (gens, doomed): (Vec<u32>, Vec<PathBuf>) = match prune_rows(ctx, name) {
+        Ok(d) => d.into_iter().unzip(),
         Err(e) => {
             return crate::lifecycle::log(ctx, &format!("prune of template {name}: {e}"));
         }
@@ -1516,6 +1553,13 @@ pub(crate) async fn prune(ctx: &Ctx, name: &str) {
     if doomed.is_empty() {
         return;
     }
+    events::emit(
+        ctx,
+        events::TEMPLATE_PRUNED,
+        None,
+        Some(name),
+        serde_json::json!({ "gens": gens }),
+    );
     let mut old = Vec::new();
     {
         let _swap = ctx.template_swap.write().await;
@@ -1546,8 +1590,8 @@ pub(crate) async fn prune(ctx: &Ctx, name: &str) {
     .await;
 }
 
-/// Deletes the rows of the generations to prune; returns their folders.
-fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<PathBuf>> {
+/// Deletes the rows of the generations to prune; returns their numbers and folders.
+fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<(u32, PathBuf)>> {
     let store = ctx.store();
     let Some(t) = store.get_template(name)? else {
         return Ok(Vec::new());
@@ -1557,7 +1601,7 @@ fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for g in gens[..cut].iter().filter(|g| g.gen != t.current_gen) {
         store.delete_generation(name, g.gen)?;
-        dirs.push(g.dir.clone());
+        dirs.push((g.gen, g.dir.clone()));
     }
     Ok(dirs)
 }

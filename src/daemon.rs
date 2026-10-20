@@ -5,7 +5,8 @@ use crate::lifecycle;
 use crate::paths::Home;
 use crate::promote;
 use crate::protocol::{
-    DaemonStatus, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
+    DaemonStatus, EventFilter, EventRow, Request, RequestEnvelope, Response, ResponseEnvelope,
+    PROTOCOL_VERSION,
 };
 use crate::scheduler;
 use crate::templates::{self, now};
@@ -17,6 +18,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
@@ -26,6 +28,10 @@ const REAP_EVERY: Duration = Duration::from_secs(30);
 const RESERVATIONS_EVERY_SECS: i64 = 24 * 3600;
 /// Longest request line accepted; a longer one closes the connection.
 const MAX_LINE: usize = 1 << 20;
+/// Events a plain `events` request returns when it sets no limit of its own.
+const EVENTS_DEFAULT_LIMIT: u32 = 1000;
+/// Past events a following request starts with when it sets no limit of its own.
+const EVENTS_FOLLOW_BACKLOG: u32 = 20;
 
 fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)
@@ -222,6 +228,13 @@ async fn connection(shared: Shared, stream: UnixStream) {
                 continue;
             }
             match parse(&line) {
+                Ok(Request::Events {
+                    filter,
+                    follow: true,
+                }) => {
+                    follow_events(&shared, filter, &mut rd, &mut wr).await;
+                    return;
+                }
                 Ok(req) => {
                     let shutdown = matches!(req, Request::Shutdown);
                     (dispatch_watching(&shared, req, &mut rd).await, shutdown)
@@ -246,6 +259,74 @@ async fn connection(shared: Shared, stream: UnixStream) {
         }
         if !sent || too_large || shutdown {
             return;
+        }
+    }
+}
+
+async fn list_events(ctx: &Arc<Ctx>, filter: EventFilter) -> Result<Vec<EventRow>> {
+    let ctx = ctx.clone();
+    tokio::task::spawn_blocking(move || ctx.store().list_events(&filter))
+        .await
+        .map_err(|e| internal(format!("background task failed: {e}")))?
+}
+
+/// Writes one reply line; false when the client is gone.
+async fn send(wr: &mut OwnedWriteHalf, result: Result<Response>) -> bool {
+    let Ok(mut out) = serde_json::to_vec(&ResponseEnvelope {
+        v: PROTOCOL_VERSION,
+        result,
+    }) else {
+        return false;
+    };
+    out.push(b'\n');
+    wr.write_all(&out).await.is_ok() && wr.flush().await.is_ok()
+}
+
+/// `Events` with `follow`: the latest matching events, then each new one as it happens, until the
+/// client hangs up or the daemon stops. It holds no work token, so a shutdown never waits for it.
+async fn follow_events(
+    shared: &Shared,
+    mut filter: EventFilter,
+    rd: &mut BufReader<OwnedReadHalf>,
+    wr: &mut OwnedWriteHalf,
+) {
+    // Subscribed before the backlog is read, so no event falls between the two.
+    let mut live = shared.ctx.events_tx.subscribe();
+    let mut shutdown = shared.shutdown.subscribe();
+    filter.limit.get_or_insert(EVENTS_FOLLOW_BACKLOG);
+    let events = match list_events(&shared.ctx, filter.clone()).await {
+        Ok(events) => events,
+        Err(e) => {
+            send(wr, Err(e)).await;
+            return;
+        }
+    };
+    let mut last = events.last().map_or(0, |e| e.id);
+    if !send(wr, Ok(Response::Events { events })).await {
+        return;
+    }
+    let mut watching = true;
+    while !*shutdown.borrow() {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            // Anything the client sends, or a hang-up, ends the stream; this only watches for it.
+            filled = rd.fill_buf(), if watching => match filled {
+                Ok(b) if !b.is_empty() => watching = false,
+                _ => return,
+            },
+            ev = live.recv() => match ev {
+                Ok(e) if e.id > last && crate::events::matches(&filter, &e) => {
+                    last = e.id;
+                    if !send(wr, Ok(Response::Event(e))).await {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    log(&shared.ctx.home, &format!("events follower skipped {n} events"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
         }
     }
 }
@@ -427,6 +508,12 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
             ctx.set_config(new);
             ctx.room.notify_waiters(); // a raised limit may let queued creates in
             Response::Ok
+        }
+        Request::Events { mut filter, .. } => {
+            filter.limit.get_or_insert(EVENTS_DEFAULT_LIMIT);
+            Response::Events {
+                events: list_events(&ctx, filter).await?,
+            }
         }
         Request::Shutdown => Response::Ok,
     })

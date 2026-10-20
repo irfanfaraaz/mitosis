@@ -1,7 +1,9 @@
 use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
-use crate::protocol::{Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION};
+use crate::protocol::{
+    EventFilter, EventRow, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
+};
 use crate::service;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
@@ -188,8 +190,13 @@ async fn exchange(stream: UnixStream, req: &Request) -> Result<Reply> {
         };
         return Err(unavailable(msg));
     }
-    // Check the version before the shape: another version may not decode at all.
-    let value: serde_json::Value = serde_json::from_slice(&buf).map_err(|e| {
+    decode(&buf)
+}
+
+/// Reads one reply line. The version is checked before the shape: another version may not
+/// decode at all.
+fn decode(buf: &[u8]) -> Result<Reply> {
+    let value: serde_json::Value = serde_json::from_slice(buf).map_err(|e| {
         MitosisError::new(
             ErrorCode::ProtocolMismatch,
             format!("unreadable daemon reply: {e}"),
@@ -209,6 +216,53 @@ async fn exchange(stream: UnixStream, req: &Request) -> Result<Reply> {
         )
     })?;
     env.result.map(|r| Reply::Done(Box::new(r)))
+}
+
+/// Streams the daemon's event log: calls `on_event` for the latest events that match `filter`
+/// and then for each new one, until the daemon stops (`Ok`) or the call fails. Starts the daemon
+/// if none runs.
+pub async fn follow_events(
+    home: &Home,
+    filter: EventFilter,
+    mut on_event: impl FnMut(EventRow),
+) -> Result<()> {
+    // An ordinary request first: it starts the daemon, or replaces one from an older release.
+    request(home, Request::Status).await?;
+    let (rd, mut wr) = connect_started(home).await?.into_split();
+    let mut line = serde_json::to_vec(&RequestEnvelope {
+        v: PROTOCOL_VERSION,
+        request: Request::Events {
+            filter,
+            follow: true,
+        },
+    })?;
+    line.push(b'\n');
+    wr.write_all(&line)
+        .await
+        .map_err(|e| unavailable(format!("send request: {e}")))?;
+    let mut rd = BufReader::new(rd);
+    loop {
+        let mut buf = Vec::new();
+        (&mut rd)
+            .take(MAX_REPLY + 1)
+            .read_until(b'\n', &mut buf)
+            .await
+            .map_err(|e| unavailable(format!("read reply: {e}")))?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if buf.last() != Some(&b'\n') {
+            return Err(unavailable("daemon reply too large or cut short"));
+        }
+        match decode(&buf)? {
+            Reply::Done(r) => match *r {
+                Response::Events { events } => events.into_iter().for_each(&mut on_event),
+                Response::Event(e) => on_event(e),
+                _ => return Err(mismatch_text(None)),
+            },
+            Reply::Older(v) => return Err(mismatch(v)),
+        }
+    }
 }
 
 /// Starts `current_exe() daemon` in its own session and waits until its socket accepts connections.

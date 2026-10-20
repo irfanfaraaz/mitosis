@@ -2,7 +2,7 @@ use crate::error::MitosisError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -227,7 +227,47 @@ pub enum Request {
     Usage,
     /// Re-read `config.toml` and the environment; later requests use the new settings.
     ConfigReload,
+    /// Past events matching `filter`, oldest first. With `follow` the daemon keeps the connection
+    /// open after that list and writes one `Response::Event` line per new event.
+    Events {
+        #[serde(default)]
+        filter: EventFilter,
+        #[serde(default)]
+        follow: bool,
+    },
     Shutdown,
+}
+
+/// One entry of the event log. `detail` never holds a password or a URL with one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct EventRow {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    pub detail: serde_json::Value,
+}
+
+/// Which events to list; an unset field matches everything.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct EventFilter {
+    /// A clone's name or id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// An exact kind (`clone.created`) or a group (`clone` matches every `clone.*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Unix seconds; only events at or after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    /// The newest `limit` matches (still listed oldest first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -373,6 +413,11 @@ pub enum Response {
     Gc(GcReport),
     Status(DaemonStatus),
     Usage(crate::budget::Usage),
+    Events {
+        events: Vec<EventRow>,
+    },
+    /// One new event on a following `Request::Events` connection.
+    Event(EventRow),
     Ok,
 }
 
@@ -421,7 +466,7 @@ mod tests {
         assert!(!line.contains('\n'));
         let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back.v, PROTOCOL_VERSION);
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
         match back.request {
             Request::CloneCreate(a) => {
                 assert_eq!(a.template, "main");
@@ -642,6 +687,32 @@ mod tests {
             serde_json::from_str(r#"{"type":"generations","template":"main","generations":[]}"#)
                 .unwrap();
         assert!(matches!(r, Response::Generations { paused: false, .. }));
+    }
+
+    #[test]
+    fn events_round_trip_and_defaults() {
+        let row = EventRow {
+            id: 7,
+            ts: 1_700_000_000,
+            kind: "clone.created".into(),
+            clone: Some("feat".into()),
+            template: None,
+            detail: serde_json::json!({ "id": "abc123" }),
+        };
+        round_trip(Response::Events {
+            events: vec![row.clone()],
+        });
+        round_trip(Response::Event(row));
+        // A request that names no filter and no follow still parses.
+        let r: Request = serde_json::from_str(r#"{"type":"events"}"#).unwrap();
+        let Request::Events { filter, follow } = r else {
+            panic!("wrong variant")
+        };
+        assert_eq!((filter, follow), (EventFilter::default(), false));
+        assert_eq!(
+            serde_json::to_string(&EventFilter::default()).unwrap(),
+            "{}"
+        );
     }
 
     #[test]
