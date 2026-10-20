@@ -1,3 +1,7 @@
+// The serial_home guard only orders whole tests, each on its own runtime thread; no task in the
+// same runtime ever waits on it.
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 use common::{seed, tmp_home};
