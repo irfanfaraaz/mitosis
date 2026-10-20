@@ -1,4 +1,5 @@
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::paths::Home;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,7 +34,7 @@ pub fn parse_version(output: &str) -> Option<(u32, String)> {
     Some((major, version))
 }
 
-fn version_key(version: &str) -> Vec<u32> {
+pub(crate) fn version_key(version: &str) -> Vec<u32> {
     version.split('.').filter_map(|p| p.parse().ok()).collect()
 }
 
@@ -93,19 +94,48 @@ fn probe(bin_dir: &Path) -> Option<PgInstall> {
     })
 }
 
+/// System installs only; the daemon uses `discover_with` so managed builds count too.
 pub fn discover() -> Vec<PgInstall> {
+    discover_with(None)
+}
+
+/// System installs plus, given a home, the builds `mitosis pg install` put in `<home>/pg/`.
+pub fn discover_with(home: Option<&Home>) -> Vec<PgInstall> {
     let mut seen = HashSet::new();
-    let mut installs: Vec<PgInstall> = candidates()
-        .into_iter()
-        .filter_map(|dir| {
-            // By the real `postgres` file: Homebrew links one install under several folders.
-            let canon = std::fs::canonicalize(dir.join("postgres")).ok()?;
-            if !seen.insert(canon) {
-                return None;
-            }
-            probe(&dir)
-        })
-        .collect();
+    let mut probe_all = |dirs: Vec<PathBuf>| -> Vec<PgInstall> {
+        dirs.into_iter()
+            .filter_map(|dir| {
+                // By the real `postgres` file: Homebrew links one install under several folders.
+                let canon = std::fs::canonicalize(dir.join("postgres")).ok()?;
+                if !seen.insert(canon) {
+                    return None;
+                }
+                probe(&dir)
+            })
+            .collect()
+    };
+    let system = probe_all(candidates());
+    let managed = home
+        .map(|h| probe_all(managed_candidates(h)))
+        .unwrap_or_default();
+    merge(system, managed)
+}
+
+fn managed_candidates(home: &Home) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(home.pg_dir()) else {
+        return vec![];
+    };
+    rd.flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path().join("bin"))
+        .collect()
+}
+
+/// A system install of a major wins over a managed one of the same major; newest first.
+fn merge(system: Vec<PgInstall>, managed: Vec<PgInstall>) -> Vec<PgInstall> {
+    let majors: HashSet<u32> = system.iter().map(|i| i.major).collect();
+    let mut installs = system;
+    installs.extend(managed.into_iter().filter(|m| !majors.contains(&m.major)));
     installs.sort_by(|a, b| {
         b.major
             .cmp(&a.major)
@@ -235,6 +265,28 @@ mod tests {
         let installs = vec![mk(17, "17.0"), mk(16, "16.4")];
         assert_eq!(newest(&installs).unwrap().major, 17);
         assert_eq!(find_major(&installs, 16).unwrap().version, "16.4");
+    }
+
+    #[test]
+    fn system_install_wins_same_major() {
+        let mk = |dir: &str, major, v: &str| PgInstall {
+            bin_dir: dir.into(),
+            major,
+            version: v.into(),
+        };
+        let system = vec![mk("/opt/homebrew/opt/postgresql@17/bin", 17, "17.2")];
+        let managed = vec![
+            mk("/h/pg/17.9/bin", 17, "17.9"),
+            mk("/h/pg/16.4/bin", 16, "16.4"),
+            mk("/h/pg/18.1/bin", 18, "18.1"),
+        ];
+        let all = merge(system, managed);
+        let got: Vec<_> = all.iter().map(|i| (i.major, i.version.as_str())).collect();
+        assert_eq!(got, vec![(18, "18.1"), (17, "17.2"), (16, "16.4")]);
+        assert_eq!(
+            find_major(&all, 17).unwrap().bin_dir,
+            PathBuf::from("/opt/homebrew/opt/postgresql@17/bin")
+        );
     }
 
     #[test]

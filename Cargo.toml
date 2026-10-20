@@ -30,6 +30,11 @@ serde_json = "1"
 nix = { version = "0.31", features = ["signal", "process", "event", "fs", "term"] }
 libc = "0.2"
 toml = "1.1.8"
+# `mitosis pg install` only (the one place Mitosis downloads): rustls keeps it free of OpenSSL; no transparent gzip so the SHA-256 covers the bytes on the wire.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+sha2 = "0.11.1"
+flate2 = "1.1.10"
+tar = { version = "0.4.46", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

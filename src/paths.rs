@@ -55,6 +55,11 @@ impl Home {
         self.root.join("clones")
     }
 
+    /// Postgres builds installed by `mitosis pg install`, one folder per `x.y` version.
+    pub fn pg_dir(&self) -> PathBuf {
+        self.root.join("pg")
+    }
+
     pub fn sockets_dir(&self) -> PathBuf {
         self.root.join("sockets")
     }
