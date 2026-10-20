@@ -76,7 +76,7 @@ fn kill_9(env: &TestEnv, info: &CloneInfo) {
 }
 
 #[tokio::test]
-async fn named_clone_restarts_after_reboot() {
+async fn named_clone_restarts_after_clean_stop() {
     let Some(env) = TestEnv::new() else { return };
     template(&env, "main", SEED).await;
     let a = create(&env.ctx, args(Some("x"), false)).await.unwrap();
