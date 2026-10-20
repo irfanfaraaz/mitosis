@@ -1,0 +1,8 @@
+[
+  {
+    "dir": "string",
+    "major": "number",
+    "used": "boolean",
+    "version": "string"
+  }
+]

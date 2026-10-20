@@ -5,12 +5,13 @@ use crate::daemon;
 use crate::doctor;
 use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events;
 use crate::mcp;
-use crate::names::{format_duration, parse_duration, validate_name};
+use crate::names::{format_duration, parse_duration, parse_wait, validate_name};
 use crate::paths::Home;
 use crate::protocol::{
-    CloneCreateArgs, CloneInfo, MigrateCmd, Request, Response, TemplateInfo, TemplateInitArgs,
-    TemplateSetArgs, TemplateSettings, TemplateSource,
+    BranchArgs, CloneCreateArgs, CloneInfo, EventFilter, EventRow, MigrateCmd, Request, Response,
+    TemplateInfo, TemplateInitArgs, TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::service;
 use crate::templates::now;
@@ -63,6 +64,10 @@ enum Cmd {
         /// How long to wait for room under the limits, like 30s or 2m; 0 fails at once.
         #[arg(long)]
         wait: Option<String>,
+        /// Clone the template built for a git branch (default: the branch checked out here),
+        /// layered on --template by running its migrate command in this checkout.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        branch: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -71,6 +76,10 @@ enum Cmd {
         id_or_name: String,
         #[arg(long, default_value = "DATABASE_URL")]
         var: String,
+        /// Print the URL straight to the clone's port instead of the router URL (wakes a
+        /// sleeping clone first).
+        #[arg(long)]
+        direct: bool,
     },
     /// List clones.
     List {
@@ -89,15 +98,58 @@ enum Cmd {
         #[arg(long)]
         forget: bool,
     },
+    /// Start a sleeping clone now instead of on its first connection.
+    Wake { id_or_name: String },
+    /// Show what a clone changed against the template generation it came from.
+    Diff {
+        id_or_name: String,
+        /// Compare one table row by row (needs a primary key).
+        #[arg(long)]
+        table: Option<String>,
+        /// Rows shown per kind with --table.
+        #[arg(long, requires = "table")]
+        limit: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Make a running clone the newest generation of its template (or of --template).
     Promote {
-        clone: String,
+        id_or_name: String,
         /// Promote into this template instead of the clone's own; created when it does not exist.
         #[arg(long)]
         template: Option<String>,
     },
     /// Remove expired clones and leftovers.
     Gc,
+    /// What the daemon did and why: creates, destroys, builds, rollbacks, gc, recovery, queue waits.
+    Events {
+        /// Keep running and print new events as they happen.
+        #[arg(long)]
+        follow: bool,
+        /// Only events of this clone (name or id).
+        #[arg(long)]
+        clone: Option<String>,
+        /// Only events of this template.
+        #[arg(long)]
+        template: Option<String>,
+        /// Only this kind (`clone.created`) or group (`clone`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only events from this long ago, like 30m, 2h or 1d.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only the newest N matching events (default 1000; with --follow, 20 before the new ones).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: Option<u32>,
+        /// A JSON array; with --follow one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download and manage Postgres builds (the only commands that ever download).
+    Pg {
+        #[command(subcommand)]
+        command: PgCmd,
+    },
     /// Check the home, config, daemon, Postgres installs and templates for problems.
     Doctor {
         /// Finish pending .env restores and run gc.
@@ -119,6 +171,7 @@ enum Cmd {
         command: ServiceCmd,
     },
     /// Show the settings and where each value comes from, or change one.
+    #[command(args_conflicts_with_subcommands = true)]
     Config {
         #[command(subcommand)]
         command: Option<ConfigCmd>,
@@ -131,7 +184,7 @@ enum Cmd {
 enum ConfigCmd {
     /// Write a setting to config.toml and tell a running daemon to reload.
     Set {
-        /// max_clones, min_free_disk, ram_budget, disk_budget, queue_wait or clone_disk_warn.
+        /// One of the settings `mitosis config` lists, like max_clones or idle_sleep.
         key: String,
         /// A number, a size like 4GB, a duration like 60s, or off.
         value: String,
@@ -140,23 +193,32 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum TemplateCmd {
-    /// Build a template from a database URL or a seed command.
+    /// Build a template from a database URL, a physical copy of a server, or a seed command.
     Init {
         #[arg(default_value = "main")]
         name: String,
         /// Copy an existing database with pg_dump.
-        #[arg(long, conflicts_with = "seed", required_unless_present = "seed")]
+        #[arg(
+            long,
+            conflicts_with_all = ["seed", "basebackup"],
+            required_unless_present_any = ["seed", "basebackup"]
+        )]
         from_url: Option<String>,
+        /// Copy a running server physically with pg_basebackup (needs a role with REPLICATION).
+        #[arg(long, conflicts_with = "seed")]
+        basebackup: Option<String>,
         /// Shell command run in this folder with DATABASE_URL set.
         #[arg(long)]
         seed: Option<String>,
+        /// The database to keep (a --basebackup copy has all of the server's; default: the URL's).
         #[arg(long)]
         database: Option<String>,
         /// Migrations folder; the template is flagged stale when it changes.
         #[arg(long)]
         migrations: Option<std::path::PathBuf>,
+        /// Postgres major to build with, like 17 (default: the newest installed).
         #[arg(long)]
-        pg_version: Option<u32>,
+        pg_major: Option<u32>,
         #[command(flatten)]
         settings: SettingsFlags,
     },
@@ -224,7 +286,7 @@ struct SettingsFlags {
     every: Option<String>,
     /// How scheduled rebuilds run.
     #[arg(long, value_parser = ["full", "layered"])]
-    mode: Option<String>,
+    every_mode: Option<String>,
     /// Migration command for layered refreshes, run in this folder with DATABASE_URL set, or off.
     #[arg(long)]
     migrate: Option<String>,
@@ -234,6 +296,13 @@ struct SettingsFlags {
     /// When a clone's template is older than --max-age: warn, or also refresh in the background.
     #[arg(long, value_parser = ["warn", "refresh"])]
     on_stale: Option<String>,
+    /// Masking file (TOML: columns to mask, row subsets) applied to every build, or off.
+    #[arg(long)]
+    mask: Option<std::path::PathBuf>,
+    /// The git branch the template's checkout follows (layered builds skip on other branches),
+    /// or off.
+    #[arg(long)]
+    base_branch: Option<String>,
 }
 
 /// A protocol enum from its snake_case name (clap already limited the choices).
@@ -271,18 +340,54 @@ impl SettingsFlags {
             ),
             None => (None, false),
         };
+        let (mask, mask_off) = match self.mask {
+            Some(p) if p.as_os_str() == "off" => (None, true),
+            // Stored absolute, like --migrations, so the daemon finds it from any folder.
+            Some(p) => (
+                Some(std::fs::canonicalize(&p).map_err(|e| {
+                    MitosisError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("masking file {}: {e}", p.display()),
+                    )
+                })?),
+                false,
+            ),
+            None => (None, false),
+        };
         let settings = TemplateSettings {
             keep: self.keep,
             every_secs,
             every_off,
-            every_mode: enum_arg(self.mode)?,
+            every_mode: enum_arg(self.every_mode)?,
             migrate,
             migrate_off,
             auto_migrate: self.auto_migrate.map(|a| a == "on"),
             on_stale: enum_arg(self.on_stale)?,
+            mask,
+            mask_off,
+            base_branch: self.base_branch.clone().filter(|b| b != "off"),
+            base_branch_off: self.base_branch.as_deref() == Some("off"),
         };
         Ok((max_age_secs, settings))
     }
+}
+
+#[derive(Subcommand)]
+enum PgCmd {
+    /// Download, verify and unpack the newest build of a Postgres major into the Mitosis home.
+    Install {
+        major: u32,
+        /// An exact minor (17.9), or a release tag (17.9.1), instead of the newest.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// List the builds installed by `pg install` and which ones Mitosis uses.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an installed build by major (17) or version (17.9).
+    Remove { spec: String },
 }
 
 #[derive(Subcommand)]
@@ -406,8 +511,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             // No daemon start: a stopped daemon reads the file when it next starts.
             client::request_if_running(&home, Request::ConfigReload).await?;
             println!("{key} = {}", value.trim());
+            // The file is written, but an environment variable of this shell still wins.
+            if let Some((var, value)) = Config::env_override(&home, &key)? {
+                eprintln!("note: {var} is set and overrides this; the value in effect is {value}");
+            }
         }
         Cmd::Template { command } => template(&home, command).await?,
+        Cmd::Pg { command } => pg(&home, command).await?,
         Cmd::Clone {
             template,
             name,
@@ -418,6 +528,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             env_file,
             env_var,
             wait,
+            branch,
             json,
         } => {
             validate_name("template", &template)?;
@@ -427,8 +538,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let ttl_secs = parse_duration(&ttl)?.as_secs();
             let wait_secs = match wait.as_deref() {
                 None => None,
-                Some("0" | "0s") => Some(0),
-                Some(w) => Some(parse_duration(w)?.as_secs()),
+                Some(w) => Some(parse_wait(w)?.as_secs()),
             };
             let args = CloneCreateArgs {
                 template: template.clone(),
@@ -442,6 +552,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 parent_pid: None,
                 env: None,
                 wait_secs,
+                // `create_clone` resolves the branch and the repository root from this folder.
+                branch: match branch {
+                    Some(name) => Some(BranchArgs {
+                        name,
+                        repo_root: std::env::current_dir()?,
+                        path: None,
+                    }),
+                    None => None,
+                },
             };
             let info = envfile::create_clone(&home, args, env_file, env_var).await?;
             for w in &info.warnings {
@@ -450,13 +569,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if info.existing {
                 eprintln!("note: clone {} was already running", info.id);
             }
+            if info.rebuilt {
+                eprintln!(
+                    "note: template {} was rebuilt for this branch",
+                    info.template
+                );
+            }
             // Warnings are best effort: the clone already exists.
             if let Ok(Response::Templates { templates }) =
                 client::request(&home, Request::TemplateList).await
             {
                 for w in templates
                     .iter()
-                    .filter(|t| t.name == template)
+                    .filter(|t| t.name == info.template)
                     .flat_map(|t| &t.warnings)
                 {
                     eprintln!("warning: {w}");
@@ -468,22 +593,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{}", info.url);
             }
         }
-        Cmd::Env { id_or_name, var } => {
-            let clones = match client::request(&home, Request::CloneList).await? {
-                Response::Clones { clones } => clones,
-                other => return Err(unexpected(other)),
-            };
-            let c = clones
-                .iter()
-                .find(|c| c.id == id_or_name || c.name.as_deref() == Some(id_or_name.as_str()))
-                .ok_or_else(|| {
-                    MitosisError::new(
-                        ErrorCode::CloneNotFound,
-                        format!("clone {id_or_name} not found"),
-                    )
-                    .with_hint("see running clones with `mitosis list`")
-                })?;
-            println!("{var}={}", c.url);
+        Cmd::Env {
+            id_or_name,
+            var,
+            direct,
+        } => {
+            // The printed line goes into a .env file: the same names `--env-var` accepts.
+            envfile::check_var(&var)?;
+            let (url, warnings) = envfile::env_url(&home, &id_or_name, direct).await?;
+            for w in &warnings {
+                eprintln!("warning: {w}");
+            }
+            println!("{var}={url}");
         }
         Cmd::List { json } => {
             let clones = match client::request(&home, Request::CloneList).await? {
@@ -518,14 +639,47 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 eprintln!("warning: {w}");
             }
         }
-        Cmd::Promote { clone, template } => {
+        Cmd::Wake { id_or_name } => {
+            let req = Request::CloneWake { id_or_name };
+            match client::request(&home, req).await? {
+                Response::Clone(info) => {
+                    for w in &info.warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    println!("{}", info.name.as_deref().unwrap_or(&info.id));
+                }
+                other => return Err(unexpected(other)),
+            }
+        }
+        Cmd::Diff {
+            id_or_name,
+            table,
+            limit,
+            json,
+        } => {
+            let req = Request::CloneDiff {
+                id_or_name,
+                table,
+                limit,
+                parent_pid: None,
+            };
+            match client::request(&home, req).await? {
+                Response::Diff(report) if json => print_json(&report)?,
+                Response::Diff(report) => print!("{}", crate::diff::render(&report)),
+                other => return Err(unexpected(other)),
+            }
+        }
+        Cmd::Promote {
+            id_or_name,
+            template,
+        } => {
             let req = Request::ClonePromote {
-                id_or_name: clone.clone(),
+                id_or_name: id_or_name.clone(),
                 template,
             };
             match client::request(&home, req).await? {
                 Response::TemplateBuilt(t) => println!(
-                    "promoted {clone} to template {} generation {} (Postgres {}, {})",
+                    "promoted {id_or_name} to template {} generation {} (Postgres {}, {})",
                     t.name,
                     t.current_gen,
                     t.pg_major,
@@ -542,6 +696,77 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print!("{}", doctor::render(&checks));
             }
             return Ok(ExitCode::from(doctor::exit_code(&checks)));
+        }
+        Cmd::Events {
+            follow,
+            clone,
+            template,
+            kind,
+            since,
+            limit,
+            json,
+        } => {
+            let since = match since {
+                Some(d) => Some(now().saturating_sub(parse_duration(&d)?.as_secs() as i64)),
+                None => None,
+            };
+            let filter = EventFilter {
+                clone,
+                template,
+                kind,
+                since,
+                limit,
+            };
+            let show = |e: &EventRow| -> Result<()> {
+                if json {
+                    println!("{}", serde_json::to_string(e)?);
+                } else {
+                    println!(
+                        "{}  {}  {}  {}",
+                        events::local_time(e.ts),
+                        e.kind,
+                        events::row_label(e),
+                        events::short_detail(&e.detail)
+                    );
+                }
+                Ok(())
+            };
+            if follow {
+                let mut failed = None;
+                client::follow_events(&home, filter, |e| {
+                    if failed.is_none() {
+                        failed = show(&e).err();
+                    }
+                })
+                .await?;
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+            } else {
+                match client::request(
+                    &home,
+                    Request::Events {
+                        filter,
+                        follow: false,
+                    },
+                )
+                .await?
+                {
+                    Response::Events { events } if json => print_json(&events)?,
+                    Response::Events { events } => {
+                        for e in &events {
+                            show(e)?;
+                        }
+                        let cap = limit.unwrap_or(daemon::EVENTS_DEFAULT_LIMIT);
+                        if events.len() >= cap as usize {
+                            eprintln!(
+                                "note: showing only the newest {cap} events; use --limit to see more"
+                            );
+                        }
+                    }
+                    other => return Err(unexpected(other)),
+                }
+            }
         }
         Cmd::Gc => match client::request(&home, Request::Gc).await? {
             Response::Gc(r) => {
@@ -578,6 +803,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "uptime    {}",
                     format_duration(Duration::from_secs(s.uptime_secs))
                 );
+                println!("router    {}", router_state(&s.router));
+                if s.router.as_ref().is_some_and(|r| !r.listening) {
+                    eprintln!(
+                        "warning: the router is not listening; it retries every minute (direct URLs still work: mitosis env <clone> --direct, which wakes a sleeping clone; or mitosis wake <clone>)"
+                    );
+                }
             }
             Some(other) => return Err(unexpected(other)),
         },
@@ -614,15 +845,66 @@ fn print_config(entries: &[ConfigEntry]) {
     }
 }
 
+/// Runs in this process, not the daemon; the blocking download and unpack go to a worker thread.
+async fn pg(home: &Home, cmd: PgCmd) -> Result<()> {
+    use crate::pg::managed;
+    let h = home.clone();
+    let blocking =
+        |e: tokio::task::JoinError| MitosisError::new(ErrorCode::Internal, e.to_string());
+    match cmd {
+        PgCmd::Install { major, version } => {
+            let src = managed::ReleaseSource::from_env();
+            let i = tokio::task::spawn_blocking(move || {
+                managed::install(&h, major, version.as_deref(), &src)
+            })
+            .await
+            .map_err(blocking)??;
+            println!("{}", i.dir.join("bin").display());
+        }
+        PgCmd::List { json } => {
+            let installs = tokio::task::spawn_blocking(move || managed::list(&h))
+                .await
+                .map_err(blocking)??;
+            if json {
+                print_json(&installs)?;
+            } else if installs.is_empty() {
+                println!("no managed Postgres builds (mitosis pg install <major>)");
+            } else {
+                let rows = installs
+                    .iter()
+                    .map(|i| {
+                        vec![
+                            i.version.clone(),
+                            if i.used { "yes" } else { "no" }.to_string(),
+                            i.dir.display().to_string(),
+                        ]
+                    })
+                    .collect();
+                print_table(&["VERSION", "USED", "PATH"], rows);
+            }
+        }
+        PgCmd::Remove { spec } => {
+            let r = tokio::task::spawn_blocking(move || {
+                managed::remove(&h, &spec, &|bin| managed::used_by_store(&h, bin))
+            })
+            .await
+            .map_err(blocking)??;
+            println!("removed Postgres {}", r.version);
+        }
+    }
+    Ok(())
+}
+
 async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
     match cmd {
         TemplateCmd::Init {
             name,
             from_url,
+            basebackup,
             seed,
             database,
             migrations,
-            pg_version,
+            pg_major,
             settings,
         } => {
             validate_name("template", &name)?;
@@ -637,15 +919,18 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                     })
                 })
                 .transpose()?;
-            let source = match (from_url, seed) {
-                (Some(url), _) => TemplateSource::Url { url },
+            let source = match (from_url, basebackup, seed) {
+                (Some(url), _, _) => TemplateSource::Url { url },
+                (None, Some(url), _) => TemplateSource::Basebackup { url },
                 // The seed runs where and with the PATH it would in this shell.
-                (None, Some(command)) => TemplateSource::Seed {
+                (None, None, Some(command)) => TemplateSource::Seed {
                     command,
                     cwd: Some(std::env::current_dir()?),
                     path: std::env::var("PATH").ok(),
                 },
-                (None, None) => unreachable!("clap requires --from-url or --seed"),
+                (None, None, None) => {
+                    unreachable!("clap requires --from-url, --basebackup or --seed")
+                }
             };
             let args = TemplateInitArgs {
                 name,
@@ -653,7 +938,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                 database,
                 migrations,
                 max_age_secs,
-                pg_major: pg_version,
+                pg_major,
                 settings,
             };
             match client::request(home, Request::TemplateInit(args)).await? {
@@ -713,15 +998,31 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
             if json {
                 print_json(&templates)?;
             } else {
+                // Branch templates right under their base, indented; any whose base is gone last.
+                let is_base = |t: &&TemplateInfo, b: &str| t.base.as_deref() == Some(b);
+                let mut ordered: Vec<&TemplateInfo> = Vec::new();
+                for t in templates.iter().filter(|t| t.base.is_none()) {
+                    ordered.push(t);
+                    ordered.extend(templates.iter().filter(|b| is_base(b, &t.name)));
+                }
+                ordered.extend(templates.iter().filter(|t| {
+                    t.base
+                        .as_deref()
+                        .is_some_and(|b| !templates.iter().any(|x| x.name == b))
+                }));
                 print_table(
                     &[
                         "NAME", "GEN", "PAUSED", "PG", "DATABASE", "SIZE", "AGE", "SOURCE",
                     ],
-                    templates
-                        .iter()
+                    ordered
+                        .into_iter()
                         .map(|t| {
                             vec![
-                                t.name.clone(),
+                                if t.base.is_some() {
+                                    format!("  {}", t.name)
+                                } else {
+                                    t.name.clone()
+                                },
                                 format!("{}/{}", t.current_gen, t.generations),
                                 if t.paused { "paused" } else { "-" }.to_string(),
                                 t.pg_major.to_string(),
@@ -736,7 +1037,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
             }
         }
         TemplateCmd::History { name, json } => {
-            validate_name("template", &name)?;
+            crate::templates::validate_template_ref(&name)?;
             let (template, generations, paused) =
                 match client::request(home, Request::TemplateHistory { name }).await? {
                     Response::Generations {
@@ -747,11 +1048,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                     other => return Err(unexpected(other)),
                 };
             if json {
-                print_json(&serde_json::json!({
-                    "template": template,
-                    "paused": paused,
-                    "generations": generations,
-                }))?;
+                print_json(&history_json(&template, paused, &generations))?;
             } else {
                 if paused {
                     println!("{}", paused_line(&template));
@@ -814,12 +1111,31 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
     Ok(())
 }
 
+/// `template history --json`.
+pub fn history_json(
+    template: &str,
+    paused: bool,
+    generations: &[crate::protocol::GenerationInfo],
+) -> serde_json::Value {
+    serde_json::json!({
+        "template": template,
+        "paused": paused,
+        "generations": generations,
+    })
+}
+
+/// The command tree, for the contract tests.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}
+
 /// The template's source for the table: the URL (the daemon already masked its password) or
 /// the seed command, cut to one short line.
 fn source_cell(source: &TemplateSource) -> String {
     const MAX: usize = 48;
     let text = match source {
         TemplateSource::Url { url } => url.clone(),
+        TemplateSource::Basebackup { url } => format!("basebackup: {url}"),
         TemplateSource::Seed { command, .. } => {
             format!(
                 "seed: {}",
@@ -860,6 +1176,7 @@ fn print_clones(clones: &[CloneInfo]) {
             "NAME",
             "TEMPLATE",
             "PORT",
+            "URL",
             "AGE",
             "TTL LEFT",
             "RAM",
@@ -874,6 +1191,8 @@ fn print_clones(clones: &[CloneInfo]) {
                     c.name.clone().unwrap_or_else(|| "-".into()),
                     c.template.clone(),
                     c.port.to_string(),
+                    // The password stays out of the table; `mitosis env` prints the full URL.
+                    crate::templates::redact_url(&c.url),
                     secs(now - c.created_at),
                     if c.protected {
                         "never".into()
@@ -889,9 +1208,12 @@ fn print_clones(clones: &[CloneInfo]) {
     );
 }
 
-/// `!` for a clone past its disk warning, then `protected`.
+/// `sleeping`, `!` for a clone past its disk warning, then `protected`.
 fn flags(c: &CloneInfo) -> String {
     let mut f = Vec::new();
+    if c.status == "sleeping" {
+        f.push("sleeping");
+    }
     if c.disk_warn {
         f.push("!");
     }
@@ -945,14 +1267,39 @@ impl Drop for RawTerminal {
     }
 }
 
-/// Waits up to 2 s for a key; true when it asks to quit (`q` or Ctrl-C).
+/// Waits up to 2 s for a key; true when it asks to quit (`q` or Ctrl-C). Reads everything
+/// waiting at once, so a multi-byte key (an arrow) causes one redraw, not one per byte.
 fn quit_key() -> bool {
     use std::io::Read;
-    let mut b = [0u8; 1];
-    matches!(std::io::stdin().read(&mut b), Ok(1) if matches!(b[0], b'q' | b'Q' | 3))
+    let mut b = [0u8; 64];
+    matches!(std::io::stdin().read(&mut b), Ok(n) if asks_to_quit(&b[..n]))
 }
 
-fn draw_top(u: &budget::Usage) {
+/// True when the bytes read from the terminal hold `q`, `Q` or Ctrl-C.
+fn asks_to_quit(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| matches!(b, b'q' | b'Q' | 3))
+}
+
+/// `off`, `listening on 127.0.0.1:54300`, or why the router is not listening.
+pub fn router_state(r: &Option<crate::protocol::RouterStatus>) -> String {
+    match r {
+        None => "off".into(),
+        Some(r) => {
+            let host = if r.listen.is_empty() {
+                "127.0.0.1"
+            } else {
+                &r.listen
+            };
+            match &r.error {
+                None if r.listening => format!("listening on {host}:{}", r.port),
+                None => format!("not listening on {host}:{}", r.port),
+                Some(e) => format!("not listening: {e}"),
+            }
+        }
+    }
+}
+
+fn draw_top(u: &budget::Usage, router: &Option<crate::protocol::RouterStatus>) {
     let now = now();
     let secs = |s: i64| format_duration(Duration::from_secs(u64::try_from(s).unwrap_or(0)));
     let opt_bytes = |b: Option<u64>| b.map_or("-".to_string(), human_bytes);
@@ -967,6 +1314,7 @@ fn draw_top(u: &budget::Usage) {
             "ID",
             "NAME",
             "TEMPLATE",
+            "STATUS",
             "TTL LEFT",
             "RAM",
             "EXTRA DISK",
@@ -979,12 +1327,18 @@ fn draw_top(u: &budget::Usage) {
                     c.id.clone(),
                     c.name.clone().unwrap_or_else(|| "-".into()),
                     c.template.clone(),
+                    c.status.clone(),
                     if c.protected {
                         "never".into()
                     } else {
                         secs(c.expires_at - now)
                     },
-                    opt_bytes(c.rss_bytes),
+                    // A sleeping clone has no server: it uses no memory.
+                    if c.status == "sleeping" {
+                        human_bytes(0)
+                    } else {
+                        opt_bytes(c.rss_bytes)
+                    },
                     opt_bytes(c.own_disk_bytes),
                     [(c.disk_warn, "!"), (c.protected, "protected")]
                         .iter()
@@ -997,22 +1351,50 @@ fn draw_top(u: &budget::Usage) {
             .collect(),
     );
     println!(
-        "\nclones  {} / {}\nram     {}\ndisk    {}\nfree    {}\nqueued  {}",
+        "\nclones  {} / {}\nram     {}\ndisk    {}\nfree    {}\nqueued  {}\nrouter  {}",
         u.clones.len(),
         u.max_clones,
         of(human_bytes(u.ram_bytes), u.ram_budget),
         of(human_bytes(u.disk_bytes), u.disk_budget),
         human_bytes(u.free_disk_bytes),
-        u.queued
+        u.queued,
+        router_state(router)
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 async fn top(home: &Home) -> Result<()> {
-    let _terminal = RawTerminal::enter()?;
+    use tokio::signal::unix::{signal, SignalKind};
+    let terminal = RawTerminal::enter()?;
+    // ISIG is off, but `kill`, a closed terminal or a logout still send these. Without a handler
+    // the process dies with the terminal left raw.
+    let sig = |k: SignalKind| {
+        signal(k).map_err(|e| MitosisError::new(ErrorCode::Internal, format!("signals: {e}")))
+    };
+    let mut term = sig(SignalKind::terminate())?;
+    let mut hup = sig(SignalKind::hangup())?;
+    let mut int = sig(SignalKind::interrupt())?;
+    let signo = tokio::select! {
+        r = top_loop(home) => return r,
+        _ = term.recv() => libc::SIGTERM,
+        _ = hup.recv() => libc::SIGHUP,
+        _ = int.recv() => libc::SIGINT,
+    };
+    drop(terminal);
+    // The usual exit status of a process ended by that signal. Exits at once: the key-reading
+    // thread may still be blocked in a read.
+    std::process::exit(128 + signo);
+}
+
+/// `top`'s draw-and-wait loop; ends on `q` or Ctrl-C.
+async fn top_loop(home: &Home) -> Result<()> {
     loop {
+        let router = match client::request(home, Request::Status).await? {
+            Response::Status(s) => s.router,
+            other => return Err(unexpected(other)),
+        };
         match client::request(home, Request::Usage).await? {
-            Response::Usage(u) => draw_top(&u),
+            Response::Usage(u) => draw_top(&u, &router),
             other => return Err(unexpected(other)),
         }
         let quit = tokio::task::spawn_blocking(quit_key)
@@ -1120,6 +1502,15 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["mitosis", "template", "init", "--seed", "x"]).is_ok());
+        let basebackup = |extra: &[&str]| {
+            let mut args = vec!["mitosis", "template", "init", "--basebackup", "u"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(basebackup(&[]).is_ok());
+        assert!(basebackup(&["--database", "shop"]).is_ok());
+        assert!(basebackup(&["--seed", "x"]).is_err());
+        assert!(basebackup(&["--from-url", "y"]).is_err());
     }
 
     #[test]
@@ -1133,7 +1524,7 @@ mod tests {
             "2",
             "--every",
             "off",
-            "--mode",
+            "--every-mode",
             "layered",
             "--migrate",
             "make migrate",
@@ -1163,6 +1554,20 @@ mod tests {
         assert_eq!(s.migrate.unwrap().command, "make migrate");
         assert_eq!(s.auto_migrate, Some(true));
         assert_eq!(s.on_stale, Some(crate::protocol::OnStale::Refresh));
-        assert!(Cli::try_parse_from(["mitosis", "template", "set", "--mode", "fast"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mitosis", "template", "set", "--every-mode", "fast"]).is_err()
+        );
+    }
+
+    #[test]
+    fn top_reads_a_whole_key_at_once() {
+        assert!(asks_to_quit(b"q") && asks_to_quit(b"Q") && asks_to_quit(&[3]));
+        // An arrow key is three bytes: one read, no quit.
+        assert!(!asks_to_quit(b"\x1b[A"));
+        assert!(
+            asks_to_quit(b"\x1b[Aq"),
+            "a q behind other keys still quits"
+        );
+        assert!(!asks_to_quit(b""));
     }
 }

@@ -26,6 +26,7 @@ fn args(template: &str) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -83,10 +84,6 @@ async fn parent_exit_reaps() {
         &env.ctx,
         CloneCreateArgs {
             parent_pid: Some(pid),
-            fresh: false,
-            protect: false,
-            env: None,
-            wait_secs: None,
             ..args("main")
         },
     )
@@ -213,6 +210,7 @@ async fn reconcile_restores_template_from_old_folder() {
                 size_bytes: 1,
                 from_clone: None,
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
     }
@@ -312,10 +310,6 @@ async fn reconcile_destroys_clone_of_dead_parent() {
         &env.ctx,
         CloneCreateArgs {
             parent_pid: Some(pid),
-            fresh: false,
-            protect: false,
-            env: None,
-            wait_secs: None,
             ..args("main")
         },
     )

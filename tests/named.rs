@@ -28,6 +28,7 @@ fn args(name: Option<&str>) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -171,6 +172,7 @@ async fn protected_survives_ttl_and_needs_force() {
             protect: true,
             env: None,
             wait_secs: None,
+            branch: None,
             ..args(None)
         },
     )
@@ -183,6 +185,7 @@ async fn protected_survives_ttl_and_needs_force() {
             protect: true,
             env: None,
             wait_secs: None,
+            branch: None,
             parent_pid: Some(std::process::id() as i32),
             ttl_secs: 1,
             ..named("keep")
@@ -298,4 +301,183 @@ async fn gc_keeps_reservation_of_running_clone() {
         .unwrap();
     assert!(env.ctx.store().get_reservation("x").unwrap().is_none());
     let _ = a;
+}
+
+#[tokio::test]
+async fn fresh_without_name_is_refused() {
+    // Refused before any Postgres work, so it runs without Postgres installed.
+    let tmp = tmp_home();
+    let ctx = std::sync::Arc::new(
+        mitosis::ctx::Ctx::open(
+            mitosis::paths::Home::at(tmp.path().to_path_buf()),
+            mitosis::ctx::Config::default(),
+        )
+        .unwrap(),
+    );
+    let e = create(
+        &ctx,
+        CloneCreateArgs {
+            fresh: true,
+            ..args(None)
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(
+        e.message.contains("--fresh needs a clone name"),
+        "{}",
+        e.message
+    );
+    assert!(e.hint.unwrap().contains("--name"));
+}
+
+/// `PRE_START_HOOK` is one slot per test binary: the tests that set it take turns.
+static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Runs `create` while every Postgres start in this home finds its port taken (the first `times`
+/// starts only, or all with `None`).
+// The guard only orders whole tests, each on its own runtime; no task waits on it.
+#[allow(clippy::await_holding_lock)]
+async fn with_ports_taken(
+    env: &TestEnv,
+    a: CloneCreateArgs,
+    times: Option<usize>,
+) -> mitosis::error::Result<mitosis::protocol::CloneInfo> {
+    let _turn = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = env.ctx.home.root.clone();
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::<TcpListener>::new()));
+    let h = held.clone();
+    *mitosis::clones::PRE_START_HOOK.lock().unwrap() = Some(Box::new(move |r, port| {
+        let mut held = h.lock().unwrap();
+        if r == root && times.is_none_or(|t| held.len() < t) {
+            if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
+                held.push(l);
+            }
+        }
+    }));
+    let made = create(&env.ctx, a).await;
+    *mitosis::clones::PRE_START_HOOK.lock().unwrap() = None;
+    made
+}
+
+#[tokio::test]
+async fn new_name_whose_port_moves_has_no_warning() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let a = with_ports_taken(&env, named("fresh-name"), Some(1))
+        .await
+        .unwrap();
+    // No URL existed before this create, so nothing changed for anyone.
+    assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+    assert_eq!(
+        env.ctx
+            .store()
+            .get_reservation("fresh-name")
+            .unwrap()
+            .unwrap()
+            .port,
+        a.port,
+        "the reservation follows the port it got"
+    );
+}
+
+#[tokio::test]
+async fn failed_create_gives_the_reservation_back() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    // A name never created keeps nothing.
+    let e = with_ports_taken(&env, named("never"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::PortInUse, "{e:?}");
+    assert!(env.ctx.store().get_reservation("never").unwrap().is_none());
+    // A known name keeps the reservation it had.
+    create(&env.ctx, named("known")).await.unwrap();
+    destroy(&env.ctx, "known").await.unwrap();
+    let before = env.ctx.store().get_reservation("known").unwrap().unwrap();
+    with_ports_taken(&env, named("known"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        env.ctx.store().get_reservation("known").unwrap().unwrap(),
+        before
+    );
+    assert!(list(&env.ctx).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reserved_port_outside_the_range_says_so() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let a = create(&env.ctx, named("x")).await.unwrap();
+    destroy(&env.ctx, "x").await.unwrap();
+    // The range shrinks to leave the reserved port out (it stays inside this test's slice).
+    let range = env.ctx.config().port_range;
+    let rest = if a.port == *range.start() {
+        a.port + 1..=*range.end()
+    } else {
+        *range.start()..=a.port - 1
+    };
+    env.ctx.set_config(mitosis::ctx::Config {
+        port_range: rest,
+        ..env.ctx.config()
+    });
+    let b = create(&env.ctx, named("x")).await.unwrap();
+    assert_ne!(b.port, a.port);
+    assert!(
+        b.warnings
+            .iter()
+            .any(|w| w.contains("is outside port_range")),
+        "{:?}",
+        b.warnings
+    );
+    assert!(!b.warnings.iter().any(|w| w.contains("was taken")));
+}
+
+#[tokio::test]
+async fn reused_pid_of_a_dead_session_is_another_session() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let with = CloneCreateArgs {
+        parent_pid: Some(child.id() as i32),
+        ..named("s")
+    };
+    create(&env.ctx, with.clone()).await.unwrap();
+    // As if the first session died and a new one got its pid: the start time differs.
+    let mut row = env.ctx.store().get_clone("s").unwrap().unwrap();
+    row.parent_start_time = row.parent_start_time.map(|t| t - 1000);
+    env.ctx.store().update_clone(&row).unwrap();
+    let e = create(&env.ctx, with).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(
+        e.message.contains("belongs to another session"),
+        "{}",
+        e.message
+    );
+    destroy(&env.ctx, "s").await.unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A 0.2 clone named like an id can still be reused; a new clone may not take such a name.
+#[tokio::test]
+async fn id_shaped_name_only_refused_for_new_clones() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let e = create(&env.ctx, named("cafe123")).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.message.contains("looks like a clone id"), "{e}");
+    // What 0.2 allowed: rename a clone's row to the id-shaped name.
+    let a = create(&env.ctx, named("old")).await.unwrap();
+    let mut row = env.ctx.store().get_clone(&a.id).unwrap().unwrap();
+    row.name = Some("cafe123".into());
+    env.ctx.store().update_clone(&row).unwrap();
+    let b = create(&env.ctx, named("cafe123")).await.unwrap();
+    assert!(b.existing);
+    assert_eq!(b.id, a.id);
 }

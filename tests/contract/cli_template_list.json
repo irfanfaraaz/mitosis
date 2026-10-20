@@ -1,0 +1,31 @@
+[
+  {
+    "age_secs": "number",
+    "auto_migrate": "boolean",
+    "base": "string",
+    "base_branch": "string",
+    "branch": "string",
+    "built_at": "number",
+    "current_gen": "number",
+    "database": "string",
+    "every_mode": "string",
+    "every_secs": "number",
+    "gen_count": "number",
+    "keep": "number",
+    "last_error": "string",
+    "mask": "string",
+    "migrate": "string",
+    "name": "string",
+    "on_stale": "string",
+    "paused": "boolean",
+    "pg_major": "number",
+    "size_bytes": "number",
+    "source": {
+      "kind": "string",
+      "url": "string"
+    },
+    "warnings": [
+      "string"
+    ]
+  }
+]

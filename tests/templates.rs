@@ -51,6 +51,7 @@ fn row(name: &str, source: TemplateSource) -> (TemplateRow, GenerationRow) {
         size_bytes: 1,
         from_clone: None,
         from_gen: None,
+        mask_hash: None,
     };
     (t, g)
 }
@@ -187,6 +188,7 @@ async fn from_url_copies_data_without_leaking_the_password() {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     };
     let src = create(&env.ctx, args("a")).await.unwrap();
     let password = src

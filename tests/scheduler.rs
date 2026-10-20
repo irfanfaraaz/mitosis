@@ -218,6 +218,7 @@ async fn stale_clone_is_served_and_refresh_starts() {
             protect: false,
             env: None,
             wait_secs: None,
+            branch: None,
         },
     )
     .await
@@ -310,6 +311,7 @@ async fn crashed_build_leaves_no_generation() {
                 size_bytes: 1,
                 from_clone: None,
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
         assert_eq!(store.alloc_gen("main").unwrap(), 2);

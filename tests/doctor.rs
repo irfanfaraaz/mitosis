@@ -1,10 +1,12 @@
 mod common;
 
 use common::*;
+use mitosis::client;
 use mitosis::daemon::run as run_daemon;
 use mitosis::doctor::{run, Check, Level};
+use mitosis::mask::MaskFile;
 use mitosis::paths::Home;
-use mitosis::protocol::{GenKind, PendingRestore, TemplateSource};
+use mitosis::protocol::{GenKind, PendingRestore, Request, Response, TemplateSource};
 use mitosis::state::{GenerationRow, Store, TemplateRow};
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
@@ -82,6 +84,7 @@ async fn doctor_reports_missing_major() {
                 size_bytes: 1,
                 from_clone: None,
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
     }
@@ -152,4 +155,209 @@ async fn doctor_fix_finishes_pending_restore() {
     );
     assert!(env.ctx.store().list_pending_restores().unwrap().is_empty());
     daemon.abort();
+}
+
+/// A free port this test holds, outside the default `port_range`, where `router_port` is refused.
+fn held_port() -> std::net::TcpListener {
+    loop {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        if !(54_320..=54_999).contains(&l.local_addr().unwrap().port()) {
+            return l;
+        }
+    }
+}
+
+#[tokio::test]
+async fn doctor_flags_router_port_taken() {
+    let (_tmp, home) = fresh_home();
+    // A port this test holds itself: never the default 54300, which a real daemon may use.
+    let blocker = held_port();
+    let port = blocker.local_addr().unwrap().port();
+    std::fs::write(home.config_file(), format!("router_port = {port}\n")).unwrap();
+    let checks = run(&home, false).await;
+    let c = find(&checks, "router");
+    assert_eq!(c.level, Level::Fail, "{}", c.detail);
+    assert!(c.detail.contains(&port.to_string()), "{}", c.detail);
+    // lsof names this very process; where lsof is missing the check says so instead.
+    let me = format!("pid {}", std::process::id());
+    assert!(
+        c.detail.contains(&me) || c.detail.contains("could not tell"),
+        "{}",
+        c.detail
+    );
+    assert!(c.fix.as_deref().unwrap().contains("router_port"));
+    assert!(!home.daemon_sock().exists());
+
+    // Free again: the daemon will be able to bind it.
+    drop(blocker);
+    let checks = run(&home, false).await;
+    assert_eq!(find(&checks, "router").level, Level::Ok);
+}
+
+#[tokio::test]
+async fn doctor_warns_router_listen_public() {
+    let (_tmp, home) = fresh_home();
+    let free = held_port();
+    let port = free.local_addr().unwrap().port();
+    drop(free);
+    std::fs::write(
+        home.config_file(),
+        format!("router_port = {port}\nrouter_listen = \"0.0.0.0\"\n"),
+    )
+    .unwrap();
+    let checks = run(&home, false).await;
+    let c = find(&checks, "router_listen");
+    assert_eq!(c.level, Level::Warn, "{}", c.detail);
+    assert!(c.detail.contains("network"), "{}", c.detail);
+
+    std::fs::write(home.config_file(), format!("router_port = {port}\n")).unwrap();
+    let checks = run(&home, false).await;
+    assert_eq!(find(&checks, "router_listen").level, Level::Ok);
+}
+
+#[tokio::test]
+async fn doctor_flags_changed_mask_file() {
+    let (_tmp, home) = fresh_home();
+    let mask = home.root.join("mask.toml");
+    std::fs::write(&mask, "[tables.users]\nemail = \"email\"\n").unwrap();
+    {
+        let store = Store::open(&home.state_db()).unwrap();
+        let mut t = TemplateRow::new(
+            "main",
+            "app",
+            TemplateSource::Url {
+                url: "postgres://u@h/app".into(),
+            },
+            None,
+            604_800,
+        );
+        t.current_gen = 1;
+        t.next_gen = 2;
+        t.mask_path = Some(mask.clone());
+        store.insert_template(&t).unwrap();
+        store
+            .insert_generation(&GenerationRow {
+                template: "main".into(),
+                gen: 1,
+                kind: GenKind::Full,
+                dir: home.templates_dir().join("main@1"),
+                pg_major: 99,
+                bin_dir: "/opt/pg99/bin".into(),
+                extensions: vec![],
+                migrations_hash: None,
+                built_at: 1,
+                size_bytes: 1,
+                from_clone: None,
+                from_gen: None,
+                mask_hash: Some(MaskFile::hash(&mask).unwrap()),
+            })
+            .unwrap();
+    }
+    let checks = run(&home, false).await;
+    assert_eq!(find(&checks, "masking").level, Level::Ok);
+
+    std::fs::write(&mask, "[tables.users]\nemail = \"hash\"\n").unwrap();
+    let checks = run(&home, false).await;
+    let c = find(&checks, "masking");
+    assert_eq!(c.level, Level::Warn, "{}", c.detail);
+    assert!(c.detail.contains("changed"), "{}", c.detail);
+    assert!(c.detail.contains("main"), "{}", c.detail);
+
+    std::fs::remove_file(&mask).unwrap();
+    let checks = run(&home, false).await;
+    let c = find(&checks, "masking");
+    assert_eq!(c.level, Level::Fail, "{}", c.detail);
+    assert!(c.detail.contains("missing"), "{}", c.detail);
+    assert!(
+        !home.daemon_sock().exists(),
+        "doctor must not start the daemon"
+    );
+}
+
+#[tokio::test]
+async fn doctor_reports_no_managed_builds_and_event_log() {
+    let (_tmp, home) = fresh_home();
+    drop(Store::open(&home.state_db()).unwrap());
+    let checks = run(&home, false).await;
+    assert_eq!(find(&checks, "managed_postgres").level, Level::Ok);
+    assert_eq!(find(&checks, "branch_templates").level, Level::Ok);
+    let c = find(&checks, "events");
+    assert_eq!(c.level, Level::Ok, "{}", c.detail);
+    assert!(c.detail.contains("0 event"), "{}", c.detail);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_shows_router() {
+    let Some(env) = TestEnv::new() else { return };
+    let root = env.tmp.path().to_path_buf();
+    let config = mitosis::ctx::Config {
+        router: true,
+        ..env.ctx.config()
+    };
+    let port = config.router_port;
+    let daemon = tokio::spawn(run_daemon(Home::at(root.clone()), config));
+    let sock = root.join("daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while UnixStream::connect(&sock).await.is_err() {
+        assert!(!daemon.is_finished(), "daemon exited before binding");
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let home = Home::at(root.clone());
+    loop {
+        let Response::Status(s) = client::request(&home, Request::Status).await.unwrap() else {
+            panic!("not a status");
+        };
+        let r = s.router.expect("router status with the router on");
+        if r.listening {
+            assert_eq!((r.listen.as_str(), r.port), ("127.0.0.1", port));
+            break;
+        }
+        assert!(Instant::now() < deadline, "router never listened: {r:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The CLI line.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mitosis"))
+        .args(["daemon", "status"])
+        .env("MITOSIS_HOME", &root)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("router    listening on 127.0.0.1:{port}")),
+        "{text}"
+    );
+    // The router checks agree with the daemon.
+    let checks = run(&home, false).await;
+    assert_eq!(find(&checks, "router").level, Level::Ok);
+
+    let _ = client::request(&home, Request::Shutdown).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), daemon).await;
+}
+
+#[test]
+fn router_state_lines() {
+    use mitosis::cli::router_state;
+    use mitosis::protocol::RouterStatus;
+    assert_eq!(router_state(&None), "off");
+    let up = RouterStatus {
+        listening: true,
+        listen: "127.0.0.1".into(),
+        port: 54300,
+        error: None,
+    };
+    assert_eq!(
+        router_state(&Some(up.clone())),
+        "listening on 127.0.0.1:54300"
+    );
+    let down = RouterStatus {
+        listening: false,
+        error: Some("cannot listen on 127.0.0.1:54300: Address already in use".into()),
+        ..up
+    };
+    let line = router_state(&Some(down));
+    assert!(
+        line.starts_with("not listening:") && line.contains("Address already in use"),
+        "{line}"
+    );
 }

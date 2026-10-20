@@ -14,6 +14,11 @@ use tokio::sync::watch;
 /// try when the template has no `--every` interval.
 const RETRY_SECS: u64 = 3_600;
 
+/// Events older than this are dropped by the scheduler.
+const EVENT_KEEP_SECS: i64 = 30 * 24 * 3600;
+/// The event log keeps at most this many rows, the newest.
+const EVENT_KEEP_ROWS: u32 = 50_000;
+
 fn secs(s: u64) -> i64 {
     i64::try_from(s).unwrap_or(i64::MAX)
 }
@@ -69,7 +74,9 @@ pub(crate) fn start(ctx: &Arc<Ctx>, name: &str, mode: RefreshMode) -> bool {
 }
 
 /// The builds due at `now`, at most one per template: an interval refresh in its mode, else an
-/// auto-migrate layered refresh. Templates with a build running are left out.
+/// auto-migrate layered refresh. Templates with a build running are left out, and so are branch
+/// templates, which are built only by `clone --branch`. A layered build of a base whose checkout
+/// is on another branch is skipped when it starts (`templates::background`).
 fn plan(ctx: &Ctx, now: i64) -> Result<Vec<(String, RefreshMode)>> {
     let rows = {
         let store = ctx.store();
@@ -87,7 +94,7 @@ fn plan(ctx: &Ctx, now: i64) -> Result<Vec<(String, RefreshMode)>> {
     };
     let mut out = Vec::new();
     for (t, newest) in rows {
-        if templates::is_building(ctx, &t.name) {
+        if t.base.is_some() || templates::is_building(ctx, &t.name) {
             continue;
         }
         if let Some(mode) = due(&t, newest.built_at, now) {
@@ -116,6 +123,12 @@ fn plan(ctx: &Ctx, now: i64) -> Result<Vec<(String, RefreshMode)>> {
 /// Starts every build due at `now` (each on its own task, skipping templates with a build
 /// running), then prunes every template, so a lowered `--keep` applies without a new build.
 pub async fn tick(ctx: &Arc<Ctx>, now: i64) {
+    let pruned = ctx
+        .store()
+        .prune_events(now.saturating_sub(EVENT_KEEP_SECS), EVENT_KEEP_ROWS);
+    if let Err(e) = pruned {
+        crate::lifecycle::log(ctx, &format!("scheduler: prune events: {e}"));
+    }
     let c = ctx.clone();
     // Hashing migration folders reads files: off the runtime.
     match tokio::task::spawn_blocking(move || plan(&c, now)).await {
@@ -204,6 +217,7 @@ mod tests {
             size_bytes: 1,
             from_clone: None,
             from_gen: None,
+            mask_hash: None,
         }
     }
 

@@ -25,6 +25,7 @@ fn clone_args(template: &str) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -53,6 +54,44 @@ async fn promote_creates_generation_and_clone_keeps_url() {
     let n = create(&env.ctx, clone_args("main")).await.unwrap();
     assert_eq!(n.generation, 2);
     assert_eq!(psql_url(&env, &n.url, "select v from t"), "p");
+}
+
+/// A kill while the clone is stopped must not lose the promoted data: the generation is in the
+/// store before the clone's server is started again.
+#[tokio::test]
+async fn promoted_generation_is_committed_before_the_clone_restarts() {
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(v text)").await;
+    let c = create(&env.ctx, clone_args("main")).await.unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], c.port));
+    let done = Arc::new(AtomicBool::new(false));
+    let (ctx, flag) = (env.ctx.clone(), done.clone());
+    // Watches the clone's port: once it was closed and is open again, generation 2 must exist.
+    let watcher = std::thread::spawn(move || {
+        let mut was_down = false;
+        while !flag.load(Ordering::Relaxed) {
+            let up = TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_ok();
+            if !up {
+                was_down = true;
+            } else if was_down {
+                let committed = ctx.store().get_generation("main", 2).unwrap().is_some();
+                return Some(committed);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        None
+    });
+    promote(&env.ctx, &c.id, None).await.unwrap();
+    done.store(true, Ordering::Relaxed);
+    assert_eq!(
+        watcher.join().unwrap(),
+        Some(true),
+        "restart began before the commit"
+    );
 }
 
 #[tokio::test]
@@ -174,6 +213,7 @@ async fn promoted_template_refuses_a_full_schedule() {
                 size_bytes: 1,
                 from_clone: Some("c0a1b2".into()),
                 from_gen: None,
+                mask_hash: None,
             })
             .unwrap();
     }
@@ -195,7 +235,7 @@ async fn promoted_template_refuses_a_full_schedule() {
     // The default mode is full.
     let e = set(None).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidRequest);
-    assert_eq!(e.hint.as_deref(), Some("use --mode layered"));
+    assert_eq!(e.hint.as_deref(), Some("use --every-mode layered"));
     assert!(set(Some(RefreshMode::Full)).is_err());
     assert!(ctx
         .store()

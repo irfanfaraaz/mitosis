@@ -26,6 +26,14 @@ fn short_home() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// The defaults without the router, so these daemons never bind the real router port 54300.
+fn no_router() -> Config {
+    Config {
+        router: false,
+        ..Config::default()
+    }
+}
+
 /// Starts the daemon on `root` and waits until its socket accepts connections.
 async fn start(root: &Path, config: Config) -> JoinHandle<Result<()>> {
     let handle = tokio::spawn(run(Home::at(root.to_path_buf()), config));
@@ -110,7 +118,7 @@ async fn status_clones(root: &Path) -> usize {
 #[tokio::test]
 async fn status_over_socket() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     match Conn::open(tmp.path()).await.ok(Request::Status).await {
         Response::Status(s) => {
             assert_eq!(s.clones, 0);
@@ -126,7 +134,7 @@ async fn status_over_socket() {
 #[tokio::test]
 async fn protocol_mismatch() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     let reply = Conn::open(tmp.path())
         .await
         .line(r#"{"v":99,"request":{"type":"status"}}"#)
@@ -144,7 +152,7 @@ async fn protocol_mismatch() {
 #[tokio::test]
 async fn garbage_line() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     let mut conn = Conn::open(tmp.path()).await;
     assert_eq!(
         conn.line("not json").await.result.unwrap_err().code,
@@ -161,8 +169,8 @@ async fn garbage_line() {
 #[tokio::test]
 async fn second_daemon_refused() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
-    let second = run(Home::at(tmp.path().to_path_buf()), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
+    let second = run(Home::at(tmp.path().to_path_buf()), no_router()).await;
     assert_eq!(second.unwrap_err().code, ErrorCode::AlreadyRunning);
     // The refused daemon did not touch the first one's socket.
     assert_eq!(status_clones(tmp.path()).await, 0);
@@ -172,7 +180,7 @@ async fn second_daemon_refused() {
 #[tokio::test]
 async fn request_too_large_is_rejected() {
     let tmp = short_home();
-    let handle = start(tmp.path(), Config::default()).await;
+    let handle = start(tmp.path(), no_router()).await;
     let mut conn = Conn::open(tmp.path()).await;
     // Exactly one byte over the 1 MiB limit and no newline: the daemon reads no further.
     conn.wr.write_all(&vec![b'x'; (1 << 20) + 1]).await.unwrap();
@@ -267,6 +275,7 @@ fn clone_args() -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -365,4 +374,72 @@ async fn config_reload_applies_new_cap() {
     ));
     assert_eq!(clones(&mut conn).await, 2);
     shutdown(root, handle).await;
+}
+
+/// A bad config.toml fails the request as invalid_request before any daemon is started.
+#[tokio::test]
+async fn ensure_daemon_refuses_an_invalid_config() {
+    let tmp = short_home();
+    std::fs::write(tmp.path().join("config.toml"), "colour = 1\n").unwrap();
+    let e = client::request(&Home::at(tmp.path().to_path_buf()), Request::Status)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest, "{e:?}");
+    assert!(e.message.contains("colour"), "{}", e.message);
+    assert!(
+        !tmp.path().join("daemon.sock").exists(),
+        "no daemon started"
+    );
+}
+
+/// A create waiting for room leaves the queue when the daemon shuts down, rather than being
+/// admitted during the drain and starting Postgres as the daemon exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_create_leaves_on_shutdown() {
+    let Some(env) = TestEnv::new() else { return };
+    let root = env.tmp.path().to_path_buf();
+    let config = Config {
+        max_clones: 1,
+        ..env.ctx.config()
+    };
+    let handle = start(&root, config).await;
+    let mut conn = Conn::open(&root).await;
+    conn.ok(Request::TemplateInit(template_args("main", seed(SEED))))
+        .await;
+    conn.ok(Request::CloneCreate(clone_args())).await;
+    let mut waiter = Conn::open(&root).await;
+    let queued = tokio::spawn(async move {
+        waiter
+            .send(Request::CloneCreate(CloneCreateArgs {
+                wait_secs: Some(120),
+                ..clone_args()
+            }))
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Response::Usage(u) = conn.ok(Request::Usage).await {
+            if u.queued > 0 {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the create never queued");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let started = Instant::now();
+    shutdown(&root, handle).await;
+    let reply = tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .expect("the queued create answered")
+        .unwrap();
+    assert_eq!(reply.result.unwrap_err().code, ErrorCode::DaemonUnavailable);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the drain did not wait for the queue"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.join("clones")).unwrap().count(),
+        1,
+        "no second clone was made"
+    );
 }

@@ -2,19 +2,26 @@ use crate::clone_backend::apparent_size;
 use crate::clones::START_TRIES;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events;
+use crate::mask::{mask_statements, subset_statements, ColumnInfo, ForeignKey, MaskFile};
 use crate::names::{random_hex, validate_name};
+use crate::paths::Home;
 use crate::pg::{
-    initdb, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg, StartOptions,
+    disable_preload_libraries, ensure_postgres_superuser, initdb, is_missing_library,
+    make_standalone, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg,
+    StartOptions,
 };
 use crate::ports::pick_port;
 use crate::protocol::{
-    GenKind, GenerationInfo, MigrateCmd, RefreshMode, TemplateInfo, TemplateInitArgs,
-    TemplateSetArgs, TemplateSettings, TemplateSource,
+    BranchArgs, EventFilter, GenKind, GenerationInfo, MigrateCmd, OnStale, RefreshMode,
+    TemplateInfo, TemplateInitArgs, TemplateSetArgs, TemplateSettings, TemplateSource,
 };
 use crate::state::{GenerationRow, TemplateRow};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -22,7 +29,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SEED_DATABASE: &str = "app";
 /// The shortest refresh interval `--every` accepts.
@@ -56,7 +63,7 @@ where
 
 pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo> {
     validate_name("template", &args.name)?;
-    if let TemplateSource::Url { url } = &args.source {
+    if let TemplateSource::Url { url } | TemplateSource::Basebackup { url } = &args.source {
         if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
             return Err(invalid(
                 "source URL must start with postgres:// or postgresql://",
@@ -102,7 +109,83 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
     preview.migrations = args.migrations.clone();
     preview.source = args.source.clone();
     apply_settings(&mut preview, None, &args.settings)?;
-    build(ctx, args).await
+    check_mask_file(&args.settings)?;
+    // The checkout as it is now, recorded once the build is in.
+    let (cwd, mig) = (
+        preview.migrate.as_ref().map(|m| m.cwd.clone()),
+        preview.migrations.clone(),
+    );
+    let paths = blocking(move || Ok(git_paths(cwd.as_deref(), mig.as_deref()))).await?;
+    let (name, explicit_branch) = (args.name.clone(), args.settings.base_branch.is_some());
+    build(ctx, args).await?;
+    {
+        let store = ctx.store();
+        let mut t = store.get_template(&name)?.ok_or_else(|| not_found(&name))?;
+        record_git_paths(&mut t, paths, explicit_branch);
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, &name)
+}
+
+/// What `git_paths` found: the checked-out branch and the repo-relative migrate folder and
+/// migrations folder.
+type GitPaths = (Option<String>, Option<PathBuf>, Option<PathBuf>);
+
+/// Forgets the repo-relative paths, which belong to the migrate and migrations folders recorded
+/// when they were derived.
+fn clear_repo_paths(t: &mut TemplateRow) {
+    (t.repo_rel_cwd, t.repo_rel_migrations) = (None, None);
+}
+
+/// Writes `paths` into `t`; `base_branch` stays when `keep_branch` (it was given explicitly).
+fn record_git_paths(t: &mut TemplateRow, paths: GitPaths, keep_branch: bool) {
+    if !keep_branch {
+        t.base_branch = paths.0;
+    }
+    (t.repo_rel_cwd, t.repo_rel_migrations) = (paths.1, paths.2);
+}
+
+/// Runs `git -C <dir> <args>`; its trimmed output when it succeeds, `None` when git fails or is
+/// missing. Blocking.
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The branch checked out in the git work tree of `cwd` (else of `migrations`), and each folder
+/// relative to the root of its work tree; `None` for what is not in a work tree. Blocking.
+fn git_paths(cwd: Option<&Path>, migrations: Option<&Path>) -> GitPaths {
+    let rel = |dir: &Path| {
+        let top = git(dir, &["rev-parse", "--show-toplevel"])?;
+        let top = Path::new(&top).canonicalize().ok()?;
+        let dir = dir.canonicalize().ok()?;
+        dir.strip_prefix(&top).ok().map(Path::to_path_buf)
+    };
+    let (rel_cwd, rel_mig) = (cwd.and_then(rel), migrations.and_then(rel));
+    let branch = cwd
+        .filter(|_| rel_cwd.is_some())
+        .or(migrations.filter(|_| rel_mig.is_some()))
+        .and_then(|d| git(d, &["branch", "--show-current"]))
+        .filter(|b| !b.is_empty());
+    (branch, rel_cwd, rel_mig)
+}
+
+/// A masking file given in a request must load. Checked at request time only: the settings
+/// written after a build never fail on a file edited meanwhile.
+fn check_mask_file(s: &TemplateSettings) -> Result<()> {
+    match &s.mask {
+        Some(p) => MaskFile::load(p).map(drop),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn not_found(name: &str) -> MitosisError {
@@ -156,6 +239,11 @@ fn refresh_args(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateI
 /// Changes the settings of `name`; `resume` clears `paused`.
 pub fn set(ctx: &Ctx, args: TemplateSetArgs) -> Result<TemplateInfo> {
     validate_name("template", &args.name)?;
+    if args.max_age_secs.is_none() && !args.resume && args.settings == TemplateSettings::default() {
+        return Err(invalid("template set needs a setting to change")
+            .with_hint("for example: mitosis template set <name> --keep 5"));
+    }
+    check_mask_file(&args.settings)?;
     {
         let store = ctx.store();
         let mut t = store
@@ -164,6 +252,8 @@ pub fn set(ctx: &Ctx, args: TemplateSetArgs) -> Result<TemplateInfo> {
         apply_settings(&mut t, args.max_age_secs, &args.settings)?;
         if args.resume {
             t.paused = false;
+            // The last failure stays visible, but it no longer holds the next automatic build back.
+            t.last_attempt_at = None;
         }
         store.update_template_settings(&t)?;
     }
@@ -182,6 +272,12 @@ fn apply_settings(
     if s.migrate.is_some() && s.migrate_off {
         return Err(invalid("set --migrate to a command or to off, not both"));
     }
+    if s.mask.is_some() && s.mask_off {
+        return Err(invalid("set --mask to a file or to off, not both"));
+    }
+    if s.base_branch.is_some() && s.base_branch_off {
+        return Err(invalid("set --base-branch to a branch or to off, not both"));
+    }
     if s.keep == Some(0) {
         return Err(invalid("--keep must be at least 1"));
     }
@@ -193,6 +289,12 @@ fn apply_settings(
         .is_some_and(|m| m.command.trim().is_empty())
     {
         return Err(invalid("--migrate needs a command, or off"));
+    }
+    if let Some(m) = s.migrate.as_ref().filter(|m| !m.cwd.is_dir()) {
+        return Err(invalid(format!(
+            "--migrate would run in {}, which is not a folder",
+            m.cwd.display()
+        )));
     }
     if let Some(v) = max_age_secs {
         t.max_age_secs = v;
@@ -213,11 +315,28 @@ fn apply_settings(
     } else if s.migrate.is_some() {
         t.migrate = s.migrate.clone();
     }
+    if s.migrate_off || s.migrate.is_some() {
+        // Re-derived from the new folder at the next `clone --branch` (or by `template init`).
+        clear_repo_paths(t);
+    }
     if let Some(a) = s.auto_migrate {
         t.auto_migrate = a;
     }
+    if s.mask_off {
+        t.mask_path = None;
+    } else if s.mask.is_some() {
+        t.mask_path = s.mask.clone();
+    }
     if let Some(o) = s.on_stale {
         t.on_stale = o;
+    }
+    if s.base_branch_off {
+        t.base_branch = None;
+    } else if let Some(b) = &s.base_branch {
+        if b.trim().is_empty() {
+            return Err(invalid("--base-branch needs a branch name, or off"));
+        }
+        t.base_branch = Some(b.clone());
     }
     // A full refresh of a promoted template is refused, so a schedule must be layered.
     if matches!(t.source, TemplateSource::Promoted { .. })
@@ -225,9 +344,9 @@ fn apply_settings(
         && t.every_mode == RefreshMode::Full
     {
         return Err(invalid(
-            "--every with --mode full needs a source, and a promoted template has none",
+            "--every with --every-mode full needs a source, and a promoted template has none",
         )
-        .with_hint("use --mode layered"));
+        .with_hint("use --every-mode layered"));
     }
     if t.auto_migrate && t.migrations.is_none() {
         return Err(
@@ -274,10 +393,11 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
     let age_secs = age_secs(cur.built_at, now);
     let mut warnings = Vec::new();
     if age_secs > row.max_age_secs {
+        // A branch template is rebuilt from its base, so the base is what to refresh.
         warnings.push(format!(
             "template is {} days old; run: mitosis template refresh {}",
             age_secs / 86_400,
-            row.name
+            row.base.as_deref().unwrap_or(&row.name)
         ));
     }
     if let Some(dir) = row.migrations.as_deref().filter(|d| d.is_dir()) {
@@ -288,8 +408,19 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
             ));
         }
     }
+    if let Some(p) = &row.mask_path {
+        if MaskFile::hash(p).ok() != cur.mask_hash {
+            warnings.push(format!(
+                "mask file {} changed since the template was built",
+                p.display()
+            ));
+        }
+    }
     let source = match &row.source {
         TemplateSource::Url { url } => TemplateSource::Url {
+            url: redact_url(url),
+        },
+        TemplateSource::Basebackup { url } => TemplateSource::Basebackup {
             url: redact_url(url),
         },
         TemplateSource::Seed { command, cwd, path } => TemplateSource::Seed {
@@ -318,11 +449,15 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
         auto_migrate: row.auto_migrate,
         on_stale: row.on_stale,
         keep: row.keep,
+        mask: row.mask_path.clone(),
+        base: row.base.clone(),
+        branch: row.branch.clone(),
+        base_branch: row.base_branch.clone(),
     }
 }
 
 pub fn history(ctx: &Ctx, name: &str) -> Result<Vec<GenerationInfo>> {
-    validate_name("template", name)?;
+    validate_template_ref(name)?;
     let store = ctx.store();
     let t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
     Ok(store
@@ -380,6 +515,13 @@ pub async fn rollback(ctx: &Ctx, name: &str, to: Option<u32>) -> Result<Template
         t.paused = true;
         store.update_template_settings(&t)?;
     }
+    events::emit(
+        ctx,
+        events::TEMPLATE_ROLLED_BACK,
+        None,
+        Some(name),
+        serde_json::json!({ "from": cur.gen, "to": target.gen }),
+    );
     template_info(ctx, name)
 }
 
@@ -411,6 +553,28 @@ pub fn redact_url(text: &str) -> String {
             .unwrap_or(after.len());
         out.push_str(&mask_query_password(&after[..url_end]));
         rest = &after[url_end..];
+    }
+    out.push_str(rest);
+    mask_env_passwords(&out)
+}
+
+/// Masks the value of every `NAME_PASSWORD=<value>` assignment (`PGPASSWORD=secret psql ...`),
+/// quoted or not, as `***`.
+fn mask_env_passwords(text: &str) -> String {
+    const KEY: &str = "PASSWORD=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(KEY) {
+        let (head, tail) = rest.split_at(i + KEY.len());
+        out.push_str(head);
+        let value_len = match tail.chars().next() {
+            Some(q @ ('\'' | '"')) => tail[1..].find(q).map_or(tail.len(), |e| e + 2),
+            _ => tail.find(char::is_whitespace).unwrap_or(tail.len()),
+        };
+        if value_len > 0 {
+            out.push_str("***");
+        }
+        rest = &tail[value_len..];
     }
     out.push_str(rest);
     out
@@ -520,7 +684,7 @@ fn split_password(url: &str) -> Result<SplitUrl> {
 
 /// Literal secrets of a source (the URL password, decoded and raw), longest first.
 fn source_secrets(source: &TemplateSource) -> Vec<String> {
-    let TemplateSource::Url { url } = source else {
+    let (TemplateSource::Url { url } | TemplateSource::Basebackup { url }) = source else {
         return Vec::new();
     };
     let Ok(split) = split_password(url) else {
@@ -543,7 +707,7 @@ fn scrub(text: &str, secrets: &[String]) -> String {
         .fold(redact_url(text), |t, s| t.replace(s.as_str(), "***"))
 }
 
-fn fnv1a(h: &mut u64, bytes: &[u8]) {
+pub(crate) fn fnv1a(h: &mut u64, bytes: &[u8]) {
     for b in bytes {
         *h ^= *b as u64;
         *h = h.wrapping_mul(0x0100_0000_01b3);
@@ -599,6 +763,9 @@ fn db_from_url(url: &str) -> String {
 fn database_for(args: &TemplateInitArgs) -> Result<String> {
     let db = match &args.source {
         TemplateSource::Url { url } => db_from_url(url),
+        TemplateSource::Basebackup { url } => {
+            args.database.clone().unwrap_or_else(|| db_from_url(url))
+        }
         TemplateSource::Seed { .. } | TemplateSource::Promoted { .. } => args
             .database
             .clone()
@@ -682,12 +849,22 @@ pub(crate) fn claim_build(ctx: &Ctx, name: &str) -> bool {
         .insert(name.to_string())
 }
 
-/// True while a build of `name` runs.
-pub(crate) fn is_building(ctx: &Ctx, name: &str) -> bool {
+/// True while a build of `name` runs (holds its build slot).
+pub fn is_building(ctx: &Ctx, name: &str) -> bool {
     ctx.building
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(name)
+}
+
+/// True when `name` has a masking file its current generation was not built with (or that
+/// cannot be read): only a full build may make its next generation.
+fn mask_stale(ctx: &Ctx, name: &str) -> Result<bool> {
+    let Some((t, cur)) = ctx.store().current(name)? else {
+        return Ok(false);
+    };
+    Ok(t.mask_path
+        .is_some_and(|p| MaskFile::hash(&p).ok() != cur.mask_hash))
 }
 
 /// A scheduled or stale-triggered build of `name` in `mode`. The caller took the build slot with
@@ -701,6 +878,25 @@ pub(crate) async fn background(ctx: &Ctx, name: &str, mode: RefreshMode) {
         name: name.to_string(),
     };
     let started = now();
+    // The base follows only its own branch: a layered build from another checkout would pollute it.
+    if mode == RefreshMode::Layered {
+        match off_base_branch(ctx, name).await {
+            Ok(Some((base_branch, current))) => {
+                emit_skipped(ctx, name, &base_branch, &current);
+                ctx.layered_skips
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => crate::lifecycle::log(ctx, &format!("template {name}: branch check: {e}")),
+        }
+    }
+    // A layered build would be refused while the masking file is newer than the current
+    // generation; an automatic build does the full build that re-bases it instead.
+    let mode = match mode {
+        RefreshMode::Layered if mask_stale(ctx, name).unwrap_or(false) => RefreshMode::Full,
+        m => m,
+    };
     let res = match mode {
         RefreshMode::Full => match refresh_args(ctx, name, None) {
             Ok(args) => build_held(ctx, args, false).await,
@@ -967,6 +1163,7 @@ pub(crate) fn is_build_socket_name(name: &str) -> bool {
 }
 
 /// A leftover folder `build` makes in `templates/`: `.<name>.building-<ts>` or `.<name>.old-<ts>`.
+/// The string is the template's `folder_stem`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Leftover {
     Building(String),
@@ -974,22 +1171,98 @@ pub(crate) enum Leftover {
 }
 
 pub(crate) fn build_dir_name(name: &str, ts: i64) -> String {
-    format!(".{name}.building-{ts}")
+    format!(".{}.building-{ts}", folder_stem(name))
 }
 
 fn old_dir_name(name: &str, ts: i64) -> String {
-    format!(".{name}.old-{ts}")
+    format!(".{}.old-{ts}", folder_stem(name))
+}
+
+/// The build log of template `name`; a branch template's name has `/`-bearing parts, so the
+/// file is named by its folder stem.
+pub(crate) fn build_log_path(home: &Home, name: &str) -> PathBuf {
+    home.logs_dir()
+        .join(format!("template-{}.log", folder_stem(name)))
 }
 
 /// The folder of generation `gen` of template `name`, in `templates/`.
 fn gen_dir_name(name: &str, gen: u32) -> String {
-    format!("{name}@{gen}")
+    format!("{}@{gen}", folder_stem(name))
+}
+
+/// The name of the template built for git branch `branch` of template `base`.
+pub fn branch_template_name(base: &str, branch: &str) -> String {
+    format!("{base}~{branch}")
+}
+
+/// What stands for a branch template in folder names: `base`, `~`, the branch as a lowercase
+/// ASCII slug (any other character becomes `-`, at most 40) and `-` plus 8 hex of its SHA-256.
+pub fn branch_folder_slug(base: &str, branch: &str) -> String {
+    let slug: String = branch
+        .chars()
+        .map(|c| match c.to_ascii_lowercase() {
+            c @ ('a'..='z' | '0'..='9' | '-') => c,
+            _ => '-',
+        })
+        .take(40)
+        .collect();
+    let hash: String = Sha256::digest(branch.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{base}~{slug}-{hash}")
+}
+
+/// What stands for template `name` in folder and log names: the name, or a branch template's slug.
+pub(crate) fn folder_stem(name: &str) -> String {
+    match name.split_once('~') {
+        Some((base, branch)) => branch_folder_slug(base, branch),
+        None => name.to_string(),
+    }
+}
+
+/// True for the names `folder_stem` makes.
+fn valid_stem(stem: &str) -> bool {
+    match stem.split_once('~') {
+        Some((base, slug)) => {
+            validate_name("template", base).is_ok()
+                && (10..=49).contains(&slug.len())
+                && slug
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }
+        None => validate_name("template", stem).is_ok(),
+    }
+}
+
+/// A template name a read request may name: a plain name, or a branch template `<base>~<branch>`.
+pub fn validate_template_ref(name: &str) -> Result<()> {
+    match name.split_once('~') {
+        Some((base, branch)) => {
+            validate_name("template", base)?;
+            check_branch_name(branch)
+        }
+        None => validate_name("template", name),
+    }
+}
+
+/// A git branch name `clone --branch` accepts.
+fn check_branch_name(branch: &str) -> Result<()> {
+    if branch.is_empty()
+        || branch.len() > 255
+        || branch.contains('~')
+        || branch.chars().any(char::is_control)
+    {
+        return Err(invalid(format!("invalid branch name {branch:?}")));
+    }
+    Ok(())
 }
 
 /// Parses the names `gen_dir_name` makes; anything else is `None`.
 pub(crate) fn parse_gen_dir(file_name: &str) -> Option<(String, u32)> {
     let (name, gen) = file_name.split_once('@')?;
-    validate_name("template", name).ok()?;
+    valid_stem(name).then_some(())?;
     if gen.is_empty() || !gen.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -999,7 +1272,7 @@ pub(crate) fn parse_gen_dir(file_name: &str) -> Option<(String, u32)> {
 /// Parses the names `build_dir_name` and `old_dir_name` make; anything else is `None`.
 pub(crate) fn parse_leftover(file_name: &str) -> Option<Leftover> {
     let (name, suffix) = file_name.strip_prefix('.')?.split_once('.')?;
-    validate_name("template", name).ok()?;
+    valid_stem(name).then_some(())?;
     let ts = |s: &str| {
         s.bytes()
             .all(|b| b.is_ascii_digit())
@@ -1020,21 +1293,29 @@ async fn run_steps(
     opts: &mut StartOptions,
     database: &str,
     source: &TemplateSource,
+    mask: Option<&Masking>,
 ) -> StepResult<Vec<String>> {
-    let (i, d) = (install.clone(), data_dir.to_path_buf());
-    blocking(move || initdb(&i, &d))
-        .await
-        .map_err(at("initdb"))?;
-    let pg = start_build_server(ctx, install, data_dir, opts).await?;
-
-    if database != "postgres" {
-        let sql = format!("CREATE DATABASE {}", quote_ident(database));
-        run_psql(install, opts, "postgres", sql)
+    let pg = if let TemplateSource::Basebackup { url } = source {
+        basebackup_server(ctx, install, url, data_dir, opts, database).await?
+    } else {
+        let (i, d) = (install.clone(), data_dir.to_path_buf());
+        blocking(move || initdb(&i, &d))
             .await
-            .map_err(at("create database"))?;
-    }
+            .map_err(at("initdb"))?;
+        let pg = start_build_server(ctx, install, data_dir, opts).await?;
+
+        if database != "postgres" {
+            let sql = format!("CREATE DATABASE {}", quote_ident(database));
+            run_psql(install, opts, "postgres", sql)
+                .await
+                .map_err(at("create database"))?;
+        }
+        pg
+    };
 
     match source {
+        // Already in the copy.
+        TemplateSource::Basebackup { .. } => {}
         TemplateSource::Url { url } => {
             let (i, u, o, db, g) = (
                 install.clone(),
@@ -1068,7 +1349,219 @@ async fn run_steps(
             ));
         }
     }
+    if let Some(m) = mask {
+        mask_and_dump(ctx, install, data_dir, opts, database, m).await?;
+    }
     extensions_and_stop(ctx, install, data_dir, opts, database, pg).await
+}
+
+/// Step name used only for "the source has no such database"; `build_gen` turns that
+/// `invalid_request` into a plain bad request instead of a failed build.
+const MISSING_DATABASE_STEP: &str = "missing database";
+
+/// The major version of the server at `url`, read with `psql` of any install.
+fn source_major(install: &PgInstall, url: &str) -> Result<u32> {
+    let split = split_password(url)?;
+    let mut cmd = Command::new(install.bin("psql"));
+    if let Some(pw) = &split.password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let out = cmd
+        .args(["-X", "-A", "-t", "-w", "-c", "show server_version_num"])
+        .arg(&split.url)
+        .env("PGCONNECT_TIMEOUT", "10")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| internal(format!("could not run psql: {e}")))?;
+    let secrets = source_secrets(&TemplateSource::Basebackup { url: url.into() });
+    if !out.status.success() {
+        let err = scrub(String::from_utf8_lossy(&out.stderr).trim(), &secrets);
+        return Err(MitosisError::new(
+            ErrorCode::TemplateBuildFailed,
+            format!("could not read the version of the source server: {err}"),
+        )
+        .with_hint("check the URL and password, and that the server accepts this connection"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse::<u32>()
+        .map(|n| n / 10_000)
+        .map_err(|_| internal(format!("unexpected server_version_num {:?}", text.trim())))
+}
+
+/// The install whose `pg_basebackup` matches the major of the source at `url`. Fails before any
+/// copy when that major is not installed.
+async fn basebackup_install(ctx: &Ctx, url: &str, pinned: Option<u32>) -> Result<PgInstall> {
+    let probe = ctx.newest_install().await?;
+    let u = url.to_string();
+    let major = blocking(move || source_major(&probe, &u)).await?;
+    if let Some(m) = pinned.filter(|m| *m != major) {
+        return Err(invalid(format!(
+            "the source runs Postgres {major}, so its physical copy is Postgres {major}, not {m}"
+        ))
+        .with_hint("drop --pg-major; to move to another major, upgrade the template"));
+    }
+    ctx.install_major(major).await.map_err(|e| {
+        if e.code != ErrorCode::NoMatchingPostgres {
+            return e;
+        }
+        MitosisError::new(
+            ErrorCode::NoMatchingPostgres,
+            format!("the source runs Postgres {major} and pg_basebackup needs the same major; no Postgres {major} found"),
+        )
+        .with_hint(format!(
+            "brew install postgresql@{major}, or: mitosis pg install {major}"
+        ))
+    })
+}
+
+/// True when `pg_basebackup`'s error says the source refused a replication connection.
+fn refused_replication(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("replication") || s.contains("walsender") || s.contains("wal sender")
+}
+
+const REPLICATION_NOTE: &str =
+    "mitosis: the source refused the physical copy. The role in the URL \
+    needs the REPLICATION attribute (ALTER ROLE <role> REPLICATION), and the source's pg_hba.conf \
+    needs a 'replication' line that allows it (host replication <role> <address> scram-sha-256).";
+
+/// `pg_basebackup -D dir -X stream -c fast` of the server at `url`, stderr to the build log. The
+/// password goes in `PGPASSWORD`, never in argv. The tool creates `dir`, which must not exist.
+fn run_basebackup(
+    install: &PgInstall,
+    url: &str,
+    dir: &Path,
+    log: &Path,
+    groups: &Groups,
+) -> Result<()> {
+    let split = split_password(url)?;
+    let mut cmd = Command::new(install.bin("pg_basebackup"));
+    if let Some(pw) = &split.password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let child = cmd
+        .args(["-X", "stream", "-c", "fast", "-w", "-D"])
+        .arg(dir)
+        .arg("-d")
+        .arg(&split.url)
+        .env("PGCONNECT_TIMEOUT", "10")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| internal(format!("could not run pg_basebackup: {e}")))?;
+    let _group = GroupGuard::new(groups, child.id() as i32);
+    let out = child
+        .wait_with_output()
+        .map_err(|e| internal(format!("waiting for pg_basebackup: {e}")))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.trim().is_empty() {
+        append_log(log, stderr.trim());
+    }
+    if out.status.success() {
+        return Ok(());
+    }
+    if refused_replication(&stderr) {
+        append_log(log, REPLICATION_NOTE);
+    }
+    Err(internal(format!("pg_basebackup failed ({})", out.status)))
+}
+
+/// Ensures the `postgres` superuser, then starts the copied cluster. A `shared_preload_libraries`
+/// entry this machine lacks is commented out once, with a warning in the build log.
+async fn standalone_start(
+    ctx: &Ctx,
+    install: &PgInstall,
+    data_dir: &Path,
+    opts: &mut StartOptions,
+) -> StepResult<RunningPg> {
+    let mut retried = false;
+    loop {
+        let (i, d) = (install.clone(), data_dir.to_path_buf());
+        let attempt = match blocking(move || ensure_postgres_superuser(&i, &d)).await {
+            Ok(()) => start_build_server(ctx, install, data_dir, opts).await,
+            Err(e) => Err(("standalone", e)),
+        };
+        let (step, e) = match attempt {
+            Ok(pg) => return Ok(pg),
+            Err(failed) => failed,
+        };
+        if retried || !is_missing_library(&e.message) {
+            return Err((step, e));
+        }
+        let d = data_dir.to_path_buf();
+        let off = blocking(move || disable_preload_libraries(&d))
+            .await
+            .map_err(at("standalone"))?;
+        if off.is_empty() {
+            return Err((step, e));
+        }
+        for line in off {
+            append_log(
+                &opts.log_file,
+                &format!("mitosis: warning: the copy needs a library this Postgres lacks; disabled: {line}"),
+            );
+        }
+        retried = true;
+    }
+}
+
+/// The copy step of a `pg_basebackup` template: copies the source into `data_dir`, makes it a
+/// standalone cluster, starts it, and checks that `database` is in it. The server is left running.
+async fn basebackup_server(
+    ctx: &Ctx,
+    install: &PgInstall,
+    url: &str,
+    data_dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+) -> StepResult<RunningPg> {
+    let (i, u, d, l, g) = (
+        install.clone(),
+        url.to_string(),
+        data_dir.to_path_buf(),
+        opts.log_file.clone(),
+        ctx.build_groups.clone(),
+    );
+    blocking(move || run_basebackup(&i, &u, &d, &l, &g))
+        .await
+        .map_err(at("basebackup"))?;
+    let d = data_dir.to_path_buf();
+    let warnings = blocking(move || make_standalone(&d))
+        .await
+        .map_err(at("standalone"))?;
+    for w in warnings {
+        append_log(&opts.log_file, &format!("mitosis: warning: {w}"));
+    }
+    let pg = standalone_start(ctx, install, data_dir, opts).await?;
+    // template1 always exists and accepts connections.
+    let out = run_psql(
+        install,
+        opts,
+        "template1",
+        "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1"
+            .into(),
+    )
+    .await
+    .map_err(at("list databases"))?;
+    let have: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !have.contains(&database) {
+        return Err((
+            MISSING_DATABASE_STEP,
+            invalid(format!(
+                "database {database} does not exist in the source (it has: {})",
+                have.join(", ")
+            ))
+            .with_hint("name one of them with --database"),
+        ));
+    }
+    Ok(pg)
 }
 
 /// Starts the build server in `data_dir`, moving `opts` to another port when the picked one is taken.
@@ -1138,6 +1631,16 @@ async fn extensions_and_stop(
     Ok(extensions)
 }
 
+/// Stops any server in `dir` and deletes the folder. A server that would not stop keeps its
+/// folder; gc deals with it later.
+fn stop_and_remove(install: &PgInstall, dir: &Path, timeout: Duration) -> Result<()> {
+    stop(install, dir, None, timeout)?;
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Stops the build server, deletes the build folder, and turns `e` into `TemplateBuildFailed`.
 async fn fail(
     ctx: &Ctx,
@@ -1159,15 +1662,7 @@ async fn fail(
         build_dir.to_path_buf(),
         ctx.config().stop_timeout,
     );
-    let cleanup = blocking(move || {
-        // A server that would not stop keeps its folder; gc deals with it later.
-        stop(&i, &d, None, t)?;
-        match std::fs::remove_dir_all(&d) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
-    })
-    .await;
+    let cleanup = blocking(move || stop_and_remove(&i, &d, t)).await;
     if let Err(ce) = cleanup {
         append_log(
             log,
@@ -1194,16 +1689,33 @@ async fn build(ctx: &Ctx, args: TemplateInitArgs) -> Result<TemplateInfo> {
 async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<TemplateInfo> {
     let name = args.name.clone();
     let database = database_for(&args)?;
-    let install = match args.pg_major {
-        Some(major) => ctx.install_major(major).await?,
-        None => ctx.newest_install().await?,
+    let install = match (&args.source, args.pg_major) {
+        // A physical copy keeps the major of the server it is copied from.
+        (TemplateSource::Basebackup { url }, pinned) => {
+            basebackup_install(ctx, url, pinned).await?
+        }
+        (_, Some(major)) => ctx.install_major(major).await?,
+        (_, None) => ctx.newest_install().await?,
     };
     let migrations_hash = match args.migrations.as_deref() {
         Some(m) if m.is_dir() => Some(hash_dir(m)?),
         _ => None,
     };
+    // The masking file this build uses: the one given now, else the recorded one.
+    let mask_path = match (&args.settings.mask, args.settings.mask_off) {
+        (_, true) => None,
+        (Some(p), false) => Some(p.clone()),
+        (None, false) => ctx.store().get_template(&name)?.and_then(|t| t.mask_path),
+    };
+    let mask_file = match mask_path.as_deref() {
+        Some(p) => {
+            let path = p.to_path_buf();
+            Some(blocking(move || MaskFile::load_hashed(&path)).await?)
+        }
+        None => None,
+    };
     // The commit expects the pointer read here; a new template starts at 0 (no generation).
-    let (created, expected, gen) = {
+    let (created, expected, gen, masking) = {
         let store = ctx.store();
         let (created, expected) = match store.get_template(&name)? {
             Some(t) => (false, t.current_gen),
@@ -1219,7 +1731,15 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
                 (true, 0)
             }
         };
-        (created, expected, store.alloc_gen(&name)?)
+        let masking = match mask_file {
+            Some((file, hash)) => Some(Masking {
+                file,
+                hash,
+                salt: store.ensure_mask_salt(&name, &random_hex(32))?,
+            }),
+            None => None,
+        };
+        (created, expected, store.alloc_gen(&name)?, masking)
     };
     let built = build_gen(
         ctx,
@@ -1227,10 +1747,14 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         &args,
         &database,
         migrations_hash,
+        masking.as_ref(),
         gen,
         expected,
     )
     .await;
+    if let Err(e) = &built {
+        events::emit_template_failed(ctx, &name, gen, "build", e);
+    }
     let store = ctx.store();
     if let Err(e) = built {
         // A failed first build leaves no template behind.
@@ -1244,6 +1768,9 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
     let mut t = store.get_template(&name)?.ok_or_else(|| not_found(&name))?;
     t.database = database;
     t.source = args.source;
+    if t.migrations != args.migrations {
+        clear_repo_paths(&mut t);
+    }
     t.migrations = args.migrations;
     if let Some(m) = args.max_age_secs {
         t.max_age_secs = m;
@@ -1268,10 +1795,74 @@ pub(crate) fn resume_if_current(t: &mut TemplateRow, gen: u32) {
 
 /// Copies the current generation of `name`, runs only its migrate command on the copy and makes
 /// the result a `Layered` generation. `path`, when given, replaces the command's recorded `PATH`.
+/// Refused while the template's recorded checkout is on another branch than its `base_branch`.
 pub async fn layered(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateInfo> {
     validate_name("template", name)?;
+    if let Some((base_branch, current)) = off_base_branch(ctx, name).await? {
+        return Err(invalid(format!(
+            "the checkout of template {name} is on {}, not on its base branch {base_branch}",
+            branch_label(&current)
+        ))
+        .with_hint(format!(
+            "for this branch use: mitosis clone --branch; to refresh {name}: git switch {base_branch}"
+        )));
+    }
     let _guard = BuildGuard::take(ctx, name)?;
     layered_held(ctx, name, path, true).await
+}
+
+/// `branch X` for a branch name, `a detached HEAD` for the empty one.
+fn branch_label(branch: &str) -> String {
+    if branch.is_empty() {
+        "a detached HEAD".into()
+    } else {
+        format!("branch {branch}")
+    }
+}
+
+/// `(base_branch, checked out branch)` when `name` has a `base_branch` and its migrate folder's
+/// checkout is on another branch (`""` for a detached HEAD); `None` otherwise, also when git
+/// cannot tell.
+async fn off_base_branch(ctx: &Ctx, name: &str) -> Result<Option<(String, String)>> {
+    let Some(t) = ctx.store().get_template(name)? else {
+        return Ok(None);
+    };
+    let (Some(base_branch), Some(m)) = (t.base_branch, t.migrate) else {
+        return Ok(None);
+    };
+    let current = blocking(move || Ok(git(&m.cwd, &["branch", "--show-current"]))).await?;
+    Ok(current
+        .filter(|c| *c != base_branch)
+        .map(|c| (base_branch, c)))
+}
+
+/// `template.skipped` for a layered build of `name` skipped because its checkout is on `current`;
+/// not again while the newest event of `name` already says so.
+fn emit_skipped(ctx: &Ctx, name: &str, base_branch: &str, current: &str) {
+    let filter = EventFilter {
+        template: Some(name.to_string()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let last = ctx.store().list_events(&filter).unwrap_or_default();
+    if last.last().is_some_and(|e| {
+        e.kind == events::TEMPLATE_SKIPPED
+            && e.detail.get("branch").and_then(|b| b.as_str()) == Some(current)
+    }) {
+        return;
+    }
+    events::emit(
+        ctx,
+        events::TEMPLATE_SKIPPED,
+        None,
+        Some(name),
+        serde_json::json!({
+            "op": "layered",
+            "reason": "checkout on another branch",
+            "branch": current,
+            "base_branch": base_branch,
+        }),
+    );
 }
 
 /// `layered` for a caller that holds the build slot. Only a `manual` build clears `paused`.
@@ -1290,14 +1881,79 @@ async fn layered_held(
         );
     };
     migrate.path = path.or(migrate.path);
+    let gen = build_layer(
+        ctx,
+        Layer {
+            target: name,
+            src: &t,
+            from: &cur,
+            migrate,
+            migrations: t.migrations.clone(),
+            expected: cur.gen,
+        },
+    )
+    .await?;
+    if manual {
+        let store = ctx.store();
+        let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+        resume_if_current(&mut t, gen);
+        store.update_template_settings(&t)?;
+    }
+    template_info(ctx, name)
+}
+
+/// A layered build: generation `from` of template `src` copied, `migrate` run on the copy (and
+/// `src`'s masking applied again), committed as the next generation of `target` when its current
+/// pointer is still `expected`. `target` is `src` itself, or a branch template of it.
+struct Layer<'a> {
+    target: &'a str,
+    src: &'a TemplateRow,
+    from: &'a GenerationRow,
+    migrate: MigrateCmd,
+    /// Hashed into the new generation, for freshness checks.
+    migrations: Option<PathBuf>,
+    expected: u32,
+}
+
+/// Runs `l`; returns the new generation's number. The caller holds the build slot of `l.target`.
+async fn build_layer(ctx: &Ctx, l: Layer<'_>) -> Result<u32> {
+    let (name, t, cur) = (l.target, l.src, l.from);
+    // Masking in place covers only what the migration adds: the copied pages must already be
+    // masked with this very file, or raw values of newly masked columns would stay in them.
+    let masking = match t.mask_path.as_deref() {
+        Some(p) => {
+            let path = p.to_path_buf();
+            let (file, hash) = blocking(move || MaskFile::load_hashed(&path)).await?;
+            if cur.mask_hash.as_deref() != Some(hash.as_str()) {
+                return Err(invalid(format!(
+                    "the current generation of template {} was not built with the masking \
+                     file {} as it is now",
+                    t.name,
+                    p.display()
+                ))
+                .with_hint(format!(
+                    "run a full build first: mitosis template refresh {}",
+                    t.name
+                )));
+            }
+            // The source's salt, so a branch template masks values as its base does.
+            Some(Masking {
+                file,
+                hash,
+                salt: ctx.store().ensure_mask_salt(&t.name, &random_hex(32))?,
+            })
+        }
+        None => None,
+    };
     let install = ctx.install_major(cur.pg_major).await?;
-    let migrations_hash = match t.migrations.as_deref() {
-        Some(m) if m.is_dir() => Some(hash_dir(m)?),
-        _ => None,
+    let migrations_hash = match l.migrations.clone() {
+        Some(m) => blocking(move || m.is_dir().then(|| hash_dir(&m)).transpose()).await?,
+        None => None,
     };
     let gen = ctx.store().alloc_gen(name)?;
 
-    let secrets = source_secrets(&t.source);
+    let mut secrets = source_secrets(&t.source);
+    secrets.extend(masking.as_ref().map(|m| m.salt.clone()));
     let ts = now();
     let side = ctx.home.templates_dir().join(build_dir_name(name, ts));
     let mut opts = build_start_options(ctx, name)?;
@@ -1309,13 +1965,17 @@ async fn layered_held(
         &side,
         &mut opts,
         &t.database,
-        &migrate,
+        &l.migrate,
+        masking.as_ref(),
     )
     .await;
     let result = match result {
         Ok(ext) => Ok(ext),
         Err((step, e)) => Err(fail(ctx, &install, &side, &log, &secrets, step, e).await),
     };
+    if let Err(e) = &result {
+        events::emit_template_failed(ctx, name, gen, "layered", e);
+    }
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let row = GenerationRow {
         template: name.to_string(),
@@ -1330,18 +1990,18 @@ async fn layered_held(
         size_bytes: 0,
         from_clone: None,
         from_gen: Some(cur.gen),
+        mask_hash: masking.map(|m| m.hash),
     };
-    commit_built(ctx, &install, &log, &secrets, row, cur.gen).await?;
-    if manual {
-        let store = ctx.store();
-        let mut t = store.get_template(name)?.ok_or_else(|| not_found(name))?;
-        resume_if_current(&mut t, gen);
-        store.update_template_settings(&t)?;
+    if let Err(e) = commit_built(ctx, &install, &log, &secrets, row, l.expected).await {
+        events::emit_template_failed(ctx, name, gen, "layered", &e);
+        return Err(e);
     }
-    template_info(ctx, name)
+    Ok(gen)
 }
 
-/// Copy of generation folder `from` into `dir`, started privately, migrated, stopped.
+/// Copy of generation folder `from` into `dir`, started privately, migrated, masked again when
+/// `mask` is set, stopped.
+#[allow(clippy::too_many_arguments)]
 async fn layered_steps(
     ctx: &Ctx,
     install: &PgInstall,
@@ -1350,6 +2010,7 @@ async fn layered_steps(
     opts: &mut StartOptions,
     database: &str,
     migrate: &MigrateCmd,
+    mask: Option<&Masking>,
 ) -> StepResult<Vec<String>> {
     {
         // A commit or prune moves generation folders only under the write guard.
@@ -1372,7 +2033,313 @@ async fn layered_steps(
     )
     .await
     .map_err(at("migrate"))?;
+    if let Some(m) = mask {
+        apply_mask(install, opts, database, m, false)
+            .await
+            .map_err(at("mask"))?;
+    }
     extensions_and_stop(ctx, install, dir, opts, database, pg).await
+}
+
+/// What `clone --branch` gets: the branch template to clone and how its freshness was handled.
+#[derive(Debug)]
+pub struct BranchUse {
+    pub name: String,
+    /// It was rebuilt before the clone.
+    pub rebuilt: bool,
+    /// It is out of date and served as it is (the base has `on_stale = refresh`).
+    pub stale: bool,
+    /// A rebuild of it runs in the background.
+    pub refreshing: bool,
+    /// For the clone's response.
+    pub warnings: Vec<String>,
+}
+
+/// How long `clone --branch` waits for another create's build of the same branch template.
+const BRANCH_BUILD_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// Where a branch build runs: the caller's checkout joined with the base's repo-relative paths.
+struct Checkout {
+    cwd: PathBuf,
+    migrations: Option<PathBuf>,
+}
+
+/// The branch template of `base` for the caller's checkout `b`: created on first use, and rebuilt
+/// first when the base has another current generation than the one it was layered on, or the
+/// checkout's migrations differ from the ones it was built with. With the base's
+/// `on_stale = refresh`, an existing generation is served and rebuilt in the background instead.
+pub async fn ensure_branch(ctx: &Arc<Ctx>, base: &str, b: &BranchArgs) -> Result<BranchUse> {
+    validate_name("template", base)?;
+    check_branch_name(&b.name)?;
+    if !b.repo_root.is_absolute() {
+        return Err(invalid(format!(
+            "repository root {} is not an absolute path",
+            b.repo_root.display()
+        )));
+    }
+    let name = branch_template_name(base, &b.name);
+    let mut warnings = Vec::new();
+    loop {
+        let (row, base_row, base_cur, checkout, warning) = branch_row(ctx, base, &name, b).await?;
+        warnings.extend(warning);
+        let used = |rebuilt, stale, refreshing, warnings| BranchUse {
+            name: name.clone(),
+            rebuilt,
+            stale,
+            refreshing,
+            warnings,
+        };
+        let cur = ctx.store().current(&name)?.map(|(_, g)| g);
+        let m = checkout.migrations;
+        let hash =
+            blocking(move || m.filter(|d| d.is_dir()).map(|d| hash_dir(&d)).transpose()).await?;
+        let fresh = cur
+            .as_ref()
+            .is_some_and(|g| row.base_gen == Some(base_cur.gen) && g.migrations_hash == hash);
+        if fresh {
+            return Ok(used(false, false, false, warnings));
+        }
+        if cur.is_some() && base_row.on_stale == OnStale::Refresh {
+            // A failed background build waits out the same back-off as a template's own.
+            let start = crate::scheduler::may_retry(&row, now()) && claim_build(ctx, &name);
+            if start {
+                let (ctx, name, base, b) = (ctx.clone(), name.clone(), base.to_string(), b.clone());
+                tokio::spawn(async move { background_branch(&ctx, &base, &name, &b).await });
+            } else if let Some(e) = row
+                .last_error
+                .as_deref()
+                .filter(|_| !is_building(ctx, &name))
+            {
+                warnings.push(format!(
+                    "the last background rebuild of template {name} failed: {e}"
+                ));
+            }
+            let refreshing = start || is_building(ctx, &name);
+            return Ok(used(false, true, refreshing, warnings));
+        }
+        match BuildGuard::take(ctx, &name) {
+            Ok(_guard) => {
+                build_branch(ctx, base, &name, b).await?;
+                return Ok(used(true, false, false, warnings));
+            }
+            // Another clone is building it: wait for that build, then look again.
+            Err(_) => {
+                let deadline = std::time::Instant::now() + BRANCH_BUILD_WAIT;
+                while is_building(ctx, &name) {
+                    if std::time::Instant::now() >= deadline {
+                        let log = ctx
+                            .home
+                            .logs_dir()
+                            .join(format!("template-{}.log", folder_stem(&name)));
+                        return Err(invalid(format!(
+                            "template {name} is still being built after {} minutes",
+                            BRANCH_BUILD_WAIT.as_secs() / 60
+                        ))
+                        .with_hint(format!(
+                            "try again later; the build log is {}",
+                            log.display()
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+}
+
+/// The background rebuild `ensure_branch` started; the caller claimed the build slot of `name`.
+/// Skipped when the caller's checkout is no longer on the branch. The outcome is stored in
+/// `last_attempt_at` / `last_error`, which `may_retry` reads.
+async fn background_branch(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) {
+    // Adopts the slot claimed by the caller.
+    let _guard = BuildGuard {
+        ctx,
+        name: name.to_string(),
+    };
+    let root = b.repo_root.clone();
+    let current = blocking(move || Ok(git(&root, &["branch", "--show-current"])))
+        .await
+        .ok()
+        .flatten();
+    if current.as_deref() != Some(b.name.as_str()) {
+        let current = current.unwrap_or_default();
+        crate::lifecycle::log(
+            ctx,
+            &format!(
+                "background build of template {name} skipped: the checkout in {} is on {}",
+                b.repo_root.display(),
+                branch_label(&current)
+            ),
+        );
+        events::emit(
+            ctx,
+            events::TEMPLATE_SKIPPED,
+            None,
+            Some(name),
+            serde_json::json!({
+                "op": "branch",
+                "reason": "checkout on another branch",
+                "branch": current,
+                "wanted": b.name,
+            }),
+        );
+        return;
+    }
+    let started = now();
+    let res = build_branch(ctx, base, name, b).await;
+    let store = ctx.store();
+    let Ok(Some(mut t)) = store.get_template(name) else {
+        return;
+    };
+    t.last_attempt_at = Some(started);
+    t.last_error = res.as_ref().err().map(|e| {
+        let first = e.message.lines().next().unwrap_or_default();
+        let msg = match &e.hint {
+            Some(h) => format!("{first} ({h})"),
+            None => first.to_string(),
+        };
+        scrub(&msg, &source_secrets(&t.source))
+    });
+    let saved = store.update_template_settings(&t);
+    drop(store);
+    if let Some(e) = &t.last_error {
+        crate::lifecycle::log(
+            ctx,
+            &format!("background build of template {name} failed: {e}"),
+        );
+    }
+    if let Err(e) = saved {
+        crate::lifecycle::log(ctx, &format!("template {name}: store build result: {e}"));
+    }
+}
+
+/// What `branch_row` returns: the branch row, the base row and its current generation, where the
+/// build runs, and a warning for the clone's response.
+type BranchRow = (
+    TemplateRow,
+    TemplateRow,
+    GenerationRow,
+    Checkout,
+    Option<String>,
+);
+
+/// Reads the base and creates the branch template `name` when it has no row yet; marks it used.
+/// Fails when the base has no migrate command or its migrate folder is not in a git work tree.
+async fn branch_row(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) -> Result<BranchRow> {
+    let (mut base_row, base_cur) = ctx.store().current(base)?.ok_or_else(|| not_found(base))?;
+    let mut warning = None;
+    let Some(migrate) = base_row.migrate.clone() else {
+        return Err(invalid(format!(
+            "template {base} has no migrate command, so it has no branch templates"
+        ))
+        .with_hint(format!(
+            "set one from your git checkout: mitosis template set {base} --migrate \"…\""
+        )));
+    };
+    if base_row.repo_rel_cwd.is_none() {
+        // `template init` records the paths; a migrate command set later is looked up here.
+        let (cwd, mig) = (migrate.cwd.clone(), base_row.migrations.clone());
+        let paths = blocking(move || Ok(git_paths(Some(&cwd), mig.as_deref()))).await?;
+        if paths.1.is_none() {
+            return Err(invalid(format!(
+                "the migrate command of template {base} runs in {}, which is not in a git work tree",
+                migrate.cwd.display()
+            ))
+            .with_hint(format!(
+                "--branch needs it inside your git checkout: mitosis template set {base} --migrate \"…\" from there"
+            )));
+        }
+        // Only the paths: the branch checked out now is usually the caller's, not the base's.
+        let store = ctx.store();
+        if let Some(mut t) = store.get_template(base)? {
+            (t.repo_rel_cwd, t.repo_rel_migrations) = (paths.1, paths.2);
+            store.update_template_settings(&t)?;
+            if t.base_branch.is_none() {
+                warning = Some(format!(
+                    "template {base} does not know its own branch; run mitosis template set \
+                     {base} --base-branch <b> so it stops following other branches"
+                ));
+            }
+            base_row = t;
+        }
+    }
+    let checkout = Checkout {
+        cwd: b
+            .repo_root
+            .join(base_row.repo_rel_cwd.as_deref().unwrap_or(Path::new(""))),
+        migrations: base_row
+            .repo_rel_migrations
+            .as_ref()
+            .map(|r| b.repo_root.join(r)),
+    };
+    if !checkout.cwd.is_dir() {
+        return Err(invalid(format!(
+            "{} does not exist in this checkout",
+            checkout.cwd.display()
+        ))
+        .with_hint(format!(
+            "run it in a checkout of the repository template {base} was made from"
+        )));
+    }
+    let store = ctx.store();
+    if store.get_template(name)?.is_none() {
+        let mut t = TemplateRow::new(
+            name,
+            &base_row.database,
+            base_row.source.clone(),
+            checkout.migrations.clone(),
+            base_row.max_age_secs,
+        );
+        (t.base, t.branch, t.keep) = (Some(base.into()), Some(b.name.clone()), base_row.keep);
+        store.insert_template(&t)?;
+    }
+    let mut row = store.get_template(name)?.ok_or_else(|| not_found(name))?;
+    (row.last_used, row.max_age_secs) = (Some(now()), base_row.max_age_secs);
+    store.update_template_settings(&row)?;
+    Ok((row, base_row, base_cur, checkout, warning))
+}
+
+/// Layers a new generation of branch template `name` on the base's current generation, running the
+/// base's migrate command in the caller's checkout. A failed first build leaves no template. The
+/// caller holds the build slot of `name`.
+async fn build_branch(ctx: &Ctx, base: &str, name: &str, b: &BranchArgs) -> Result<()> {
+    let (row, base_row, base_cur, checkout, _) = branch_row(ctx, base, name, b).await?;
+    let Some(mut migrate) = base_row.migrate.clone() else {
+        return Err(not_found(base));
+    };
+    migrate.cwd = checkout.cwd;
+    migrate.path = b.path.clone().or(migrate.path);
+    let built = build_layer(
+        ctx,
+        Layer {
+            target: name,
+            src: &base_row,
+            from: &base_cur,
+            migrate,
+            migrations: checkout.migrations.clone(),
+            expected: row.current_gen,
+        },
+    )
+    .await;
+    let store = ctx.store();
+    let Some(mut t) = store.get_template(name)? else {
+        return built.map(drop);
+    };
+    match built {
+        Ok(gen) => {
+            if t.current_gen == gen {
+                (t.base_gen, t.last_error) = (Some(base_cur.gen), None);
+            }
+            t.migrations = checkout.migrations;
+            store.update_template_settings(&t)
+        }
+        Err(e) => {
+            if matches!(store.list_generations(name), Ok(g) if g.is_empty()) {
+                let _ = store.delete_template(name);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// A free port for a build server, skipping `skip`. Reserved ports too: a named clone's stable URL
@@ -1388,7 +2355,7 @@ fn build_port(ctx: &Ctx, skip: &HashSet<u16>) -> Result<u16> {
 /// Options for a private build server of `name` on a free port. Truncates the build log, so an
 /// error tail belongs to this build.
 fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
-    let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
+    let log = build_log_path(&ctx.home, name);
     std::fs::File::create(&log)?;
     let port = build_port(ctx, &HashSet::new())?;
     Ok(StartOptions {
@@ -1400,28 +2367,59 @@ fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
     })
 }
 
-/// Builds generation `gen` in a side folder and commits it as a `Full` generation.
+/// Builds generation `gen` in a side folder and commits it as a `Full` generation; through a
+/// staging cluster when `masking` is set.
+#[allow(clippy::too_many_arguments)]
 async fn build_gen(
     ctx: &Ctx,
     install: &PgInstall,
     args: &TemplateInitArgs,
     database: &str,
     migrations_hash: Option<String>,
+    masking: Option<&Masking>,
     gen: u32,
     expected: u32,
 ) -> Result<()> {
     let name = &args.name;
-    let secrets = source_secrets(&args.source);
+    let mut secrets = source_secrets(&args.source);
+    secrets.extend(masking.map(|m| m.salt.clone()));
     let ts = now();
     let build_dir = ctx.home.templates_dir().join(build_dir_name(name, ts));
     let mut opts = build_start_options(ctx, name)?;
     let log = opts.log_file.clone();
+    let staging = masking.map(|_| Staging::new(ctx, install, name, &build_dir));
 
-    let result = run_steps(ctx, install, &build_dir, &mut opts, database, &args.source).await;
+    let result = match (masking, &staging) {
+        (None, _) | (_, None) => {
+            run_steps(
+                ctx,
+                install,
+                &build_dir,
+                &mut opts,
+                database,
+                &args.source,
+                None,
+            )
+            .await
+        }
+        (Some(m), Some(st)) => {
+            let source = &args.source;
+            masked_steps(ctx, install, st, &build_dir, &mut opts, database, source, m).await
+        }
+    };
     let result = match result {
         Ok(ext) => Ok(ext),
-        Err((step, e)) => Err(fail(ctx, install, &build_dir, &log, &secrets, step, e).await),
+        Err((step, e)) => {
+            // The caller named a database the source does not have: a bad request, not a failed build.
+            let bad_request = step == MISSING_DATABASE_STEP && e.code == ErrorCode::InvalidRequest;
+            let failed = fail(ctx, install, &build_dir, &log, &secrets, step, e.clone()).await;
+            Err(if bad_request { e } else { failed })
+        }
     };
+    // Removed only now, so `fail` read the log tail before the staging server's shutdown lines.
+    if let Some(st) = staging {
+        st.remove(&log).await;
+    }
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let row = GenerationRow {
         template: name.clone(),
@@ -1436,8 +2434,281 @@ async fn build_gen(
         size_bytes: 0,
         from_clone: None,
         from_gen: None,
+        mask_hash: masking.map(|m| m.hash.clone()),
     };
     commit_built(ctx, install, &log, &secrets, row, expected).await
+}
+
+/// What a masked build needs: the masking file, its hash, and the template's salt.
+struct Masking {
+    file: MaskFile,
+    hash: String,
+    salt: String,
+}
+
+/// Every column of every user table, as JSON for `ColumnInfo`.
+const COLUMNS_SQL: &str = "SELECT coalesce(json_agg(json_build_object('schema', n.nspname, \
+    'table', c.relname, 'column', a.attname, 'data_type', format_type(a.atttypid, a.atttypmod), \
+    'not_null', a.attnotnull)), '[]') \
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+    WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped \
+    AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%'";
+
+/// Every foreign key (partitions' inherited copies left out), as JSON for `ForeignKey`.
+const FOREIGN_KEYS_SQL: &str = "SELECT coalesce(json_agg(json_build_object( \
+    'child', format('%I.%I', cn.nspname, cc.relname), \
+    'child_cols', (SELECT json_agg(quote_ident(a.attname) ORDER BY k.i) \
+        FROM unnest(con.conkey) WITH ORDINALITY AS k(num, i) \
+        JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num), \
+    'parent', format('%I.%I', pn.nspname, pc.relname), \
+    'parent_cols', (SELECT json_agg(quote_ident(a.attname) ORDER BY k.i) \
+        FROM unnest(con.confkey) WITH ORDINALITY AS k(num, i) \
+        JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.num))), '[]') \
+    FROM pg_constraint con \
+    JOIN pg_class cc ON cc.oid = con.conrelid JOIN pg_namespace cn ON cn.oid = cc.relnamespace \
+    JOIN pg_class pc ON pc.oid = con.confrelid JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+    WHERE con.contype = 'f' AND con.conparentid = 0";
+
+/// Files the staging stage leaves for the restore stage, inside the staging folder.
+const GLOBALS_FILE: &str = "mitosis-globals.sql";
+const DUMP_FILE: &str = "mitosis-masked.dump";
+
+/// Runs the subset (when `subset`) and masking statements of `m` against `database`, in one
+/// transaction with triggers and foreign-key checks off.
+async fn apply_mask(
+    install: &PgInstall,
+    opts: &StartOptions,
+    database: &str,
+    m: &Masking,
+    subset: bool,
+) -> Result<()> {
+    let columns: Vec<ColumnInfo> =
+        serde_json::from_str(&run_psql(install, opts, database, COLUMNS_SQL.into()).await?)?;
+    let mut statements = Vec::new();
+    if subset && !m.file.subset.is_empty() {
+        let fks: Vec<ForeignKey> = serde_json::from_str(
+            &run_psql(install, opts, database, FOREIGN_KEYS_SQL.into()).await?,
+        )?;
+        statements = subset_statements(&m.file, &fks)?;
+    }
+    statements.extend(mask_statements(&m.file, &m.salt, &columns)?);
+    if statements.is_empty() {
+        return Ok(());
+    }
+    // Only the `SET LOCAL` of the salt holds it. Nothing may echo statement text: no statement
+    // logging (whatever the cluster's settings say), no sampled statement or transaction logging
+    // (PG 12+/13+ settings, so set only where they exist), no failing statement in the server log,
+    // no `LINE` excerpt from psql, no utility tracking by pg_stat_statements.
+    let sql = format!(
+        "\\set VERBOSITY terse\nSET log_statement = 'none';\nSET log_min_duration_statement = -1;\n\
+         SELECT set_config(name, CASE name WHEN 'log_transaction_sample_rate' THEN '0' ELSE '-1' END, \
+         false) FROM pg_settings WHERE name IN ('log_transaction_sample_rate', 'log_min_duration_sample');\n\
+         SET log_min_error_statement = panic;\nSET pg_stat_statements.track_utility = off;\n\
+         BEGIN;\nSET LOCAL session_replication_role = replica;\n{};\nCOMMIT;\n",
+        statements.join(";\n")
+    );
+    run_psql(install, opts, database, sql).await.map(drop)
+}
+
+/// Runs a Postgres tool against the build server, output to the build log, in its own process group.
+fn run_tool(
+    install: &PgInstall,
+    tool: &str,
+    opts: &StartOptions,
+    groups: &Groups,
+    args: &[&OsStr],
+) -> Result<()> {
+    let log = || OpenOptions::new().append(true).open(&opts.log_file);
+    let mut child = Command::new(install.bin(tool))
+        .arg("-h")
+        .arg(&opts.socket_dir)
+        .args(["-p", &opts.port.to_string(), "-U", "postgres"])
+        .args(args)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(log()?)
+        .stderr(log()?)
+        .spawn()
+        .map_err(|e| internal(format!("could not run {tool}: {e}")))?;
+    let _group = GroupGuard::new(groups, child.id() as i32);
+    let status = child
+        .wait()
+        .map_err(|e| internal(format!("waiting for {tool}: {e}")))?;
+    if !status.success() {
+        return Err(internal(format!("{tool} failed ({status})")));
+    }
+    Ok(())
+}
+
+/// In the running staging server: subsets and masking, then the roles (without passwords) and
+/// the database dumped into files in the staging folder.
+async fn mask_and_dump(
+    ctx: &Ctx,
+    install: &PgInstall,
+    staging: &Path,
+    opts: &StartOptions,
+    database: &str,
+    m: &Masking,
+) -> StepResult<()> {
+    apply_mask(install, opts, database, m, true)
+        .await
+        .map_err(at("mask"))?;
+    let (i, o, db, dir, g) = (
+        install.clone(),
+        opts.clone(),
+        database.to_string(),
+        staging.to_path_buf(),
+        ctx.build_groups.clone(),
+    );
+    blocking(move || {
+        let (globals, dump) = (dir.join(GLOBALS_FILE), dir.join(DUMP_FILE));
+        let globals_args = ["--globals-only", "--no-role-passwords", "-f"].map(OsStr::new);
+        run_tool(
+            &i,
+            "pg_dumpall",
+            &o,
+            &g,
+            &[&globals_args[..], &[globals.as_os_str()]].concat(),
+        )?;
+        // --create: the database's owner, settings and grants come along. No statistics: they
+        // are computed from the raw data (pg_dump 18 is the first to know the flag).
+        let mut dump_args = vec!["-Fc", "--create"];
+        if i.major >= 18 {
+            dump_args.push("--no-statistics");
+        }
+        dump_args.extend(["-d", &db, "-f"]);
+        let mut dump_args: Vec<&OsStr> = dump_args.into_iter().map(OsStr::new).collect();
+        dump_args.push(dump.as_os_str());
+        run_tool(&i, "pg_dump", &o, &g, &dump_args)
+    })
+    .await
+    .map_err(at("dump"))
+}
+
+/// Stage two of a masked build: a fresh cluster in `dir` gets the staging roles, then the
+/// staging dump, and is stopped.
+async fn restore_steps(
+    ctx: &Ctx,
+    install: &PgInstall,
+    dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+    staging: &Path,
+) -> StepResult<()> {
+    let (i, d) = (install.clone(), dir.to_path_buf());
+    blocking(move || initdb(&i, &d))
+        .await
+        .map_err(at("initdb"))?;
+    let pg = start_build_server(ctx, install, dir, opts).await?;
+    let globals = std::fs::read_to_string(staging.join(GLOBALS_FILE))
+        .map_err(|e| ("roles", MitosisError::from(e)))?;
+    // initdb made the postgres role already, and psql stops at the first error.
+    let globals: String = globals
+        .lines()
+        .filter(|l| *l != "CREATE ROLE postgres;")
+        .map(|l| format!("{l}\n"))
+        .collect();
+    run_psql(install, opts, "postgres", globals)
+        .await
+        .map_err(at("roles"))?;
+    let (i, o, f, g) = (
+        install.clone(),
+        opts.clone(),
+        staging.join(DUMP_FILE),
+        ctx.build_groups.clone(),
+    );
+    // -C makes the database from the dump (owner, settings, grants); `postgres` exists already.
+    let create = database != "postgres";
+    blocking(move || {
+        let mut args = vec![OsStr::new("-d"), OsStr::new("postgres")];
+        if create {
+            args.push(OsStr::new("-C"));
+        }
+        args.push(f.as_os_str());
+        run_tool(&i, "pg_restore", &o, &g, &args)
+    })
+    .await
+    .map_err(at("restore"))?;
+    let (i, d, t) = (
+        install.clone(),
+        dir.to_path_buf(),
+        ctx.config().stop_timeout,
+    );
+    blocking(move || stop(&i, &d, Some(pg), t))
+        .await
+        .map_err(at("stop"))
+}
+
+/// The staging cluster of a masked build. It holds raw source values, so it is stopped and
+/// deleted on every path: by `remove`, or from a thread if the build is dropped midway.
+struct Staging {
+    install: PgInstall,
+    dir: PathBuf,
+    timeout: Duration,
+    removed: bool,
+}
+
+impl Staging {
+    /// A staging folder of template `name` next to its build folder `build_dir`.
+    fn new(ctx: &Ctx, install: &PgInstall, name: &str, build_dir: &Path) -> Staging {
+        let mut ts = now();
+        let dir = loop {
+            let d = ctx.home.templates_dir().join(build_dir_name(name, ts));
+            if d != build_dir && !d.exists() {
+                break d;
+            }
+            ts += 1;
+        };
+        Staging {
+            install: install.clone(),
+            dir,
+            timeout: ctx.config().stop_timeout,
+            removed: false,
+        }
+    }
+
+    async fn remove(mut self, log: &Path) {
+        self.removed = true;
+        let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
+        if let Err(e) = blocking(move || stop_and_remove(&i, &d, t)).await {
+            append_log(
+                log,
+                &format!(
+                    "mitosis: cleanup of staging {} failed: {e}",
+                    self.dir.display()
+                ),
+            );
+        }
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.removed {
+            let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
+            std::thread::spawn(move || stop_and_remove(&i, &d, t));
+        }
+    }
+}
+
+/// The two-stage build: the source is built into a staging cluster, subset and masked there,
+/// and only a dump of the result is restored into a fresh cluster in `build_dir`, so the
+/// generation's data files and WAL never hold raw values.
+/// The caller removes `staging` afterwards, on every path.
+#[allow(clippy::too_many_arguments)]
+async fn masked_steps(
+    ctx: &Ctx,
+    install: &PgInstall,
+    staging: &Staging,
+    build_dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+    source: &TemplateSource,
+    m: &Masking,
+) -> StepResult<Vec<String>> {
+    let extensions = run_steps(ctx, install, &staging.dir, opts, database, source, Some(m)).await?;
+    restore_steps(ctx, install, build_dir, opts, database, &staging.dir).await?;
+    Ok(extensions)
 }
 
 /// Step 7: measures the built side folder `row.dir` (filling `pg_major` and `size_bytes`), then
@@ -1499,6 +2770,26 @@ pub async fn commit_generation(
             ),
         );
     }
+    let kind = match gen.kind {
+        GenKind::Promoted => events::TEMPLATE_PROMOTED,
+        GenKind::Upgraded => events::TEMPLATE_UPGRADED,
+        GenKind::Full | GenKind::Layered => events::TEMPLATE_BUILT,
+    };
+    events::emit(
+        ctx,
+        kind,
+        None,
+        Some(&gen.template),
+        serde_json::json!({
+            "gen": gen.gen,
+            "kind": gen.kind,
+            "current": current,
+            "pg_major": gen.pg_major,
+            "size_bytes": gen.size_bytes,
+            "from_clone": gen.from_clone,
+            "from_gen": gen.from_gen,
+        }),
+    );
     prune(ctx, &gen.template).await;
     Ok(current)
 }
@@ -1507,8 +2798,8 @@ pub async fn commit_generation(
 /// folders, renamed aside under the write guard (no clonefile reads them meanwhile) and deleted
 /// outside it. Failures are logged; gc removes what is left.
 pub(crate) async fn prune(ctx: &Ctx, name: &str) {
-    let doomed = match prune_rows(ctx, name) {
-        Ok(d) => d,
+    let (gens, doomed): (Vec<u32>, Vec<PathBuf>) = match prune_rows(ctx, name) {
+        Ok(d) => d.into_iter().unzip(),
         Err(e) => {
             return crate::lifecycle::log(ctx, &format!("prune of template {name}: {e}"));
         }
@@ -1516,6 +2807,13 @@ pub(crate) async fn prune(ctx: &Ctx, name: &str) {
     if doomed.is_empty() {
         return;
     }
+    events::emit(
+        ctx,
+        events::TEMPLATE_PRUNED,
+        None,
+        Some(name),
+        serde_json::json!({ "gens": gens }),
+    );
     let mut old = Vec::new();
     {
         let _swap = ctx.template_swap.write().await;
@@ -1546,18 +2844,23 @@ pub(crate) async fn prune(ctx: &Ctx, name: &str) {
     .await;
 }
 
-/// Deletes the rows of the generations to prune; returns their folders.
-fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<PathBuf>> {
+/// Deletes the rows of the generations to prune; returns their numbers and folders.
+fn prune_rows(ctx: &Ctx, name: &str) -> Result<Vec<(u32, PathBuf)>> {
     let store = ctx.store();
     let Some(t) = store.get_template(name)? else {
         return Ok(Vec::new());
     };
+    // A branch template keeps as many generations as its base.
+    let keep = match &t.base {
+        Some(base) => store.get_template(base)?.map_or(t.keep, |b| b.keep),
+        None => t.keep,
+    };
     let gens = store.list_generations(name)?;
-    let cut = gens.len().saturating_sub(t.keep as usize);
+    let cut = gens.len().saturating_sub(keep as usize);
     let mut dirs = Vec::new();
     for g in gens[..cut].iter().filter(|g| g.gen != t.current_gen) {
         store.delete_generation(name, g.gen)?;
-        dirs.push(g.dir.clone());
+        dirs.push((g.gen, g.dir.clone()));
     }
     Ok(dirs)
 }
@@ -1644,6 +2947,49 @@ mod tests {
             "psql 'postgres://a:***@h/db' && psql postgresql://b:***@h2:1/x"
         );
         assert_eq!(redact_url("postgres://u@h/db"), "postgres://u@h/db");
+    }
+
+    #[test]
+    fn redacts_password_env_assignments() {
+        assert_eq!(
+            redact_url("PGPASSWORD=s3cret psql -c 'select 1'"),
+            "PGPASSWORD=*** psql -c 'select 1'"
+        );
+        assert_eq!(
+            redact_url("DB_PASSWORD='a b' PGPASSWORD=\"x y\" run"),
+            "DB_PASSWORD=*** PGPASSWORD=*** run"
+        );
+        assert_eq!(redact_url("echo PASSWORD= done"), "echo PASSWORD= done");
+    }
+
+    #[test]
+    fn migrate_cwd_must_be_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let migrate = |cwd: PathBuf| TemplateSettings {
+            migrate: Some(crate::protocol::MigrateCmd {
+                command: "make".into(),
+                cwd,
+                path: None,
+            }),
+            ..Default::default()
+        };
+        let mut t = TemplateRow::new("m", "app", TemplateSource::Url { url: "x".into() }, None, 1);
+        apply_settings(&mut t, None, &migrate(tmp.path().to_path_buf())).unwrap();
+        let e = apply_settings(&mut t, None, &migrate(tmp.path().join("gone"))).unwrap_err();
+        assert!(e.message.contains("not a folder"), "{}", e.message);
+    }
+
+    #[test]
+    fn build_log_name_is_safe_for_branch_templates() {
+        let home = Home::at(PathBuf::from("/h"));
+        assert_eq!(
+            build_log_path(&home, "main"),
+            home.logs_dir().join("template-main.log")
+        );
+        let log = build_log_path(&home, &branch_template_name("main", "feature/x y"));
+        let file = log.file_name().unwrap().to_str().unwrap();
+        assert_eq!(log.parent().unwrap(), home.logs_dir());
+        assert!(file.starts_with("template-main~feature-x-y-"), "{file}");
     }
 
     #[test]

@@ -39,24 +39,238 @@ fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)
 }
 
+/// The auth methods `initdb` is told to use; `make_standalone` writes the same `pg_hba.conf`.
+const AUTH_LOCAL: &str = "trust";
+const AUTH_HOST: &str = "scram-sha-256";
+
 pub fn initdb(install: &PgInstall, data_dir: &Path) -> Result<()> {
     let out = Command::new(install.bin("initdb"))
         .arg("-D")
         .arg(data_dir)
-        .args([
-            "-U",
-            "postgres",
-            "-E",
-            "UTF8",
-            "--auth-local=trust",
-            "--auth-host=scram-sha-256",
-        ])
+        .args(["-U", "postgres", "-E", "UTF8"])
+        .arg(format!("--auth-local={AUTH_LOCAL}"))
+        .arg(format!("--auth-host={AUTH_HOST}"))
         .output()?;
     if !out.status.success() {
         return Err(internal(format!(
             "initdb failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
+    }
+    Ok(())
+}
+
+/// The `pg_hba.conf` that `initdb` writes with `AUTH_LOCAL` and `AUTH_HOST` (checked against a real
+/// `initdb` in the tests): the local socket trusts, TCP needs a password; `replication` lines too.
+fn hba_text() -> String {
+    let mut text = String::new();
+    for db in ["all", "replication"] {
+        text.push_str(&format!(
+            "{:<8}{db:<16}{:<40}{AUTH_LOCAL}\n",
+            "local", "all"
+        ));
+        for addr in ["127.0.0.1/32", "::1/128"] {
+            text.push_str(&format!(
+                "{:<8}{db:<16}{:<16}{addr:<24}{AUTH_HOST}\n",
+                "host", "all"
+            ));
+        }
+    }
+    text
+}
+
+/// Comments out (with a `#mitosis: ` prefix) every active line of `text` for which `hit` is true;
+/// returns the new text and the commented lines.
+fn comment_out(text: &str, hit: impl Fn(&str) -> bool) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(text.len());
+    let mut hits = Vec::new();
+    for line in text.split_inclusive('\n') {
+        if hit(line.trim_start()) {
+            hits.push(line.trim().to_string());
+            out.push_str("#mitosis: ");
+        }
+        out.push_str(line);
+    }
+    (out, hits)
+}
+
+/// The setting name of an active `postgresql.conf` line (`name = value`, `name value`), if any,
+/// in lower case: Postgres reads names case-insensitively.
+fn setting_name(line: &str) -> Option<String> {
+    line.split(|c: char| c == '=' || c.is_whitespace())
+        .next()
+        .filter(|n| !n.is_empty() && !n.starts_with('#'))
+        .map(str::to_ascii_lowercase)
+}
+
+/// True when the `include*` line `line` points outside `data_dir`: an absolute path elsewhere, or
+/// a relative one that climbs out with `..`. A relative path is read relative to the including file.
+fn include_leaves_dir(line: &str, data_dir: &Path) -> bool {
+    let Some((_, rest)) = line.split_once(|c: char| c == '=' || c.is_whitespace()) else {
+        return true;
+    };
+    let rest = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
+    let path = rest
+        .strip_prefix('\'')
+        .and_then(|r| r.split('\'').next())
+        .unwrap_or_else(|| rest.split('#').next().unwrap_or("").trim());
+    let path = Path::new(path);
+    if path.is_absolute() {
+        !path.starts_with(data_dir)
+    } else {
+        path.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    }
+}
+
+/// Settings a copy must not inherit: the value it gets instead (appended to `postgresql.conf`),
+/// or `None` to just comment the source's line out. A copy must not run the source's
+/// `archive_command` against its WAL archive, load its certificates, follow a primary, or read
+/// its `hba_file`, `ident_file` or data folder.
+const NEUTRALISED: [(&str, Option<&str>); 11] = [
+    ("archive_mode", Some("off")),
+    ("archive_command", Some("''")),
+    ("ssl", Some("off")),
+    ("restore_command", Some("''")),
+    ("primary_conninfo", Some("''")),
+    ("primary_slot_name", Some("''")),
+    // A source with synchronous replication would make every commit wait for a standby.
+    ("synchronous_standby_names", Some("''")),
+    ("data_directory", None),
+    ("hba_file", None),
+    ("ident_file", None),
+    ("external_pid_file", None),
+];
+
+/// Makes a folder copied by `pg_basebackup` a normal standalone cluster, before its first start:
+/// removes the standby, recovery and pid files, writes the `pg_hba.conf` `initdb` writes, empties
+/// `postgresql.auto.conf`, comments out `include` lines that point outside the folder and the
+/// `NEUTRALISED` settings (the copy gets safe values appended). A `postgresql.conf` or
+/// `pg_ident.conf` the source keeps outside its data folder (Debian layout) is not copied, so
+/// an empty one stands in. Returns warnings for the build log.
+pub fn make_standalone(data_dir: &Path) -> Result<Vec<String>> {
+    for name in [
+        "standby.signal",
+        "recovery.signal",
+        "postmaster.pid",
+        "postmaster.opts",
+    ] {
+        match std::fs::remove_file(data_dir.join(name)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(internal(format!("remove {name}: {e}")))
+            }
+            _ => {}
+        }
+    }
+    let write = |name: &str, text: &str| {
+        std::fs::write(data_dir.join(name), text)
+            .map_err(|e| internal(format!("write {name}: {e}")))
+    };
+    let mut warnings = Vec::new();
+    write("pg_hba.conf", &hba_text())?;
+    write("postgresql.auto.conf", "")?;
+    if !data_dir.join("pg_ident.conf").exists() {
+        warnings.push("pg_ident.conf was not in the copied folder; wrote an empty one".into());
+        write("pg_ident.conf", "# Mitosis: no user name maps\n")?;
+    }
+
+    let conf = data_dir.join("postgresql.conf");
+    let text = match std::fs::read_to_string(&conf) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(
+                "postgresql.conf was not in the copied folder (the source keeps it elsewhere); \
+                 using Postgres defaults"
+                    .into(),
+            );
+            String::new()
+        }
+        Err(e) => return Err(internal(format!("read {}: {e}", conf.display()))),
+    };
+    let (mut text, hits) = comment_out(&text, |line| match setting_name(line).as_deref() {
+        Some("include" | "include_dir" | "include_if_exists") => include_leaves_dir(line, data_dir),
+        Some(name) => NEUTRALISED.iter().any(|(n, _)| *n == name),
+        None => false,
+    });
+    // Names only: a value can hold a password (`primary_conninfo`) or keys (`archive_command`).
+    warnings.extend(
+        hits.iter()
+            .filter_map(|l| setting_name(l))
+            .map(|name| format!("commented out the source's {name} setting in postgresql.conf")),
+    );
+    // Later lines win, so these also beat a setting an included file inside the folder sets.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("# Mitosis: a copy must not inherit these\n");
+    for (name, value) in NEUTRALISED {
+        if let Some(v) = value {
+            text.push_str(&format!("{name} = {v}\n"));
+        }
+    }
+    write("postgresql.conf", &text)?;
+    Ok(warnings)
+}
+
+/// Comments out the active `shared_preload_libraries` line(s) of `postgresql.conf`; returns them
+/// (empty when there was none, or no file). For a copy whose libraries this machine does not have.
+pub fn disable_preload_libraries(data_dir: &Path) -> Result<Vec<String>> {
+    let conf = data_dir.join("postgresql.conf");
+    let text = match std::fs::read_to_string(&conf) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(internal(format!("read {}: {e}", conf.display()))),
+    };
+    let (text, hits) = comment_out(&text, |line| {
+        setting_name(line).as_deref() == Some("shared_preload_libraries")
+    });
+    if !hits.is_empty() {
+        std::fs::write(&conf, text)
+            .map_err(|e| internal(format!("write {}: {e}", conf.display())))?;
+    }
+    Ok(hits)
+}
+
+/// True when a start failure message says a library could not be loaded.
+pub fn is_missing_library(message: &str) -> bool {
+    message.contains("could not access file")
+        || message.contains("could not load library")
+        || message.contains("shared_preload_libraries")
+}
+
+/// Makes sure the folder's cluster has a `postgres` role that is a superuser, in single-user
+/// mode: it needs no socket, no password and no knowing the name of the bootstrap superuser
+/// (a copy of a Homebrew-made source has the OS user's name there, not `postgres`).
+/// The server must not be running. Also finishes the backup recovery of a fresh copy.
+pub fn ensure_postgres_superuser(install: &PgInstall, data_dir: &Path) -> Result<()> {
+    // One line: in single-user mode a newline ends the statement.
+    let sql = "DO $$BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') \
+        THEN CREATE ROLE postgres SUPERUSER LOGIN; ELSE ALTER ROLE postgres SUPERUSER LOGIN; \
+        END IF; END$$;\n";
+    let mut child = Command::new(install.bin("postgres"))
+        .env("LC_ALL", "C")
+        .arg("--single")
+        .arg("-D")
+        .arg(data_dir)
+        // The lean memory settings `start` uses, not the source's.
+        .args(["-c", "shared_buffers=32MB", "-c", "max_connections=20"])
+        .arg("template1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| internal(format!("could not run postgres --single: {e}")))?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let writer = std::thread::spawn(move || stdin.write_all(sql.as_bytes()));
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    // Single-user mode exits 0 even when a statement failed: its errors are on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || stderr.contains("ERROR:") || stderr.contains("FATAL:") {
+        return Err(MitosisError::new(
+            ErrorCode::PostgresStartFailed,
+            format!("preparing the copied cluster failed:\n{}", stderr.trim()),
+        ));
     }
     Ok(())
 }
@@ -709,5 +923,54 @@ mod tests {
             parse_control_state("pg_control version number: 1300\n"),
             None
         );
+    }
+
+    #[test]
+    fn make_standalone_comments_outside_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::write(
+            d.join("postgresql.conf"),
+            format!(
+                "shared_buffers = 1GB\n#include 'commented.conf'\ninclude '/etc/pg/extra.conf'\n\
+                 include_dir = '../conf.d'  # up\ninclude_if_exists='/etc/pg/maybe.conf'\n\
+                 include 'local.conf'\ninclude_dir '{}/conf.d'\nshared_preload_libraries = 'x'\n\
+                 INCLUDE '/etc/pg/upper.conf'\n",
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.join("pg_ident.conf"), "").unwrap();
+
+        let warnings = make_standalone(d).unwrap();
+
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(std::fs::read_to_string(d.join("postgresql.conf"))
+            .unwrap()
+            .contains("#mitosis: INCLUDE '/etc/pg/upper.conf'"));
+        let conf = std::fs::read_to_string(d.join("postgresql.conf")).unwrap();
+        assert!(conf.contains("#mitosis: include '/etc/pg/extra.conf'"));
+        assert!(conf.contains("#mitosis: include_dir = '../conf.d'"));
+        assert!(conf.contains("#mitosis: include_if_exists='/etc/pg/maybe.conf'"));
+        // Inside the folder, and settings that are not includes, stay.
+        assert!(conf.contains("\ninclude 'local.conf'\n"));
+        assert!(conf.contains(&format!("\ninclude_dir '{}/conf.d'\n", d.display())));
+        assert!(conf.lines().any(|l| l == "shared_buffers = 1GB"));
+        assert!(conf.contains("\nshared_preload_libraries = 'x'\n"));
+
+        let off = disable_preload_libraries(d).unwrap();
+        assert_eq!(off, vec!["shared_preload_libraries = 'x'".to_string()]);
+        let conf = std::fs::read_to_string(d.join("postgresql.conf")).unwrap();
+        assert!(conf.contains("#mitosis: shared_preload_libraries = 'x'"));
+        assert!(disable_preload_libraries(d).unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_library_messages() {
+        assert!(is_missing_library(
+            "postgres exited during startup:\nFATAL:  could not access file \"timescaledb\": No such file"
+        ));
+        assert!(is_missing_library("could not load library \"$libdir/x\""));
+        assert!(!is_missing_library("port 5432 is already in use"));
     }
 }

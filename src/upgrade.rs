@@ -88,6 +88,9 @@ pub async fn upgrade(
     let new_name = as_name.unwrap_or(name);
     let (created, expected, gen) = reserve(ctx, &row, new_name, as_name.is_some(), cur.gen)?;
     let res = run(ctx, &old, &target, &cur, new_name, gen, expected, created).await;
+    if let Err(e) = &res {
+        crate::events::emit_template_failed(ctx, new_name, gen, "upgrade", e);
+    }
     if res.is_err() && created {
         // A failed upgrade leaves no new template behind.
         let store = ctx.store();
@@ -131,6 +134,12 @@ fn reserve(
     t.migrate = row.migrate.clone();
     t.auto_migrate = row.auto_migrate;
     t.on_stale = row.on_stale;
+    // A later full refresh of the copy must mask as the original does, with the same salt.
+    t.mask_path = row.mask_path.clone();
+    t.mask_salt = row.mask_salt.clone();
+    t.base_branch = row.base_branch.clone();
+    t.repo_rel_cwd = row.repo_rel_cwd.clone();
+    t.repo_rel_migrations = row.repo_rel_migrations.clone();
     store.insert_template(&t)?;
     match store.alloc_gen(new_name) {
         Ok(gen) => Ok((true, 0, gen)),
@@ -214,6 +223,7 @@ async fn run(
         from_clone: None,
         // Only a generation of the same template names its parent.
         from_gen: (!created).then_some(cur.gen),
+        mask_hash: cur.mask_hash.clone(),
     };
     commit_built(ctx, target, &work.log, &[], row, expected).await?;
     if !created {
@@ -524,9 +534,29 @@ fn log_files(root: &Path, text: &mut String) {
     }
 }
 
+/// `redact_url`, and every `SCRAM-SHA-256$...` password hash (pg_upgrade logs print role
+/// statements) cut to its prefix.
+fn redact(text: &str) -> String {
+    const HASH: &str = "SCRAM-SHA-256$";
+    let text = redact_url(text);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find(HASH) {
+        let (head, tail) = rest.split_at(i + HASH.len());
+        out.push_str(head);
+        out.push_str("***");
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn append_log(log: &Path, text: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log) {
-        let _ = writeln!(f, "{}", redact_url(text));
+        let _ = writeln!(f, "{}", redact(text));
     }
 }
 
@@ -555,7 +585,7 @@ async fn fail(
     e: MitosisError,
 ) -> MitosisError {
     append_log(&work.log, &format!("mitosis: {step} failed: {e}"));
-    let tail = redact_url(&log_tail(&work.log, 20));
+    let tail = redact(&log_tail(&work.log, 20));
     let (o, t, timeout) = (old.clone(), target.clone(), ctx.config().stop_timeout);
     let (a, b, tmp, sock) = (
         work.a.clone(),
@@ -625,6 +655,17 @@ mod tests {
             .unwrap();
         assert_eq!(s, settings("c", None, false));
         assert!(parse_settings("garbage").is_err());
+    }
+
+    #[test]
+    fn password_hashes_are_cut_from_logs() {
+        let hash = format!("SCRAM-SHA-256${}", "4096:abc$def:ghi");
+        let text = format!("ALTER ROLE app WITH PASSWORD '{hash}'; next");
+        assert_eq!(
+            redact(&text),
+            "ALTER ROLE app WITH PASSWORD 'SCRAM-SHA-256$***'; next"
+        );
+        assert_eq!(redact("plain line"), "plain line");
     }
 
     #[test]

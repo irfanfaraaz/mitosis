@@ -4,7 +4,7 @@ use common::*;
 use mitosis::client;
 use mitosis::clones;
 use mitosis::daemon::run;
-use mitosis::envfile::{create_clone, finish_pending, get_var};
+use mitosis::envfile::{create_clone, finish_pending, finish_pending_counted, get_var};
 use mitosis::error::{ErrorCode, Result};
 use mitosis::lifecycle::reap_expired;
 use mitosis::paths::Home;
@@ -53,6 +53,8 @@ impl Fixture {
             .unwrap()
             .join(".env");
         std::fs::write(&p, text).unwrap();
+        // Set, not left to the umask: tests check that a rewrite keeps the mode.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         p
     }
 
@@ -96,6 +98,7 @@ fn args(name: Option<&str>, ttl_secs: u64) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -200,10 +203,16 @@ async fn unwritable_restore_becomes_pending_and_client_finishes_it() {
     let warnings = finish_pending(&fx.home).await;
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(!warnings[0].contains("postgres://"), "{}", warnings[0]);
+    assert!(
+        warnings[0].contains("for an earlier clone"),
+        "{}",
+        warnings[0]
+    );
+    assert_eq!(finish_pending_counted(&fx.home).await.0, 0, "none finished");
     assert_eq!(fx.env.ctx.store().list_pending_restores().unwrap().len(), 1);
 
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(finish_pending(&fx.home).await.is_empty());
+    assert_eq!(finish_pending_counted(&fx.home).await, (1, Vec::new()));
     assert_eq!(read(&file), "DATABASE_URL=old\n");
     assert!(fx
         .env
@@ -360,6 +369,27 @@ async fn fresh_failing_after_destroy_leaves_a_pending_restore() {
     assert_eq!(pending[0].url, a.url);
 
     assert!(finish_pending(&fx.home).await.is_empty());
+    assert_eq!(read(&file), "DATABASE_URL=old\n");
+    fx.stop().await;
+}
+
+/// Asking again for a running named clone with the same file keeps the first `previous`: the
+/// file then holds the clone's URL, which must not become the value to restore.
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_named_clone_keeps_the_first_previous() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let file = fx.dotenv("DATABASE_URL=old\n");
+    let named = || create_clone(&fx.home, args(Some("keep"), 7200), Some(file.clone()), None);
+    let a = named().await.unwrap();
+    let b = named().await.unwrap();
+    assert!(b.existing && b.id == a.id);
+    assert_eq!(
+        get_var(&read(&file), "DATABASE_URL").as_deref(),
+        Some(&*a.url)
+    );
+    fx.destroy(&a.id).await;
     assert_eq!(read(&file), "DATABASE_URL=old\n");
     fx.stop().await;
 }

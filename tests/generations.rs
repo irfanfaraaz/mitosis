@@ -34,6 +34,7 @@ fn args(template: &str) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn fake_gen(ctx: &Ctx, name: &str, gen: u32, pg_major: u32) -> GenerationRow {
         size_bytes: 1,
         from_clone: None,
         from_gen: None,
+        mask_hash: None,
     }
 }
 

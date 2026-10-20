@@ -2,12 +2,16 @@ use crate::error::MitosisError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemplateSource {
     Url {
+        url: String,
+    },
+    /// A physical copy of a running server made with `pg_basebackup`.
+    Basebackup {
         url: String,
     },
     Seed {
@@ -95,6 +99,17 @@ pub struct TemplateSettings {
     pub auto_migrate: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_stale: Option<OnStale>,
+    /// Masking file, as an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<PathBuf>,
+    #[serde(default)]
+    pub mask_off: bool,
+    /// The git branch the base template's recorded checkout follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Forget the base branch: layered builds then run on any branch, as before v1.0.
+    #[serde(default)]
+    pub base_branch_off: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -142,6 +157,21 @@ pub struct CloneCreateArgs {
     /// How long to wait for room under the limits; `None` uses the daemon's `queue_wait`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
+    /// Clone the template built for this git branch (`<template>~<branch>`) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<BranchArgs>,
+}
+
+/// The caller's git checkout for `clone --branch`; the client fills it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BranchArgs {
+    /// The branch name as git shows it.
+    pub name: String,
+    /// The root of the caller's git work tree (`git rev-parse --show-toplevel`).
+    pub repo_root: PathBuf,
+    /// The caller's `PATH`, for the migrate command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// One variable in one `.env` file that holds a clone's URL.
@@ -216,6 +246,23 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         template: Option<String>,
     },
+    /// Starts a sleeping clone (a no-op for a running one); answered with `Response::Clone`.
+    CloneWake {
+        id_or_name: String,
+    },
+    /// What a clone changed against the template generation it came from; answered with
+    /// `Response::Diff`. A `parent_pid` limits it to a clone of that MCP session.
+    CloneDiff {
+        id_or_name: String,
+        /// A table (`name` or `schema.name`) to compare row by row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
+        /// Rows shown per kind with `table`; default 20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_pid: Option<i32>,
+    },
     /// `.env` restores the daemon could not finish.
     PendingRestores,
     PendingRestoreDone {
@@ -227,7 +274,47 @@ pub enum Request {
     Usage,
     /// Re-read `config.toml` and the environment; later requests use the new settings.
     ConfigReload,
+    /// Past events matching `filter`, oldest first. With `follow` the daemon keeps the connection
+    /// open after that list and writes one `Response::Event` line per new event.
+    Events {
+        #[serde(default)]
+        filter: EventFilter,
+        #[serde(default)]
+        follow: bool,
+    },
     Shutdown,
+}
+
+/// One entry of the event log. `detail` never holds a password or a URL with one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct EventRow {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    pub detail: serde_json::Value,
+}
+
+/// Which events to list; an unset field matches everything.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct EventFilter {
+    /// A clone's name or id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// An exact kind (`clone.created`) or a group (`clone` matches every `clone.*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Unix seconds; only events at or after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    /// The newest `limit` matches (still listed oldest first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -242,8 +329,8 @@ pub struct TemplateInfo {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub current_gen: u32,
-    /// How many generations the template keeps on disk.
-    #[serde(default)]
+    /// How many generations the template has on disk.
+    #[serde(default, rename = "gen_count")]
     pub generations: u32,
     #[serde(default)]
     pub paused: bool,
@@ -262,6 +349,18 @@ pub struct TemplateInfo {
     pub on_stale: OnStale,
     #[serde(default)]
     pub keep: u32,
+    /// The masking file, when the template has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<PathBuf>,
+    /// A branch template: its base template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// A branch template: its git branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// A base template: the branch its recorded checkout follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -280,7 +379,7 @@ pub struct CloneInfo {
     pub rss_bytes: Option<u64>,
     pub own_disk_bytes: Option<u64>,
     /// The template generation this clone was made from.
-    #[serde(default)]
+    #[serde(default, rename = "gen")]
     pub generation: u32,
     /// The template was older than its max age when this clone was made.
     #[serde(default)]
@@ -308,6 +407,83 @@ pub struct CloneInfo {
     /// Restarted after an unclean shutdown with fsync off: recent writes may be lost or corrupt.
     #[serde(default)]
     pub suspect: bool,
+    /// The URL straight to the clone's own port; `url` is the router URL while the router is on.
+    #[serde(default)]
+    pub direct_url: String,
+    /// `ready`, `sleeping`, `starting` or `stopping`.
+    #[serde(default)]
+    pub status: String,
+    /// Made from a branch template: its git branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The branch template was rebuilt before this clone was made.
+    #[serde(default)]
+    pub rebuilt: bool,
+}
+
+/// What a clone changed against the template generation it was made from.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DiffReport {
+    pub clone: String,
+    pub template: String,
+    #[serde(rename = "gen")]
+    pub generation: u32,
+    pub schema: Vec<SchemaChange>,
+    /// Every table of either side; `public.` is left off names.
+    pub tables: Vec<TableCount>,
+    /// Only with `--table`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<RowDiff>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SchemaChange {
+    /// table, column, index, constraint, view, function, sequence or extension.
+    pub kind: String,
+    pub name: String,
+    /// added, removed or changed.
+    pub change: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TableCount {
+    pub table: String,
+    /// None: the table is not there on that side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<Count>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Count>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Count {
+    pub n: u64,
+    /// `n` is the planner's estimate: the exact count timed out.
+    #[serde(default)]
+    pub estimate: bool,
+}
+
+/// Row-level changes of one table. `pk` is the key value, or an array for a composite key.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RowDiff {
+    pub table: String,
+    pub inserted: Vec<serde_json::Value>,
+    pub deleted: Vec<serde_json::Value>,
+    pub updated: Vec<RowChange>,
+    pub inserted_total: u64,
+    pub deleted_total: u64,
+    pub updated_total: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RowChange {
+    pub pk: serde_json::Value,
+    /// Columns whose values differ.
+    pub columns: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -344,6 +520,21 @@ pub struct DaemonStatus {
     /// Started by the launchd login service.
     #[serde(default)]
     pub service: bool,
+    /// The router's state; none when `router = off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<RouterStatus>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct RouterStatus {
+    pub listening: bool,
+    /// The address the router binds (`router_listen`); empty before the first bind attempt.
+    #[serde(default)]
+    pub listen: String,
+    pub port: u16,
+    /// Why the router is not listening (a taken port, say); it retries every minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -361,6 +552,8 @@ pub enum Response {
         paused: bool,
     },
     CloneCreated(CloneInfo),
+    /// One clone, e.g. after `CloneWake`.
+    Clone(CloneInfo),
     Clones {
         clones: Vec<CloneInfo>,
     },
@@ -373,6 +566,12 @@ pub enum Response {
     Gc(GcReport),
     Status(DaemonStatus),
     Usage(crate::budget::Usage),
+    Events {
+        events: Vec<EventRow>,
+    },
+    /// One new event on a following `Request::Events` connection.
+    Event(EventRow),
+    Diff(DiffReport),
     Ok,
 }
 
@@ -415,13 +614,14 @@ mod tests {
                 protect: false,
                 env: None,
                 wait_secs: None,
+                branch: None,
             }),
         };
         let line = serde_json::to_string(&env).unwrap();
         assert!(!line.contains('\n'));
         let back: RequestEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(back.v, PROTOCOL_VERSION);
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
         match back.request {
             Request::CloneCreate(a) => {
                 assert_eq!(a.template, "main");
@@ -470,6 +670,10 @@ mod tests {
             auto_migrate: true,
             on_stale: OnStale::Refresh,
             keep: 3,
+            mask: None,
+            base: None,
+            branch: None,
+            base_branch: None,
         }
     }
 
@@ -498,6 +702,10 @@ mod tests {
             waited_ms: 0,
             disk_warn: false,
             suspect: false,
+            direct_url: "postgres://localhost:5500/app".into(),
+            status: "ready".into(),
+            branch: None,
+            rebuilt: false,
         }
     }
 
@@ -642,6 +850,32 @@ mod tests {
             serde_json::from_str(r#"{"type":"generations","template":"main","generations":[]}"#)
                 .unwrap();
         assert!(matches!(r, Response::Generations { paused: false, .. }));
+    }
+
+    #[test]
+    fn events_round_trip_and_defaults() {
+        let row = EventRow {
+            id: 7,
+            ts: 1_700_000_000,
+            kind: "clone.created".into(),
+            clone: Some("feat".into()),
+            template: None,
+            detail: serde_json::json!({ "id": "abc123" }),
+        };
+        round_trip(Response::Events {
+            events: vec![row.clone()],
+        });
+        round_trip(Response::Event(row));
+        // A request that names no filter and no follow still parses.
+        let r: Request = serde_json::from_str(r#"{"type":"events"}"#).unwrap();
+        let Request::Events { filter, follow } = r else {
+            panic!("wrong variant")
+        };
+        assert_eq!((filter, follow), (EventFilter::default(), false));
+        assert_eq!(
+            serde_json::to_string(&EventFilter::default()).unwrap(),
+            "{}"
+        );
     }
 
     #[test]

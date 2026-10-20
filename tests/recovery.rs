@@ -4,8 +4,9 @@ use common::*;
 use mitosis::clones::{create, list};
 use mitosis::lifecycle::reconcile;
 use mitosis::pg::newest;
-use mitosis::protocol::{CloneCreateArgs, CloneInfo};
+use mitosis::protocol::{CloneCreateArgs, CloneInfo, EnvTarget};
 use mitosis::state::CloneRow;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ fn args(name: Option<&str>, durable: bool) -> CloneCreateArgs {
         protect: false,
         env: None,
         wait_secs: None,
+        branch: None,
     }
 }
 
@@ -71,10 +73,29 @@ fn kill_9(env: &TestEnv, info: &CloneInfo) {
         .status()
         .unwrap();
     assert!(st.success());
-    // Its children notice the postmaster is gone and exit, releasing shared memory.
-    std::thread::sleep(Duration::from_secs(2));
+    // Its children notice the postmaster is gone and exit, releasing shared memory. They all have
+    // the data folder as their working folder, so wait until no process has.
+    let dir = row(env, &info.id).unwrap().dir;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let users = Command::new("lsof")
+            .args(["-t", "+d"])
+            .arg(&dir)
+            .output()
+            .unwrap();
+        if users.stdout.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backends still in {}",
+            dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
+/// The router is off in `TestEnv`, so this is the v0.2 restart.
 #[tokio::test]
 async fn named_clone_restarts_after_clean_stop() {
     let Some(env) = TestEnv::new() else { return };
@@ -174,4 +195,94 @@ async fn dead_unnamed_clone_with_parent_is_destroyed() {
     assert_eq!(report.destroyed, vec![c.id.clone()], "{report:?}");
     assert!(row(&env, &c.id).is_none());
     assert!(!dir.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn named_clone_sleeps_after_dead_server_and_router_wakes_it() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    start_router(&env).await;
+    let x = create(&env.ctx, args(Some("x"), false)).await.unwrap();
+    psql_url(&env, &x.url, "insert into t values (2)");
+    pg_ctl_stop(&env, &x);
+    // With the router on, recovery marks it sleeping instead of starting it.
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert!(report.adopted.contains(&x.id), "{report:?}");
+    assert!(report.destroyed.is_empty(), "{report:?}");
+    let r = row(&env, &x.id).unwrap();
+    assert_eq!(r.pg_pid, None);
+    assert_eq!(listed(&env, &x.id).status, "sleeping");
+    // A second gc leaves it asleep.
+    reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert_eq!(listed(&env, &x.id).status, "sleeping");
+    // The first router connection wakes it, data intact.
+    assert_eq!(psql_url(&env, &x.url, "select count(*) from t"), "2");
+    let info = listed(&env, &x.id);
+    assert_eq!(info.status, "ready");
+    assert_eq!(info.url, x.url);
+    assert!(!info.suspect);
+}
+
+/// After a port move, a `.env` file the daemon cannot write keeps the old URL, and so does its
+/// record, so the restore at destroy still finds it.
+#[tokio::test]
+async fn restart_keeps_record_url_when_rewrite_fails() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let project = tempfile::tempdir().unwrap();
+    let file = std::fs::canonicalize(project.path()).unwrap().join(".env");
+    let target = EnvTarget {
+        file: file.clone(),
+        var: "DATABASE_URL".into(),
+        previous: Some("old".into()),
+    };
+    let a = create(
+        &env.ctx,
+        CloneCreateArgs {
+            env: Some(target),
+            ..args(Some("w"), false)
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::write(&file, format!("DATABASE_URL={}\n", a.url)).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    pg_ctl_stop(&env, &a);
+    let Ok(_busy) = std::net::TcpListener::bind(("127.0.0.1", a.port)) else {
+        println!("skipping: could not hold port {}", a.port);
+        return;
+    };
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(report.adopted.contains(&a.id), "{report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("could not update")),
+        "{report:?}"
+    );
+    assert_ne!(row(&env, &a.id).unwrap().port, a.port, "the port moved");
+    let recs = env.ctx.store().env_records(&a.id).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].url, a.url, "the record names what the file holds");
+    assert_eq!(recs[0].previous.as_deref(), Some("old"));
+}
+
+/// A Ready clone whose server is down says so in `list` until gc recovers it.
+#[tokio::test]
+async fn list_warns_when_a_ready_server_is_down() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let a = create(&env.ctx, args(Some("down"), false)).await.unwrap();
+    assert!(listed(&env, &a.id).warnings.is_empty());
+    pg_ctl_stop(&env, &a);
+    let info = listed(&env, &a.id);
+    assert!(
+        info.warnings.iter().any(|w| w.contains("is not running")),
+        "{:?}",
+        info.warnings
+    );
+    reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert!(listed(&env, &a.id).warnings.is_empty(), "recovered");
 }

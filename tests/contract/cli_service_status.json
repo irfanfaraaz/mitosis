@@ -1,0 +1,7 @@
+{
+  "binary": "string",
+  "binary_exists": "boolean",
+  "installed": "boolean",
+  "loaded": "boolean",
+  "running": "boolean"
+}

@@ -3,9 +3,9 @@
 use crate::client;
 use crate::envfile;
 use crate::error::{self, ErrorCode, MitosisError};
-use crate::names::{format_duration, parse_duration, validate_name};
+use crate::names::{format_duration, parse_duration, parse_wait, validate_name};
 use crate::paths::Home;
-use crate::protocol::{CloneCreateArgs, CloneInfo, Request, Response};
+use crate::protocol::{BranchArgs, CloneCreateArgs, CloneInfo, Request, Response};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
@@ -34,16 +34,32 @@ pub struct CloneCreateParams {
     pub env_file: Option<String>,
     /// Variable to set in `env_file`. Default "DATABASE_URL".
     pub env_var: Option<String>,
-    /// Seconds to wait for room when the clone limits are full. 0 fails at once. Default: the
-    /// daemon's setting.
-    pub wait_secs: Option<u64>,
+    /// How long to wait for room when the clone limits are full, like 30s or 2m; "0" fails at
+    /// once. Default: the daemon's setting.
+    pub wait: Option<String>,
+    /// Clone a template built for this git branch, so the database has the branch's schema: the
+    /// template's migrate command runs in the git checkout the MCP server runs in. "" means the
+    /// branch checked out there; it must be the branch checked out. Default: the template itself.
+    pub branch: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CloneDestroyParams {
     /// Clone id or name.
-    pub id: String,
+    pub id_or_name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct CloneDiffParams {
+    /// Clone id or name.
+    pub id_or_name: String,
+    /// A table (`name` or `schema.name`) to compare row by row; it needs a primary key. Omit for
+    /// the schema changes and row counts of every table.
+    pub table: Option<String>,
+    /// With `table`: rows shown per kind (inserted, deleted, updated). Default 20.
+    pub limit: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -63,10 +79,10 @@ fn unexpected() -> MitosisError {
         .with_hint("restart the daemon: mitosis daemon stop")
 }
 
-#[tool_router]
+#[tool_router(vis = "pub")]
 impl Mitosis {
     #[tool(
-        description = "Create a private, throwaway Postgres database cloned from a template in about a second. Use it for migrations, seeds and destructive tests. It is deleted when this session ends or the TTL passes."
+        description = "Create a private, throwaway Postgres database cloned from a template in about a second. Use it for migrations, seeds and destructive tests. It is deleted when this session ends or the TTL passes. Returns `url`, a stable router URL (postgres://postgres:<password>@127.0.0.1:<router_port>/<clone name or id>) that keeps working when the clone sleeps: an idle clone is stopped to save memory and the next connection to `url` wakes it. `direct_url` is the clone's own port and refuses connections while it sleeps. `branch` clones a template built for a git branch, so the database has that branch's schema. Use clone_diff afterwards to see what you changed."
     )]
     async fn clone_create(
         &self,
@@ -75,7 +91,9 @@ impl Mitosis {
         text(self.create(p).await)
     }
 
-    #[tool(description = "List the clones this session created, as JSON.")]
+    #[tool(
+        description = "List the clones this session created, as JSON. `status` is `ready` or `sleeping`; connecting to a sleeping clone's `url` wakes it."
+    )]
     async fn clone_list(&self) -> Result<String, String> {
         text(
             async {
@@ -91,12 +109,24 @@ impl Mitosis {
         )
     }
 
-    #[tool(description = "Destroy a clone this session created, by id or name.")]
+    #[tool(
+        description = "Destroy a clone this session created, by id or name. Works on a sleeping clone too. Returns `{\"destroyed\": \"<id>\"}`."
+    )]
     async fn clone_destroy(
         &self,
         Parameters(p): Parameters<CloneDestroyParams>,
     ) -> Result<String, String> {
-        text(self.destroy(p.id).await)
+        text(self.destroy(p.id_or_name).await)
+    }
+
+    #[tool(
+        description = "Show what you changed in one of your clones, compared with the template generation it was made from, as JSON: schema changes (tables, columns, indexes, constraints, views, functions, sequences, extensions), row counts per table before and after, and with `table` the inserted, deleted and updated rows by primary key."
+    )]
+    async fn clone_diff(
+        &self,
+        Parameters(p): Parameters<CloneDiffParams>,
+    ) -> Result<String, String> {
+        text(self.diff(p).await)
     }
 }
 
@@ -153,7 +183,41 @@ impl Mitosis {
         )
         .await?
         {
-            Response::Destroyed { id } => Ok(format!("destroyed {id}")),
+            Response::Destroyed { id } => Ok(serde_json::to_string_pretty(&destroy_output(&id))?),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Diffs a clone of this session; another session's clone (or a CLI one) is refused.
+    async fn diff(&self, p: CloneDiffParams) -> error::Result<String> {
+        let clones = self.all_clones().await?;
+        let c = find(&clones, &p.id_or_name).ok_or_else(|| {
+            MitosisError::new(
+                ErrorCode::CloneNotFound,
+                format!("clone {} not found", p.id_or_name),
+            )
+            .with_hint("see this session's clones with the clone_list tool")
+        })?;
+        if !is_mine(c) {
+            return Err(MitosisError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "clone {} was not created by this session; it may be another agent's database",
+                    c.id
+                ),
+            )
+            .with_hint("this tool only reads clones from clone_create in this session"));
+        }
+        // By id, so a name reused meanwhile cannot redirect the diff; the daemon checks the
+        // session again.
+        let req = Request::CloneDiff {
+            id_or_name: c.id.clone(),
+            table: p.table,
+            limit: p.limit,
+            parent_pid: Some(std::process::id() as i32),
+        };
+        match client::request(&self.home, req).await? {
+            Response::Diff(report) => Ok(serde_json::to_string_pretty(&report)?),
             _ => Err(unexpected()),
         }
     }
@@ -174,7 +238,21 @@ impl Mitosis {
             // Agents must not make undeletable clones.
             protect: false,
             env: None,
-            wait_secs: p.wait_secs,
+            wait_secs: p
+                .wait
+                .as_deref()
+                .map(parse_wait)
+                .transpose()?
+                .map(|d| d.as_secs()),
+            // `create_clone` resolves the branch and the repository root from our cwd.
+            branch: match p.branch {
+                Some(name) => Some(BranchArgs {
+                    name,
+                    repo_root: std::env::current_dir()?,
+                    path: None,
+                }),
+                None => None,
+            },
             // This process is the parent: when the MCP session ends, the daemon destroys the clone.
             parent_pid: Some(std::process::id() as i32),
         };
@@ -187,35 +265,50 @@ impl Mitosis {
             match client::request(&self.home, Request::TemplateList).await {
                 Ok(Response::Templates { templates }) => templates
                     .into_iter()
-                    .filter(|t| t.name == template)
+                    .filter(|t| t.name == info.template)
                     .flat_map(|t| t.warnings)
                     .collect(),
                 _ => Vec::new(),
             };
         warnings.extend(info.warnings.iter().cloned());
-        let mut out = serde_json::to_value(&info)?;
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert(
-                "template_age".into(),
-                format_duration(Duration::from_secs(info.template_age_secs)).into(),
-            );
-            obj.insert("warnings".into(), warnings.into());
-        }
-        Ok(serde_json::to_string_pretty(&out)?)
+        Ok(serde_json::to_string_pretty(&create_output(
+            &info, warnings,
+        )?)?)
     }
+}
+
+/// The `clone_create` reply: the clone, a readable `template_age`, and every warning (the
+/// template's and the clone's).
+pub fn create_output(info: &CloneInfo, warnings: Vec<String>) -> error::Result<serde_json::Value> {
+    let mut out = serde_json::to_value(info)?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "template_age".into(),
+            format_duration(Duration::from_secs(info.template_age_secs)).into(),
+        );
+        obj.insert("warnings".into(), warnings.into());
+    }
+    Ok(out)
+}
+
+/// The `clone_destroy` reply.
+pub fn destroy_output(id: &str) -> serde_json::Value {
+    serde_json::json!({ "destroyed": id })
 }
 
 #[tool_handler(
     name = "mitosis",
-    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL; clone_list shows the clones this session made; clone_destroy deletes one of them. Clones are deleted when this session ends or their TTL passes."
+    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL (a router URL on 127.0.0.1 that stays valid while the clone sleeps; the next connection wakes it); clone_list shows the clones this session made; clone_destroy deletes one of them; clone_diff shows what you changed in one. Pass `branch` to clone_create to get the schema of a git branch. Clones are deleted when this session ends or their TTL passes."
 )]
 impl ServerHandler for Mitosis {}
 
 /// Serves the clone tools on stdin/stdout until stdin closes.
 pub async fn serve_stdio(home: Home) -> error::Result<()> {
     let internal = |e: String| MitosisError::new(ErrorCode::Internal, format!("mcp: {e}"));
-    // Restores a dead clone's `.env` value; warnings are best effort and stdout is MCP-only.
-    for w in envfile::finish_pending(&home).await {
+    // Restores a dead clone's `.env` value; warnings are best effort and stdout is MCP-only. Only
+    // when a daemon runs: a session that never calls a tool must not start one (clone_create
+    // finishes them anyway).
+    for w in envfile::finish_pending_if_running(&home).await {
         eprintln!("mitosis: {w}");
     }
     let service = Mitosis { home }

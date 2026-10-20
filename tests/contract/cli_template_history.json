@@ -1,0 +1,16 @@
+{
+  "generations": [
+    {
+      "built_at": "number",
+      "current": "boolean",
+      "from_clone": "string",
+      "from_gen": "number",
+      "gen": "number",
+      "kind": "string",
+      "pg_major": "number",
+      "size_bytes": "number"
+    }
+  ],
+  "paused": "boolean",
+  "template": "string"
+}

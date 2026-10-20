@@ -1,5 +1,8 @@
 use crate::error::{ErrorCode, MitosisError, Result};
-use crate::protocol::{GenKind, MigrateCmd, OnStale, PendingRestore, RefreshMode, TemplateSource};
+use crate::protocol::{
+    EventFilter, EventRow, GenKind, MigrateCmd, OnStale, PendingRestore, RefreshMode,
+    TemplateSource,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -13,15 +16,18 @@ pub enum CloneStatus {
     Starting,
     Ready,
     Stopping,
+    /// Postgres stopped cleanly; folder, port, password and `.env` records kept until a wake.
+    Sleeping,
 }
 
 impl CloneStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             CloneStatus::Creating => "creating",
             CloneStatus::Starting => "starting",
             CloneStatus::Ready => "ready",
             CloneStatus::Stopping => "stopping",
+            CloneStatus::Sleeping => "sleeping",
         }
     }
 
@@ -31,6 +37,7 @@ impl CloneStatus {
             "starting" => CloneStatus::Starting,
             "ready" => CloneStatus::Ready,
             "stopping" => CloneStatus::Stopping,
+            "sleeping" => CloneStatus::Sleeping,
             _ => return None,
         })
     }
@@ -56,6 +63,26 @@ pub struct TemplateRow {
     pub paused: bool,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<i64>,
+    /// Masking file (absolute path); full builds then dump and restore through a staging cluster.
+    pub mask_path: Option<PathBuf>,
+    /// Hex of the 32 random bytes that key masked values; made at the first masked build.
+    /// Written only by `ensure_mask_salt`, never by `update_template_settings`.
+    pub mask_salt: Option<String>,
+    /// A branch template (`<base>~<branch>`): its base template.
+    pub base: Option<String>,
+    /// A branch template: the git branch it was built for, as git names it.
+    pub branch: Option<String>,
+    /// A branch template: the base generation its current generation was layered on.
+    pub base_gen: Option<u32>,
+    /// A base template: the branch its recorded checkout follows; layered builds of the base skip
+    /// while that checkout is on another branch.
+    pub base_branch: Option<String>,
+    /// The migrate command's folder, relative to the root of the git work tree it is in.
+    pub repo_rel_cwd: Option<PathBuf>,
+    /// The migrations folder, relative to the root of the git work tree it is in.
+    pub repo_rel_migrations: Option<PathBuf>,
+    /// A branch template: when a clone last asked for it (gc drops long-unused ones).
+    pub last_used: Option<i64>,
 }
 
 impl TemplateRow {
@@ -84,6 +111,15 @@ impl TemplateRow {
             paused: false,
             last_error: None,
             last_attempt_at: None,
+            mask_path: None,
+            mask_salt: None,
+            base: None,
+            branch: None,
+            base_gen: None,
+            base_branch: None,
+            repo_rel_cwd: None,
+            repo_rel_migrations: None,
+            last_used: None,
         }
     }
 }
@@ -102,6 +138,8 @@ pub struct GenerationRow {
     pub size_bytes: u64,
     pub from_clone: Option<String>,
     pub from_gen: Option<u32>,
+    /// Hash of the masking file the generation was masked with.
+    pub mask_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,7 +180,7 @@ pub struct Store {
 }
 
 /// SQLite `user_version` of the current schema; v0.1 stores are version 0.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 pub const DEFAULT_KEEP: u32 = 3;
 
 const SCHEMA: &str = "
@@ -162,7 +200,16 @@ CREATE TABLE IF NOT EXISTS templates (
     on_stale TEXT NOT NULL DEFAULT 'warn',
     paused INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    last_attempt_at INTEGER
+    last_attempt_at INTEGER,
+    mask_salt TEXT,
+    mask_path TEXT,
+    base TEXT,
+    branch TEXT,
+    base_gen INTEGER,
+    base_branch TEXT,
+    repo_rel_cwd TEXT,
+    repo_rel_migrations TEXT,
+    last_used INTEGER
 );
 CREATE TABLE IF NOT EXISTS generations (
     template TEXT NOT NULL,
@@ -177,6 +224,7 @@ CREATE TABLE IF NOT EXISTS generations (
     size_bytes INTEGER NOT NULL,
     from_clone TEXT,
     from_gen INTEGER,
+    mask_hash TEXT,
     PRIMARY KEY (template, gen)
 );
 CREATE TABLE IF NOT EXISTS clones (
@@ -201,6 +249,15 @@ CREATE TABLE IF NOT EXISTS clones (
     suspect INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS clones_name_uniq ON clones(name) WHERE name IS NOT NULL;
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    clone TEXT,
+    template TEXT,
+    detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 ";
 
 /// v0.1 -> v2: each template row becomes a template plus generation 1 in its old folder.
@@ -248,8 +305,23 @@ CREATE TABLE IF NOT EXISTS pending_restores (
 );
 ";
 
-const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at";
-const GEN_COLS: &str = "template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes, from_clone, from_gen";
+/// Columns added after their table first shipped: added on open when missing, so v0.2 stores
+/// and v3 stores made before them gain them too.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("templates", "mask_salt", "TEXT"),
+    ("templates", "mask_path", "TEXT"),
+    ("generations", "mask_hash", "TEXT"),
+    ("templates", "base", "TEXT"),
+    ("templates", "branch", "TEXT"),
+    ("templates", "base_gen", "INTEGER"),
+    ("templates", "base_branch", "TEXT"),
+    ("templates", "repo_rel_cwd", "TEXT"),
+    ("templates", "repo_rel_migrations", "TEXT"),
+    ("templates", "last_used", "INTEGER"),
+];
+
+const TEMPLATE_COLS: &str = "name, database, source, migrations, max_age_secs, current_gen, next_gen, keep, every_secs, every_mode, migrate, auto_migrate, on_stale, paused, last_error, last_attempt_at, mask_salt, mask_path, base, branch, base_gen, base_branch, repo_rel_cwd, repo_rel_migrations, last_used";
+const GEN_COLS: &str = "template, gen, kind, dir, pg_major, bin_dir, extensions, migrations_hash, built_at, size_bytes, from_clone, from_gen, mask_hash";
 const CLONE_COLS: &str = "id, name, template, dir, port, socket_dir, password, database, pg_pid, pg_start_time, parent_pid, parent_start_time, created_at, expires_at, durable, status, generation, protected, suspect";
 
 fn conv_err(idx: usize, msg: String) -> rusqlite::Error {
@@ -299,6 +371,15 @@ fn template_from_row(r: &Row) -> rusqlite::Result<TemplateRow> {
         paused: r.get::<_, i64>(13)? != 0,
         last_error: r.get(14)?,
         last_attempt_at: r.get(15)?,
+        mask_salt: r.get(16)?,
+        mask_path: r.get::<_, Option<String>>(17)?.map(PathBuf::from),
+        base: r.get(18)?,
+        branch: r.get(19)?,
+        base_gen: r.get::<_, Option<i64>>(20)?.map(|v| v as u32),
+        base_branch: r.get(21)?,
+        repo_rel_cwd: r.get::<_, Option<String>>(22)?.map(PathBuf::from),
+        repo_rel_migrations: r.get::<_, Option<String>>(23)?.map(PathBuf::from),
+        last_used: r.get(24)?,
     })
 }
 
@@ -316,6 +397,7 @@ fn gen_from_row(r: &Row) -> rusqlite::Result<GenerationRow> {
         size_bytes: r.get::<_, i64>(9)? as u64,
         from_clone: r.get(10)?,
         from_gen: r.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+        mask_hash: r.get(12)?,
     })
 }
 
@@ -396,8 +478,32 @@ macro_rules! template_params {
             $t.paused as i64,
             $t.last_error,
             $t.last_attempt_at,
+            $t.mask_salt,
+            $t.mask_path.as_deref().map(p),
+            $t.base,
+            $t.branch,
+            $t.base_gen.map(|v| v as i64),
+            $t.base_branch,
+            $t.repo_rel_cwd.as_deref().map(p),
+            $t.repo_rel_migrations.as_deref().map(p),
+            $t.last_used,
         ]
     };
+}
+
+/// Adds the `ADDED_COLUMNS` a table lacks.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    for (table, col, decl) in ADDED_COLUMNS {
+        let has = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, col],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Brings a store of any older version to `SCHEMA_VERSION` in one transaction.
@@ -415,19 +521,22 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(RESERVATIONS)?;
     conn.execute_batch(ENV_TABLES)?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return add_missing_columns(conn);
     }
     let tx = conn.transaction()?;
-    // A v0.1 store has a templates table but no version; a new file has no tables.
-    let v01 = tx.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'templates'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )? > 0;
+    // A v0.1 store has a templates table but no version; a new file has no tables. A v2 store
+    // has a templates table too, but already in the new shape.
+    let v01 = version < 2
+        && tx.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'templates'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
     if v01 {
         tx.execute_batch(MIGRATE_V1)?;
     }
     tx.execute_batch(SCHEMA)?;
+    add_missing_columns(&tx)?;
     if v01 {
         tx.execute_batch(MIGRATE_V1_ROWS)?;
     }
@@ -455,7 +564,7 @@ impl Store {
     /// Fails when the name is taken.
     pub fn insert_template(&self, t: &TemplateRow) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO templates ({TEMPLATE_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"),
+            &format!("INSERT INTO templates ({TEMPLATE_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)"),
             template_params!(t),
         )?;
         Ok(())
@@ -466,7 +575,9 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE templates SET database=?2, source=?3, migrations=?4, max_age_secs=?5, keep=?8, \
              every_secs=?9, every_mode=?10, migrate=?11, auto_migrate=?12, on_stale=?13, paused=?14, \
-             last_error=?15, last_attempt_at=?16 WHERE name=?1",
+             last_error=?15, last_attempt_at=?16, mask_path=?18, base=?19, branch=?20, \
+             base_gen=?21, base_branch=?22, repo_rel_cwd=?23, repo_rel_migrations=?24, \
+             last_used=?25 WHERE name=?1",
             template_params!(t),
         )?;
         if n == 0 {
@@ -478,12 +589,41 @@ impl Store {
         Ok(())
     }
 
+    /// Stores `salt` as the masking salt of `name` unless it already has one; returns the salt in
+    /// effect, so every build of a template masks with the same key.
+    pub fn ensure_mask_salt(&self, name: &str, salt: &str) -> Result<String> {
+        self.conn.execute(
+            "UPDATE templates SET mask_salt = ?2 WHERE name = ?1 AND mask_salt IS NULL",
+            params![name, salt],
+        )?;
+        self.conn
+            .query_row(
+                "SELECT mask_salt FROM templates WHERE name = ?1",
+                [name],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .ok_or_else(|| {
+                MitosisError::new(
+                    ErrorCode::TemplateNotFound,
+                    format!("template {name} not found"),
+                )
+            })
+    }
+
     /// Removes the template and all its generation rows (not their folders).
+    /// Removes the template and its generation rows together, so a failure never leaves one half.
+    /// A base template takes its branch templates (`base = name`) with it.
     pub fn delete_template(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM generations WHERE template = ?1", [name])?;
-        self.conn
-            .execute("DELETE FROM templates WHERE name = ?1", [name])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM generations WHERE template = ?1 \
+             OR template IN (SELECT name FROM templates WHERE base = ?1)",
+            [name],
+        )?;
+        tx.execute("DELETE FROM templates WHERE name = ?1 OR base = ?1", [name])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -528,7 +668,7 @@ impl Store {
 
     pub fn insert_generation(&self, g: &GenerationRow) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO generations ({GEN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
+            &format!("INSERT INTO generations ({GEN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
             params![
                 g.template,
                 g.gen as i64,
@@ -542,6 +682,7 @@ impl Store {
                 g.size_bytes as i64,
                 g.from_clone,
                 g.from_gen.map(|v| v as i64),
+                g.mask_hash,
             ],
         )?;
         Ok(())
@@ -773,6 +914,94 @@ impl Store {
         Ok(())
     }
 
+    /// Appends one entry to the event log (the time is now).
+    pub fn add_event(
+        &self,
+        kind: &str,
+        clone: Option<&str>,
+        template: Option<&str>,
+        detail: &serde_json::Value,
+    ) -> Result<EventRow> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let id = self.conn.query_row(
+            "INSERT INTO events (ts, kind, clone, template, detail) VALUES (?1,?2,?3,?4,?5) RETURNING id",
+            params![ts, kind, clone, template, serde_json::to_string(detail)?],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(EventRow {
+            id,
+            ts,
+            kind: kind.to_string(),
+            clone: clone.map(String::from),
+            template: template.map(String::from),
+            detail: detail.clone(),
+        })
+    }
+
+    /// The events matching `f`, oldest first; with a limit, the newest `limit` of them.
+    pub fn list_events(&self, f: &EventFilter) -> Result<Vec<EventRow>> {
+        self.query_events(0, f)
+    }
+
+    /// Every event with `id > after` that matches `f` (its `limit` is ignored), oldest first.
+    /// A follower reads the log with this, so it can neither lose nor reorder an event.
+    pub fn list_events_after(&self, after: i64, f: &EventFilter) -> Result<Vec<EventRow>> {
+        let all = EventFilter {
+            limit: None,
+            ..f.clone()
+        };
+        self.query_events(after, &all)
+    }
+
+    fn query_events(&self, after: i64, f: &EventFilter) -> Result<Vec<EventRow>> {
+        // A clone filter matches the name or id column, or the id kept in a named clone's detail.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, kind, clone, template, detail FROM (
+                 SELECT id, ts, kind, clone, template, detail FROM events
+                 WHERE id > ?6
+                   AND (?1 IS NULL OR clone = ?1 OR json_extract(detail, '$.id') = ?1)
+                   AND (?2 IS NULL OR template = ?2)
+                   AND (?3 IS NULL OR kind = ?3 OR substr(kind, 1, length(?3) + 1) = ?3 || '.')
+                   AND (?4 IS NULL OR ts >= ?4)
+                 ORDER BY id DESC LIMIT ?5
+             ) ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    f.clone,
+                    f.template,
+                    f.kind,
+                    f.since,
+                    f.limit.map_or(-1, i64::from),
+                    after
+                ],
+                |r| {
+                    Ok(EventRow {
+                        id: r.get(0)?,
+                        ts: r.get(1)?,
+                        kind: r.get(2)?,
+                        clone: r.get(3)?,
+                        template: r.get(4)?,
+                        detail: json_col(r, 5)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Deletes events older than `before_ts` and all but the newest `max_rows`; returns how many.
+    pub fn prune_events(&self, before_ts: i64, max_rows: u32) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM events WHERE ts < ?1 \
+             OR id <= (SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+            params![before_ts, i64::from(max_rows)],
+        )?)
+    }
+
     /// Every reserved port, whether or not a clone of that name runs.
     pub fn reserved_ports(&self) -> Result<HashSet<u16>> {
         let mut stmt = self.conn.prepare("SELECT port FROM reservations")?;
@@ -834,6 +1063,7 @@ mod tests {
             size_bytes: 1,
             from_clone: None,
             from_gen: None,
+            mask_hash: Some("m1".into()),
         }
     }
 
@@ -908,6 +1138,31 @@ mod tests {
         assert_eq!(store.list_templates().unwrap().len(), 2);
         store.delete_template("other").unwrap();
         assert_eq!(store.list_templates().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_template_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        store.insert_template(&tpl("main")).unwrap();
+        store.insert_generation(&gen("main", 1)).unwrap();
+        // A failing second delete must take the first one back with it.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER no_tpl_delete BEFORE DELETE ON templates
+                 BEGIN SELECT RAISE(ABORT, 'no'); END;",
+            )
+            .unwrap();
+        assert!(store.delete_template("main").is_err());
+        assert_eq!(store.list_generations("main").unwrap().len(), 1);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER no_tpl_delete")
+            .unwrap();
+        store.delete_template("main").unwrap();
+        assert!(store.list_generations("main").unwrap().is_empty());
+        assert!(store.get_template("main").unwrap().is_none());
     }
 
     #[test]
@@ -1106,5 +1361,224 @@ CREATE UNIQUE INDEX IF NOT EXISTS clones_name_uniq ON clones(name) WHERE name IS
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// The v0.2 schema (version 2), verbatim: no `events` table.
+    const V02_SCHEMA: &str = "
+CREATE TABLE templates (
+    name TEXT PRIMARY KEY, database TEXT NOT NULL, source TEXT NOT NULL, migrations TEXT,
+    max_age_secs INTEGER NOT NULL, current_gen INTEGER NOT NULL, next_gen INTEGER NOT NULL,
+    keep INTEGER NOT NULL DEFAULT 3, every_secs INTEGER, every_mode TEXT NOT NULL DEFAULT 'full',
+    migrate TEXT, auto_migrate INTEGER NOT NULL DEFAULT 0, on_stale TEXT NOT NULL DEFAULT 'warn',
+    paused INTEGER NOT NULL DEFAULT 0, last_error TEXT, last_attempt_at INTEGER
+);
+CREATE TABLE generations (
+    template TEXT NOT NULL, gen INTEGER NOT NULL, kind TEXT NOT NULL, dir TEXT NOT NULL,
+    pg_major INTEGER NOT NULL, bin_dir TEXT NOT NULL, extensions TEXT NOT NULL, migrations_hash TEXT,
+    built_at INTEGER NOT NULL, size_bytes INTEGER NOT NULL, from_clone TEXT, from_gen INTEGER,
+    PRIMARY KEY (template, gen)
+);
+CREATE TABLE clones (
+    id TEXT PRIMARY KEY, name TEXT, template TEXT NOT NULL, dir TEXT NOT NULL, port INTEGER NOT NULL,
+    socket_dir TEXT NOT NULL, password TEXT NOT NULL, database TEXT NOT NULL, pg_pid INTEGER,
+    pg_start_time INTEGER, parent_pid INTEGER, parent_start_time INTEGER, created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL, durable INTEGER NOT NULL, status TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1, protected INTEGER NOT NULL DEFAULT 0,
+    suspect INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX clones_name_uniq ON clones(name) WHERE name IS NOT NULL;
+CREATE TABLE reservations (
+    name TEXT PRIMARY KEY, port INTEGER NOT NULL, password TEXT NOT NULL, template TEXT NOT NULL,
+    last_used INTEGER NOT NULL
+);
+CREATE TABLE env_records (
+    clone_id TEXT NOT NULL, file TEXT NOT NULL, var TEXT NOT NULL, previous TEXT, url TEXT NOT NULL,
+    PRIMARY KEY (clone_id, file, var)
+);
+CREATE TABLE pending_restores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT NOT NULL, var TEXT NOT NULL, previous TEXT,
+    url TEXT NOT NULL
+);
+PRAGMA user_version = 2;
+";
+
+    #[test]
+    fn v02_store_migrates_to_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V02_SCHEMA).unwrap();
+            conn.execute_batch(
+                "INSERT INTO templates (name, database, source, max_age_secs, current_gen, next_gen, keep)
+                     VALUES ('main', 'app', '{\"kind\":\"seed\",\"command\":\"make seed\"}', 604800, 2, 3, 5);
+                 INSERT INTO generations VALUES ('main', 1, 'full', '/h/templates/main@1', 16, '/b', '[]', 'h1', 5, 9, NULL, NULL);
+                 INSERT INTO generations VALUES ('main', 2, 'layered', '/h/templates/main@2', 16, '/b', '[\"pgcrypto\"]', 'h2', 6, 9, NULL, 1);
+                 INSERT INTO clones VALUES ('c1', 'x', 'main', '/h/clones/c1', 54320, '/h/s/c1', 'pw', 'app',
+                     1, 2, NULL, NULL, 3, 4, 0, 'ready', 2, 1, 0);
+                 INSERT INTO reservations VALUES ('x', 54320, 'pw', 'main', 77);
+                 INSERT INTO env_records VALUES ('c1', '/w/.env', 'DATABASE_URL', 'old', 'postgres://u:***@h/db');
+                 INSERT INTO pending_restores (file, var, previous, url) VALUES ('/w/.env', 'URL', NULL, 'u');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i32 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 3);
+
+        let (t, g) = store.current("main").unwrap().unwrap();
+        assert_eq!((t.current_gen, t.next_gen, t.keep), (2, 3, 5));
+        assert_eq!((g.gen, g.kind, g.from_gen), (2, GenKind::Layered, Some(1)));
+        assert_eq!(store.list_generations("main").unwrap().len(), 2);
+        let c = store.get_clone("x").unwrap().unwrap();
+        assert_eq!((c.id.as_str(), c.generation, c.protected), ("c1", 2, true));
+        assert_eq!(store.get_reservation("x").unwrap().unwrap().port, 54320);
+        let recs = store.env_records("c1").unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].previous.as_deref(), Some("old"));
+        assert_eq!(store.list_pending_restores().unwrap().len(), 1);
+
+        // The new table works, and a reopen changes nothing.
+        let ev = store
+            .add_event("gc", None, None, &serde_json::json!({ "n": 1 }))
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.list_events(&EventFilter::default()).unwrap(),
+            vec![ev]
+        );
+        assert_eq!(store.list_generations("main").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mask_columns_reach_v02_and_early_v3_stores() {
+        for version in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(V02_SCHEMA).unwrap();
+                conn.execute_batch(&format!(
+                    "INSERT INTO templates (name, database, source, max_age_secs, current_gen, next_gen)
+                         VALUES ('main', 'app', '{{\"kind\":\"seed\",\"command\":\"x\"}}', 1, 1, 2);
+                     INSERT INTO generations VALUES ('main', 1, 'full', '/d', 16, '/b', '[]', NULL, 5, 9, NULL, NULL);
+                     PRAGMA user_version = {version};"
+                ))
+                .unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            let (t, g) = store.current("main").unwrap().unwrap();
+            assert_eq!((t.mask_path, t.mask_salt, g.mask_hash), (None, None, None));
+            assert_eq!(store.ensure_mask_salt("main", "aa").unwrap(), "aa");
+            // The first salt sticks, and a settings write leaves it alone.
+            assert_eq!(store.ensure_mask_salt("main", "bb").unwrap(), "aa");
+            let mut t = store.get_template("main").unwrap().unwrap();
+            t.mask_salt = None;
+            t.mask_path = Some(PathBuf::from("/w/mask.toml"));
+            store.update_template_settings(&t).unwrap();
+            let t = store.get_template("main").unwrap().unwrap();
+            assert_eq!(t.mask_salt.as_deref(), Some("aa"));
+            assert_eq!(t.mask_path, Some(PathBuf::from("/w/mask.toml")));
+            store.insert_generation(&gen("main", 2)).unwrap();
+            assert_eq!(
+                store.get_generation("main", 2).unwrap().unwrap(),
+                gen("main", 2)
+            );
+        }
+    }
+
+    #[test]
+    fn prune_keeps_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        for i in 0..10 {
+            store
+                .add_event("gc", None, None, &serde_json::json!({ "i": i }))
+                .unwrap();
+        }
+        // Nothing is old, and the row limit is above the count: nothing goes.
+        assert_eq!(store.prune_events(0, 10).unwrap(), 0);
+        assert_eq!(store.prune_events(0, 3).unwrap(), 7);
+        let left = store.list_events(&EventFilter::default()).unwrap();
+        let kept: Vec<i64> = left
+            .iter()
+            .map(|e| e.detail["i"].as_i64().unwrap())
+            .collect();
+        assert_eq!(kept, vec![7, 8, 9]);
+        // Everything is older than a time in the future.
+        assert_eq!(store.prune_events(i64::MAX, 100).unwrap(), 3);
+    }
+
+    #[test]
+    fn list_events_filters_and_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        let add = |kind, clone: Option<&str>, tpl: Option<&str>, detail| {
+            store.add_event(kind, clone, tpl, &detail).unwrap()
+        };
+        let a = add(
+            "clone.created",
+            Some("x"),
+            Some("main"),
+            serde_json::json!({ "id": "c1" }),
+        );
+        let b = add(
+            "clone.destroyed",
+            Some("x"),
+            Some("main"),
+            serde_json::json!({ "id": "c1" }),
+        );
+        let c = add("template.built", None, Some("main"), serde_json::json!({}));
+        let d = add(
+            "clone.created",
+            Some("c2"),
+            Some("other"),
+            serde_json::json!({ "id": "c2" }),
+        );
+        let list = |f: EventFilter| -> Vec<i64> {
+            store
+                .list_events(&f)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        assert_eq!(list(EventFilter::default()), vec![a.id, b.id, c.id, d.id]);
+        // A clone filter takes the name or the id.
+        let by = |c: &str| EventFilter {
+            clone: Some(c.into()),
+            ..Default::default()
+        };
+        assert_eq!(list(by("x")), vec![a.id, b.id]);
+        assert_eq!(list(by("c1")), vec![a.id, b.id]);
+        let tpl = EventFilter {
+            template: Some("main".into()),
+            ..Default::default()
+        };
+        assert_eq!(list(tpl), vec![a.id, b.id, c.id]);
+        // A kind is exact or a group, never a loose prefix.
+        let kind = |k: &str| EventFilter {
+            kind: Some(k.into()),
+            ..Default::default()
+        };
+        assert_eq!(list(kind("clone.created")), vec![a.id, d.id]);
+        assert_eq!(list(kind("clone")), vec![a.id, b.id, d.id]);
+        assert_eq!(list(kind("clon")), Vec::<i64>::new());
+        // The limit keeps the newest matches, still oldest first.
+        let last2 = EventFilter {
+            limit: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(list(last2), vec![c.id, d.id]);
+        let future = EventFilter {
+            since: Some(i64::MAX),
+            ..Default::default()
+        };
+        assert!(list(future).is_empty());
     }
 }

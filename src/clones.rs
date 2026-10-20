@@ -3,6 +3,7 @@ use crate::clone_backend::{free_space, private_size};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events::{self, reason};
 use crate::lifecycle::log;
 use crate::names::{new_clone_id, random_hex, validate_name};
 use crate::pg::{
@@ -45,17 +46,67 @@ where
         .map_err(|e| internal(format!("background task failed: {e}")))?
 }
 
-pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
+/// The URL straight to the clone's own port (the v0.2 URL).
+pub fn direct_url(row: &CloneRow) -> String {
+    format!(
+        "postgres://postgres:{}@127.0.0.1:{}/{}",
+        row.password,
+        row.port,
+        crate::templates::url_encode(&row.database)
+    )
+}
+
+/// The URL through the router: the clone's name (else its id) as the database, so a named
+/// clone's URL stays the same when its direct port moves.
+pub fn router_url(ctx: &Ctx, row: &CloneRow) -> String {
+    format!(
+        "postgres://postgres:{}@127.0.0.1:{}/{}",
+        row.password,
+        ctx.config().router_port,
+        row.name.as_deref().unwrap_or(&row.id)
+    )
+}
+
+/// `CloneInfo.status`.
+fn status_str(s: CloneStatus) -> &'static str {
+    match s {
+        CloneStatus::Creating | CloneStatus::Starting => "starting",
+        CloneStatus::Ready => "ready",
+        CloneStatus::Stopping => "stopping",
+        CloneStatus::Sleeping => "sleeping",
+    }
+}
+
+/// Why a direct port moved: the old one was taken.
+const TAKEN: &str = "was taken";
+/// Why a direct port moved: the reserved one is outside `port_range` now.
+const OUT_OF_RANGE: &str = "is outside port_range";
+
+/// The warning for a direct port that had to move from `old`; `why` is `TAKEN` or `OUT_OF_RANGE`.
+fn port_moved(ctx: &Ctx, old: u16, why: &str) -> String {
+    if ctx.config().router {
+        format!("port {old} {why}; the direct URL changed, the router URL did not")
+    } else {
+        format!("port {old} {why}; the URL changed")
+    }
+}
+
+/// `url` is the router URL while `router` is on (even while its port is taken), else the direct one.
+pub fn to_info(ctx: &Ctx, row: &CloneRow, template_age_secs: u64) -> CloneInfo {
+    let direct = direct_url(row);
     CloneInfo {
         id: row.id.clone(),
         name: row.name.clone(),
         template: row.template.clone(),
-        url: format!(
-            "postgres://postgres:{}@127.0.0.1:{}/{}",
-            row.password,
-            row.port,
-            crate::templates::url_encode(&row.database)
-        ),
+        url: if ctx.config().router {
+            router_url(ctx, row)
+        } else {
+            direct.clone()
+        },
+        direct_url: direct,
+        status: status_str(row.status).to_string(),
+        branch: row.template.split_once('~').map(|(_, b)| b.to_string()),
+        rebuilt: false,
         port: row.port,
         socket_dir: row.socket_dir.clone(),
         template_age_secs,
@@ -82,6 +133,214 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
     }
 }
 
+fn not_found(id: &str) -> MitosisError {
+    MitosisError::new(ErrorCode::CloneNotFound, format!("clone {id} not found"))
+        .with_hint("see existing clones with `mitosis list` (or the clone_list tool)")
+}
+
+/// The clone's row when it can take connections now; a sleeping clone is woken first.
+pub async fn ensure_running(ctx: &Arc<Ctx>, id: &str) -> Result<CloneRow> {
+    let row = ctx.store().get_clone(id)?.ok_or_else(|| not_found(id))?;
+    let label = row.name.as_deref().unwrap_or(&row.id);
+    match row.status {
+        CloneStatus::Ready => Ok(row),
+        CloneStatus::Sleeping => {
+            let (row, warnings) = wake(ctx, &row.id).await?;
+            for w in warnings {
+                log(ctx, &format!("wake of clone {}: {w}", row.id));
+            }
+            Ok(row)
+        }
+        CloneStatus::Stopping => Err(invalid(format!("clone {label} is being destroyed"))),
+        CloneStatus::Creating | CloneStatus::Starting => Err(invalid(format!(
+            "clone {label} is still starting; try again in a moment"
+        ))),
+    }
+}
+
+/// The lock that one wake or sleep of clone `id` holds at a time.
+fn clone_turn(ctx: &Ctx, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    ctx.waking
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The row of `id` (an id, else a name) and that row re-read under its wake/sleep lock.
+async fn locked_row(
+    ctx: &Ctx,
+    id_or_name: &str,
+) -> Result<(CloneRow, tokio::sync::OwnedMutexGuard<()>)> {
+    let id = ctx
+        .store()
+        .get_clone(id_or_name)?
+        .ok_or_else(|| not_found(id_or_name))?
+        .id;
+    let turn = clone_turn(ctx, &id).lock_owned().await;
+    // A destroy, wake or sleep may have finished while this one waited.
+    let row = ctx
+        .store()
+        .get_clone(&id)?
+        .filter(|r| r.id == id)
+        .ok_or_else(|| not_found(&id))?;
+    Ok((row, turn))
+}
+
+/// Starts a sleeping clone: the suspect check of recovery, then Postgres on the same folder,
+/// port (moved when taken, with the reservation and `.env` records following) and password.
+/// One wake per clone at a time; a caller that waited on another's wake gets the woken row.
+/// Returns the warnings of the start (a moved port).
+pub async fn wake(ctx: &Arc<Ctx>, id_or_name: &str) -> Result<(CloneRow, Vec<String>)> {
+    let (mut row, _turn) = locked_row(ctx, id_or_name).await?;
+    let label = row.name.clone().unwrap_or_else(|| row.id.clone());
+    match row.status {
+        CloneStatus::Ready => return Ok((row, Vec::new())),
+        CloneStatus::Sleeping => {}
+        CloneStatus::Stopping => return Err(invalid(format!("clone {label} is being destroyed"))),
+        CloneStatus::Creating | CloneStatus::Starting => {
+            return Err(invalid(format!(
+                "clone {label} is still starting; try again in a moment"
+            )))
+        }
+    }
+    let _mark = mark(ctx, &row.id, InFlightOp::Create)
+        .map_err(|_| invalid(format!("clone {label} is busy; try again in a moment")))?;
+    let started = Instant::now();
+    let old_port = row.port;
+    let res = async {
+        if crate::lifecycle::unclean(ctx, &row).await? && !row.suspect {
+            crate::lifecycle::mark_suspect(ctx, &mut row)?;
+        }
+        let warnings = restart_or_undo(ctx, &mut row).await?;
+        row.status = CloneStatus::Ready;
+        ctx.store().update_clone(&row)?;
+        Ok::<_, MitosisError>(warnings)
+    }
+    .await;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match res {
+        Ok(warnings) => {
+            // The idle clock starts again now, also for a wake by hand.
+            ctx.router().last_active.insert(row.id.clone(), now());
+            events::emit_clone(
+                ctx,
+                events::CLONE_WOKE,
+                &row,
+                serde_json::json!({
+                    "ok": true,
+                    "duration_ms": ms,
+                    "port_moved": row.port != old_port,
+                    "suspect": row.suspect,
+                }),
+            );
+            Ok((row, warnings))
+        }
+        Err(e) => {
+            log(ctx, &format!("wake of clone {} failed: {e}", row.id));
+            events::emit_clone(
+                ctx,
+                events::CLONE_WOKE,
+                &row,
+                serde_json::json!({ "ok": false, "duration_ms": ms, "error": e.code }),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// `mitosis wake`: wakes the clone (a no-op when it runs) and returns its info.
+pub async fn wake_info(ctx: &Arc<Ctx>, id_or_name: &str) -> Result<CloneInfo> {
+    let (row, warnings) = wake(ctx, id_or_name).await?;
+    let age = ctx
+        .store()
+        .current(&row.template)?
+        .map_or(0, |(_, g)| age_secs(g.built_at, now()));
+    let mut info = to_info(ctx, &row, age);
+    info.warnings.extend(warnings);
+    info.warnings.extend(crate::router::warning(ctx));
+    Ok(info)
+}
+
+/// Stops a running clone cleanly and marks it `Sleeping` (folder, port, password and `.env`
+/// records kept). Refuses while the router has a connection open to it; already sleeping is fine.
+/// `why` is the `reason` of the `clone.slept` event.
+pub async fn sleep(ctx: &Ctx, id_or_name: &str, why: &str) -> Result<()> {
+    let (mut row, _turn) = locked_row(ctx, id_or_name).await?;
+    let label = row.name.clone().unwrap_or_else(|| row.id.clone());
+    match row.status {
+        CloneStatus::Ready => {}
+        CloneStatus::Sleeping => return Ok(()),
+        _ => return Err(invalid(format!("clone {label} is not running"))),
+    }
+    let _mark = mark(ctx, &row.id, InFlightOp::Create)
+        .map_err(|_| invalid(format!("clone {label} is busy; try again in a moment")))?;
+    let open = || invalid(format!("clone {label} has open connections"));
+    if ctx.router().open_conns(&row.id) > 0 {
+        return Err(open());
+    }
+    // Marked first: a router connection that starts after this sees Sleeping and waits for the
+    // wake; one counted before it shows up in the second check.
+    ctx.store()
+        .set_clone_status(&row.id, CloneStatus::Sleeping)?;
+    if ctx.router().open_conns(&row.id) > 0 {
+        ctx.store().set_clone_status(&row.id, CloneStatus::Ready)?;
+        return Err(open());
+    }
+    // The idle check that chose this clone may be several psql calls old: a direct-port session
+    // opened since then would be cut by the stop. One that opens after this check still can be.
+    let backends = crate::lifecycle::client_backends(ctx, &row).await;
+    if !matches!(backends, Ok(0)) {
+        ctx.store().set_clone_status(&row.id, CloneStatus::Ready)?;
+        return Err(match backends {
+            Err(e) => e,
+            Ok(_) => open(),
+        });
+    }
+    ctx.router().close_clone(&row.id);
+    let install = install_for(ctx, &row.dir).ok_or_else(|| {
+        internal(format!(
+            "no Postgres install found for {}",
+            row.dir.display()
+        ))
+    });
+    let expected = row
+        .pg_pid
+        .zip(row.pg_start_time)
+        .map(|(pid, start_time)| RunningPg { pid, start_time });
+    let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
+    let stopped = match install {
+        Ok(i) => blocking(move || stop(&i, &dir, expected, t)).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = stopped {
+        // Possibly still running: it stays Ready, so nothing treats it as stopped.
+        if let Err(re) = ctx.store().set_clone_status(&row.id, CloneStatus::Ready) {
+            log(
+                ctx,
+                &format!(
+                    "sleep of clone {}: the stop failed and the row could not go back to ready, \
+                     so it says sleeping while its server may run: {re}",
+                    row.id
+                ),
+            );
+        }
+        return Err(e);
+    }
+    row.status = CloneStatus::Sleeping;
+    row.pg_pid = None;
+    row.pg_start_time = None;
+    ctx.store().update_clone(&row)?;
+    events::emit_clone(
+        ctx,
+        events::CLONE_SLEPT,
+        &row,
+        serde_json::json!({ "reason": why }),
+    );
+    Ok(())
+}
+
 /// Why a suspect clone should be replaced, and how.
 pub fn suspect_warning(row: &CloneRow) -> String {
     let name = row.name.as_deref().unwrap_or(&row.id);
@@ -93,6 +352,23 @@ pub fn suspect_warning(row: &CloneRow) -> String {
 
 pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneInfo> {
     let started = Instant::now();
+    // Before any work: `--fresh` resets the clone of a name, so without one it means nothing.
+    if args.fresh && args.name.is_none() {
+        return Err(invalid("--fresh needs a clone name")
+            .with_hint("mitosis clone --name <name> --fresh (MCP: pass `name` with `fresh`)"));
+    }
+    // `--branch`: clone the base's branch template, made or rebuilt first when needed.
+    let branch = match args.branch.take() {
+        Some(b) => {
+            if let Some(name) = &args.name {
+                check_clone_name(ctx, name)?;
+            }
+            let used = crate::templates::ensure_branch(ctx, &args.template, &b).await?;
+            args.template = used.name.clone();
+            Some(used)
+        }
+        None => None,
+    };
     // The `.env` records a `--fresh` took from the clone it destroyed.
     let mut taken = Vec::new();
     let mut info = match create_inner(ctx, &mut args, &mut taken).await {
@@ -108,8 +384,35 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
             return Err(e);
         }
     };
-    // The new clone takes over the old one's entries, each keeping the user's `previous`; the one
-    // named by `args.env` is recorded below.
+    if let Some(used) = branch {
+        // A reused named clone was made before this rebuild.
+        info.rebuilt = used.rebuilt && !info.existing;
+        info.warnings.extend(used.warnings);
+        info.stale |= used.stale;
+        info.refreshing |= used.refreshing;
+    }
+    info.warnings.extend(crate::router::warning(ctx));
+    info.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(info)
+}
+
+/// Records the clone's `.env` entries: those `taken` from the clone a `--fresh` destroyed (each
+/// keeping the user's `previous`, pointed at the new URL) and the one named by `args.env`. A new
+/// clone calls this while its create mark is held, so no destroy can come before the records.
+async fn attach_env(
+    ctx: &Ctx,
+    info: &mut CloneInfo,
+    args: &CloneCreateArgs,
+    taken: Vec<PendingRestore>,
+) {
+    let remember = |info: &mut CloneInfo, rec: &PendingRestore| {
+        if let Err(e) = ctx.store().add_env_record(&info.id, rec) {
+            info.warnings.push(format!(
+                "could not remember the .env entry, so it will not be restored: {}",
+                e.message
+            ));
+        }
+    };
     for mut rec in taken {
         if args
             .env
@@ -119,7 +422,8 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
             continue;
         }
         if rec.url != info.url {
-            match envfile::rewrite(&rec.file, &rec.var, &rec.url, &info.url) {
+            let (r, url) = (rec.clone(), info.url.clone());
+            match blocking(move || envfile::rewrite(&r.file, &r.var, &r.url, &url)).await {
                 Ok(_) => rec.url = info.url.clone(),
                 // The file still holds the old URL, which is what a later restore looks for.
                 Err(e) => info.warnings.push(format!(
@@ -130,12 +434,7 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
                 )),
             }
         }
-        if let Err(e) = ctx.store().add_env_record(&info.id, &rec) {
-            info.warnings.push(format!(
-                "could not remember the .env entry, so it will not be restored: {}",
-                e.message
-            ));
-        }
+        remember(info, &rec);
     }
     // Also for a reused or `--fresh` clone: the client writes its URL into the file either way.
     if let Some(t) = &args.env {
@@ -146,15 +445,8 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
             previous: t.previous.clone(),
             url: info.url.clone(),
         };
-        if let Err(e) = ctx.store().add_env_record(&info.id, &rec) {
-            info.warnings.push(format!(
-                "could not remember the .env entry, so it will not be restored: {}",
-                e.message
-            ));
-        }
+        remember(info, &rec);
     }
-    info.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok(info)
 }
 
 /// A named create when a clone of that name exists: its info if it can be reused (`existing`),
@@ -178,7 +470,14 @@ async fn reuse_named(
             "clone {name} is being destroyed; try again in a moment"
         )));
     }
-    if args.parent_pid.is_some() && row.parent_pid != args.parent_pid {
+    // The same pid with another start time is a new session that got a dead session's pid.
+    let other_session = args.parent_pid.is_some_and(|p| {
+        row.parent_pid != Some(p)
+            || row
+                .parent_start_time
+                .is_some_and(|t| !crate::lifecycle::parent_alive(p, Some(t)))
+    });
+    if other_session {
         return Err(
             invalid(format!("a clone named {name} belongs to another session"))
                 .with_hint("use another name"),
@@ -210,9 +509,17 @@ async fn reuse_named(
                 t.previous = r.previous.clone();
             }
         }
-        if let Err(e) = destroy(ctx, &row.id).await {
+        if let Err(e) = destroy_for(ctx, &row.id, reason::FRESH).await {
             for rec in &recs {
-                let _ = ctx.store().add_env_record(&row.id, rec);
+                if let Err(re) = ctx.store().add_env_record(&row.id, rec) {
+                    log(
+                        ctx,
+                        &format!(
+                            "--fresh of clone {}: could not put back the .env entry of {}: {re}",
+                            row.id, rec.var
+                        ),
+                    );
+                }
             }
             return Err(e);
         }
@@ -231,6 +538,10 @@ async fn reuse_named(
             "clone {name} is already running with different durable/protect settings"
         ))
         .with_hint("use --fresh"));
+    }
+    let mut woke = Vec::new();
+    if row.status == CloneStatus::Sleeping {
+        (row, woke) = wake(ctx, &row.id).await?;
     }
     let busy = ctx
         .in_flight
@@ -260,7 +571,8 @@ async fn reuse_named(
             .current(&row.template)?
             .map_or(0, |(_, g)| age_secs(g.built_at, t))
     };
-    let mut info = to_info(&row, age);
+    let mut info = to_info(ctx, &row, age);
+    info.warnings.extend(woke);
     info.existing = true;
     Ok(Some(info))
 }
@@ -273,13 +585,28 @@ fn template_missing(name: &str) -> MitosisError {
     .with_hint(format!("mitosis template init {name} --seed \"…\""))
 }
 
+/// `clone --name`: the name rules, with the id-shape rule only for a name no clone has yet, so a
+/// 0.2 clone named like an id can still be reused or recreated with `--fresh`.
+fn check_clone_name(ctx: &Ctx, name: &str) -> Result<()> {
+    validate_name("clone", name)?;
+    let exists = ctx
+        .store()
+        .list_clones()?
+        .iter()
+        .any(|c| c.name.as_deref() == Some(name));
+    if exists {
+        return Ok(());
+    }
+    crate::names::check_new_clone_name(name)
+}
+
 async fn create_inner(
     ctx: &Arc<Ctx>,
     args: &mut CloneCreateArgs,
     taken: &mut Vec<PendingRestore>,
 ) -> Result<CloneInfo> {
     if let Some(name) = &args.name {
-        validate_name("clone", name)?;
+        check_clone_name(ctx, name)?;
     }
     if args.protect && args.name.is_none() {
         return Err(invalid("a protected clone needs a name")
@@ -289,14 +616,29 @@ async fn create_inner(
         return Err(invalid("ttl must be greater than zero"));
     }
     if let Some(name) = args.name.clone() {
-        if let Some(info) = reuse_named(ctx, &name, args, taken).await? {
+        if let Some(mut info) = reuse_named(ctx, &name, args, taken).await? {
+            attach_env(ctx, &mut info, args, std::mem::take(taken)).await;
             return Ok(info);
         }
     }
-    // Fail on a missing template before queueing, not after the wait.
-    if ctx.store().current(&args.template)?.is_none() {
-        return Err(template_missing(&args.template));
-    }
+    // Checked before queueing, so a missing template, install or extension, or a parent that is
+    // gone, fails at once and does not hold the line (re-checked below if the generation changed).
+    let (_, first) = ctx
+        .store()
+        .current(&args.template)?
+        .ok_or_else(|| template_missing(&args.template))?;
+    let mut install = ctx.install_major(first.pg_major).await?;
+    let (i, ext) = (install.clone(), first.extensions.clone());
+    blocking(move || check_extensions(&i, &ext)).await?;
+    // A protected clone has no parent.
+    let parent_start_time = match args.parent_pid.filter(|_| !args.protect) {
+        Some(pid) => Some(
+            process_start_time(pid)
+                .filter(|_| is_alive(pid))
+                .ok_or_else(|| invalid(format!("parent process {pid} is not running")))?,
+        ),
+        None => None,
+    };
     // Admission comes before the template guard and the store lock, and is held until the row is
     // reserved, so no other create can pass the limits in between.
     let wait = args
@@ -311,22 +653,18 @@ async fn create_inner(
         .store()
         .current(&args.template)?
         .ok_or_else(|| template_missing(&args.template))?;
-    let install = ctx.install_major(gen.pg_major).await?;
-    let (i, ext) = (install.clone(), gen.extensions.clone());
-    blocking(move || check_extensions(&i, &ext)).await?;
-    // A protected clone has no parent.
-    let parent_start_time = match args.parent_pid.filter(|_| !args.protect) {
-        Some(pid) => Some(
-            process_start_time(pid)
-                .filter(|_| is_alive(pid))
-                .ok_or_else(|| invalid(format!("parent process {pid} is not running")))?,
-        ),
-        None => None,
-    };
+    // A build committed while this create waited may need another major or other extensions.
+    if gen.pg_major != first.pg_major || gen.extensions != first.extensions {
+        install = ctx.install_major(gen.pg_major).await?;
+        let (i, ext) = (install.clone(), gen.extensions.clone());
+        blocking(move || check_extensions(&i, &ext)).await?;
+    }
 
     let reserved = reserve(ctx, &tpl, &gen, args, parent_start_time);
     drop(admission);
-    let (mut row, _in_flight, mut warnings) = reserved?;
+    let (mut row, _in_flight, mut warnings, prior) = reserved?;
+    // `reserve` already warned when the reserved port could not be used.
+    let moved_in_reserve = prior.as_ref().is_some_and(|p| p.port != row.port);
     // A vanished row (CloneNotFound from an update) also lands here: stop, remove, report it.
     match bring_up(ctx, &install, swap, &gen, &mut row).await {
         Ok(mut info) => {
@@ -341,21 +679,52 @@ async fn create_inner(
                     .flatten()
                     .filter(|r| r.port != row.port)
                 {
-                    warnings.push(format!("port {} was taken; the URL changed", r.port));
+                    // A brand-new name had no URL before, so nothing changed for anyone.
+                    if prior.is_some() && !moved_in_reserve {
+                        warnings.push(port_moved(ctx, r.port, TAKEN));
+                    }
                     r.port = row.port;
                     let _ = store.upsert_reservation(&r);
                 }
             }
             info.warnings = warnings;
             info.waited_ms = waited_ms;
+            events::emit_clone(
+                ctx,
+                events::CLONE_CREATED,
+                &row,
+                serde_json::json!({
+                    "gen": row.generation,
+                    "durable": row.durable,
+                    "protected": row.protected,
+                    "waited_ms": waited_ms,
+                }),
+            );
+            // While `_in_flight` is held: no reaper or parent-exit destroy comes before the records.
+            attach_env(ctx, &mut info, args, std::mem::take(taken)).await;
             Ok(info)
         }
         Err(e) => {
             // A failed cleanup leaves the row in Stopping for gc; the caller still gets the cause.
-            if let Err(ce) = stop_and_remove(ctx, &row).await {
+            if let Err(ce) = stop_and_remove(ctx, &row, reason::FAILED).await {
                 let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
                 if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log) {
                     let _ = writeln!(f, "mitosis: cleanup after failed create failed: {ce}");
+                }
+            }
+            // The name's reservation goes back to how it was: a name never created keeps nothing.
+            if let Some(name) = &row.name {
+                let store = ctx.store();
+                let undone = match &prior {
+                    Some(r) => store.upsert_reservation(r),
+                    None => store.delete_reservation(name),
+                };
+                if let Err(re) = undone {
+                    drop(store);
+                    log(
+                        ctx,
+                        &format!("reservation of {name} after a failed create: {re}"),
+                    );
                 }
             }
             Err(e)
@@ -413,6 +782,10 @@ pub(crate) fn mark<'a>(
     })
 }
 
+/// What `reserve` made: the row, its in-flight mark, warnings, and the name's reservation as it
+/// was before this create (`None`: a new name), so a failed create can put it back.
+type Reserved<'a> = (CloneRow, InFlight<'a>, Vec<String>, Option<ReservationRow>);
+
 /// Steps 3-4 under one store lock, so concurrent creates cannot both pass the cap or share a port.
 /// The id joins `ctx.in_flight` under that same lock, so reconcile never sees the row without it.
 fn reserve<'a>(
@@ -421,27 +794,17 @@ fn reserve<'a>(
     gen: &GenerationRow,
     args: &CloneCreateArgs,
     parent_start_time: Option<u64>,
-) -> Result<(CloneRow, InFlight<'a>, Vec<String>)> {
+) -> Result<Reserved<'a>> {
     let cfg = ctx.config();
     let store = ctx.store();
     let active: Vec<String> = store
         .list_clones()?
         .into_iter()
         .filter(|c| c.status != CloneStatus::Stopping)
-        .map(|c| c.id)
+        .map(|c| c.name.unwrap_or(c.id))
         .collect();
     if active.len() >= cfg.max_clones {
-        return Err(MitosisError::new(
-            ErrorCode::CapReached,
-            format!(
-                "clone limit of {} reached: {}",
-                cfg.max_clones,
-                active.join(", ")
-            ),
-        )
-        .with_hint(
-            "destroy one with `mitosis destroy <id-or-name>` (or the clone_destroy tool), or raise max_clones (mitosis config set max_clones <n>)",
-        ));
+        return Err(crate::budget::cap_reached(cfg.max_clones, &active));
     }
     let clones_dir = ctx.home.clones_dir();
     let free = free_space(&clones_dir)?;
@@ -472,6 +835,7 @@ fn reserve<'a>(
     let mut reserved = store.reserved_ports()?;
     let mut warnings = Vec::new();
     let mut new_res = None;
+    let mut prior = None;
     // A named clone keeps the port and password of its reservation while that port is free.
     let (port, password) = match &args.name {
         None => (
@@ -480,6 +844,7 @@ fn reserve<'a>(
         ),
         Some(name) => {
             let res = store.get_reservation(name)?;
+            prior = res.clone();
             if let Some(r) = &res {
                 reserved.remove(&r.port);
             }
@@ -495,7 +860,12 @@ fn reserve<'a>(
                     let port =
                         pick_port(cfg.port_range.clone(), &leased, &HashSet::new(), &reserved)?;
                     if let Some(r) = &other {
-                        warnings.push(format!("port {} was taken; the URL changed", r.port));
+                        let why = if cfg.port_range.contains(&r.port) {
+                            TAKEN
+                        } else {
+                            OUT_OF_RANGE
+                        };
+                        warnings.push(port_moved(ctx, r.port, why));
                     }
                     (port, other.map_or_else(|| random_hex(16), |r| r.password))
                 }
@@ -542,7 +912,7 @@ fn reserve<'a>(
     }
     let mark = mark(ctx, &id, InFlightOp::Create)
         .map_err(|_| internal(format!("clone {id} is already in use")))?;
-    Ok((row, mark, warnings))
+    Ok((row, mark, warnings, prior))
 }
 
 /// Test hook, called with (home root, port) right before each Postgres start in `bring_up`, so a
@@ -584,7 +954,7 @@ async fn bring_up(
             durable: row.durable,
             log_file: log_file.clone(),
         };
-        if let Some(hook) = &*PRE_START_HOOK.lock().unwrap() {
+        if let Some(hook) = &*PRE_START_HOOK.lock().unwrap_or_else(|e| e.into_inner()) {
             hook(&ctx.home.root, row.port);
         }
         let pg = start(install, &row.dir, &opts)?;
@@ -616,7 +986,7 @@ async fn bring_up(
     row.pg_pid = Some(pg.pid);
     row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
     set_status(ctx, row, CloneStatus::Ready)?;
-    Ok(to_info(row, age_secs(gen.built_at, now())))
+    Ok(to_info(ctx, row, age_secs(gen.built_at, now())))
 }
 
 /// Sets the clone's `postgres` password over its private socket.
@@ -703,28 +1073,76 @@ pub async fn restart(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
     if row.port == old_port {
         return Ok(Vec::new());
     }
-    let mut warnings = vec![format!("port {old_port} was taken; the URL changed")];
-    let new_url = to_info(row, 0).url;
-    let store = ctx.store();
-    if let Some(name) = &row.name {
-        if let Some(mut r) = store.get_reservation(name)? {
-            r.port = row.port;
-            store.upsert_reservation(&r)?;
+    let mut warnings = vec![port_moved(ctx, old_port, TAKEN)];
+    let new_url = to_info(ctx, row, 0).url;
+    let recs = {
+        let store = ctx.store();
+        if let Some(name) = &row.name {
+            if let Some(mut r) = store.get_reservation(name)? {
+                r.port = row.port;
+                store.upsert_reservation(&r)?;
+            }
         }
-    }
-    for mut rec in store.env_records(&row.id)? {
-        if let Err(e) = envfile::rewrite(&rec.file, &rec.var, &rec.url, &new_url) {
-            warnings.push(format!(
-                "could not update {} in {}: {}",
-                rec.var,
-                rec.file.display(),
-                e.message
-            ));
+        store.env_records(&row.id)?
+    };
+    // Records already holding the router URL need no rewrite. The files are edited off the
+    // runtime and without the store lock, as `--fresh` does.
+    for mut rec in recs.into_iter().filter(|r| r.url != new_url) {
+        let (r, url) = (rec.clone(), new_url.clone());
+        match blocking(move || envfile::rewrite(&r.file, &r.var, &r.url, &url)).await {
+            Ok(_) => rec.url = new_url.clone(),
+            // The file still holds the old URL and so does the record: a later restore matches.
+            Err(e) => {
+                warnings.push(format!(
+                    "could not update {} in {}: {}",
+                    rec.var,
+                    rec.file.display(),
+                    e.message
+                ));
+                continue;
+            }
         }
-        rec.url = new_url.clone();
-        store.add_env_record(&row.id, &rec)?;
+        ctx.store().add_env_record(&row.id, &rec)?;
     }
     Ok(warnings)
+}
+
+/// `restart`, and on error stops whatever it started and puts the old pid and port back, so the
+/// next try starts from the recorded identity (the status is left as it was).
+pub(crate) async fn restart_or_undo(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
+    let (old_pid, old_start, old_port) = (row.pg_pid, row.pg_start_time, row.port);
+    let err = match restart(ctx, row).await {
+        Ok(warnings) => return Ok(warnings),
+        Err(e) => e,
+    };
+    let started = row
+        .pg_pid
+        .zip(row.pg_start_time)
+        .filter(|_| row.pg_pid != old_pid)
+        .map(|(pid, start_time)| RunningPg { pid, start_time });
+    if let (Some(pg), Some(install)) = (started, install_for(ctx, &row.dir)) {
+        let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
+        if let Err(se) = blocking(move || stop(&install, &dir, Some(pg), t)).await {
+            // It may still run: keep the identity that names it, so gc sees it and nothing else
+            // starts a second server on the folder.
+            log(
+                ctx,
+                &format!(
+                    "restart of clone {}: could not stop the server it started (pid {}): {se}",
+                    row.id, pg.pid
+                ),
+            );
+            let _ = ctx.store().update_clone(row);
+            return Err(err);
+        }
+    }
+    row.pg_pid = old_pid;
+    row.pg_start_time = old_start;
+    // A port move already saved must be undone too, or the retry would think the URL never
+    // changed and leave the reservation and .env records on the old port.
+    row.port = old_port;
+    let _ = ctx.store().update_clone(row);
+    Err(err)
 }
 
 /// Destroy as a user asks for it: a protected clone needs `force`; `forget` also drops the
@@ -765,8 +1183,14 @@ pub async fn destroy_with(
     }
 }
 
-/// Destroys regardless of protection (the reaper, the parent watcher and `--fresh` use it).
+/// Destroys regardless of protection, as a user's request (see `destroy_for`).
 pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
+    destroy_for(ctx, id_or_name, reason::USER).await
+}
+
+/// Destroys regardless of protection (the reaper, the parent watcher and `--fresh` use it);
+/// `why` is the `reason` of the `clone.destroyed` event.
+pub(crate) async fn destroy_for(ctx: &Ctx, id_or_name: &str, why: &str) -> Result<String> {
     let row = ctx.store().get_clone(id_or_name)?.ok_or_else(|| {
         MitosisError::new(
             ErrorCode::CloneNotFound,
@@ -786,10 +1210,17 @@ pub async fn destroy(ctx: &Ctx, id_or_name: &str) -> Result<String> {
     }
     let _mark = match mark(ctx, &row.id, InFlightOp::Destroy) {
         Ok(m) => m,
-        Err(InFlightOp::Create) => return Err(starting()), // Ready, but create has not returned yet
+        // Ready with a create that has not returned yet, or a wake or sleep under way (they hold
+        // the same mark). The parent watcher retries on this InvalidRequest.
+        Err(InFlightOp::Create) => {
+            return Err(invalid(format!(
+                "clone {} is busy (starting, waking or going to sleep); try again in a moment",
+                row.id
+            )))
+        }
         Err(InFlightOp::Destroy) => return Ok(row.id), // user, reaper or parent watcher got there first
     };
-    stop_and_remove(ctx, &row).await?;
+    stop_and_remove(ctx, &row, why).await?;
     Ok(row.id)
 }
 
@@ -819,10 +1250,13 @@ fn remove_if_present(path: &Path, dir: bool) -> Result<()> {
 
 /// Marks the clone Stopping, stops its Postgres, removes its folders and log, then drops the row.
 /// If Postgres may still be running, nothing is removed and the error is returned.
-/// A missing row is fine: the folders are still cleaned up.
-pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
+/// A missing row is fine: the folders are still cleaned up. Records `clone.destroyed` with `why`
+/// as its reason once the clone is gone.
+pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Result<()> {
     ctx.store()
         .set_clone_status(&row.id, CloneStatus::Stopping)?;
+    // Router clients go first, so the stop does not wait on them and none stays half-open.
+    ctx.router().close_clone(&row.id);
     let dir = ctx.home.clones_dir().join(&row.id);
     let sock = ctx.home.sockets_dir().join(&row.id);
     let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
@@ -847,16 +1281,30 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow) -> Result<()> {
         remove_if_present(&log, false)
     })
     .await?;
-    restore_env(ctx, &row.id);
+    ctx.waking
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&row.id);
+    ctx.router().last_active.remove(&row.id);
+    restore_env(ctx, &row.id).await;
     let deleted = ctx.store().delete_clone(&row.id);
+    if deleted.is_ok() {
+        events::emit_clone(
+            ctx,
+            events::CLONE_DESTROYED,
+            row,
+            serde_json::json!({ "reason": why }),
+        );
+    }
     // Every destroy path ends here (user, --fresh, reaper, parent watch, gc, failed create).
     ctx.room.notify_waiters();
     deleted
 }
 
 /// Puts back the `.env` values the clone replaced. A restore that fails (a read-only file, say)
-/// is kept as a pending restore for a client to finish; it never fails the destroy.
-fn restore_env(ctx: &Ctx, clone_id: &str) {
+/// is kept as a pending restore for a client to finish; it never fails the destroy. The files are
+/// edited off the runtime.
+async fn restore_env(ctx: &Ctx, clone_id: &str) {
     let recs = match ctx.store().env_records(clone_id) {
         Ok(r) => r,
         Err(e) => {
@@ -864,25 +1312,40 @@ fn restore_env(ctx: &Ctx, clone_id: &str) {
             return;
         }
     };
-    for rec in recs {
-        if let Err(e) = envfile::restore(&rec) {
-            log(
-                ctx,
-                &format!(
-                    "restore of {} in {} deferred: {}",
-                    rec.var,
-                    rec.file.display(),
-                    e.message
-                ),
-            );
-            if let Err(e) = ctx.store().add_pending_restore(&rec) {
-                log(ctx, &format!("pending restore of {}: {e}", rec.var));
-            }
+    let failed = blocking(move || {
+        Ok(recs
+            .into_iter()
+            .filter_map(|rec| envfile::restore(&rec).err().map(|e| (rec, e)))
+            .collect::<Vec<_>>())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log(ctx, &format!("env restores of {clone_id}: {e}"));
+        Vec::new()
+    });
+    for (rec, e) in failed {
+        log(
+            ctx,
+            &format!(
+                "restore of {} in {} deferred: {}",
+                rec.var,
+                rec.file.display(),
+                e.message
+            ),
+        );
+        if let Err(e) = ctx.store().add_pending_restore(&rec) {
+            log(ctx, &format!("pending restore of {}: {e}", rec.var));
         }
     }
     if let Err(e) = ctx.store().delete_env_records(clone_id) {
         log(ctx, &format!("env records of {clone_id}: {e}"));
     }
+}
+
+/// True while the row's recorded postmaster runs (same pid, same start time).
+fn server_up(r: &CloneRow) -> bool {
+    r.pg_pid
+        .is_some_and(|pid| is_alive(pid) && process_start_time(pid) == r.pg_start_time)
 }
 
 pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
@@ -901,7 +1364,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
     Ok(rows
         .iter()
         .map(|r| {
-            let mut ci = to_info(r, ages.get(r.template.as_str()).copied().unwrap_or(0));
+            let mut ci = to_info(ctx, r, ages.get(r.template.as_str()).copied().unwrap_or(0));
             // Postmaster plus its backends; skip a pid that was reused by another process.
             ci.rss_bytes = r
                 .pg_pid
@@ -909,6 +1372,13 @@ pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
                 .and_then(rss_bytes);
             ci.own_disk_bytes = private_size(&r.dir);
             ci.disk_warn = ci.own_disk_bytes.is_some_and(|b| b > warn_at);
+            // A restart that keeps failing leaves the row Ready; say so instead of looking fine.
+            if r.status == CloneStatus::Ready && ci.rss_bytes.is_none() && !server_up(r) {
+                let label = r.name.as_deref().unwrap_or(&r.id);
+                ci.warnings.push(format!(
+                    "the server of clone {label} is not running; `mitosis gc` recovers it"
+                ));
+            }
             ci
         })
         .collect())
@@ -942,14 +1412,39 @@ mod tests {
             protected: false,
             suspect: false,
         };
-        let i = to_info(&row, 5);
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx::open(
+            crate::paths::Home::at(tmp.path().join("m")),
+            crate::ctx::Config::default(),
+        )
+        .unwrap();
+        let i = to_info(&ctx, &row, 5);
+        let direct = format!(
+            "postgres://postgres:{}@127.0.0.1:54321/app",
+            "ab".repeat(16)
+        );
+        assert_eq!(i.direct_url, direct);
         assert_eq!(
             i.url,
             format!(
-                "postgres://postgres:{}@127.0.0.1:54321/app",
+                "postgres://postgres:{}@127.0.0.1:54300/feat",
                 "ab".repeat(16)
             )
         );
+        assert_eq!(i.status, "ready");
+        let unnamed = CloneRow {
+            name: None,
+            status: CloneStatus::Creating,
+            ..row.clone()
+        };
+        let u = to_info(&ctx, &unnamed, 0);
+        assert!(u.url.ends_with(":54300/c0a1b2"), "{}", u.url);
+        assert_eq!(u.status, "starting");
+        ctx.set_config(crate::ctx::Config {
+            router: false,
+            ..ctx.config()
+        });
+        assert_eq!(to_info(&ctx, &row, 5).url, direct);
         assert_eq!(
             (i.id.as_str(), i.template_age_secs, i.parent_pid, i.durable),
             ("c0a1b2", 5, Some(3), true)
@@ -982,14 +1477,14 @@ mod tests {
             suspect: false,
         };
         assert_eq!(
-            to_info(&row, 0).url,
+            direct_url(&row),
             format!(
                 "postgres://postgres:{}@127.0.0.1:54321/my%20db%2Fx%3Fy%25z",
                 row.password
             )
         );
         row.database = "app".into();
-        assert!(to_info(&row, 0).url.ends_with("/app"));
+        assert!(direct_url(&row).ends_with("/app"));
     }
 
     // The daemon spawns these futures on a multi-thread runtime, so they must be Send.
@@ -998,7 +1493,10 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(create(ctx, args));
         send(destroy(ctx, "x"));
-        send(stop_and_remove(ctx, row));
+        send(stop_and_remove(ctx, row, "user"));
         send(restart(ctx, Box::leak(Box::new(row.clone()))));
+        send(wake(ctx, "x"));
+        send(sleep(ctx, "x", "idle"));
+        send(ensure_running(ctx, "x"));
     }
 }

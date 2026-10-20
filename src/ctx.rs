@@ -2,12 +2,17 @@ use crate::clone_backend::{same_volume, ApfsBackend, CloneBackend};
 pub use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
-use crate::pg::{discover, find_major, newest, PgInstall};
+use crate::pg::{discover_with, find_major, newest, PgInstall};
+use crate::protocol::EventRow;
+use crate::router::RouterState;
 use crate::state::Store;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
+
+/// Events a slow follower may fall behind by before it skips some.
+const EVENT_CHANNEL: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InFlightOp {
@@ -43,6 +48,16 @@ pub struct Ctx {
     pub(crate) admission: Arc<tokio::sync::Mutex<()>>,
     /// Creates waiting for room (including the one at the head).
     pub(crate) queued: AtomicUsize,
+    /// Every event `events::emit` writes, for `mitosis events --follow` connections.
+    pub events_tx: tokio::sync::broadcast::Sender<EventRow>,
+    /// Router connections, cancel keys and listener status; read through `router()`.
+    router: Mutex<RouterState>,
+    /// Clone id → the lock one wake or sleep of that clone holds; others wait on it.
+    pub(crate) waking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test hook: background layered builds skipped because the checkout was on another branch
+    /// (only the first such skip leaves an event).
+    #[doc(hidden)]
+    pub layered_skips: AtomicUsize,
 }
 
 impl Ctx {
@@ -64,12 +79,14 @@ impl Ctx {
             ));
         }
         let store = Store::open(&home.state_db())?;
+        let installs = discover_with(Some(&home));
+        let router = Mutex::new(RouterState::new(config.router_port));
         Ok(Ctx {
             home,
             config: RwLock::new(config),
             store: Mutex::new(store),
             backend,
-            installs: RwLock::new(discover()),
+            installs: RwLock::new(installs),
             started_at: Instant::now(),
             building: Mutex::new(HashSet::new()),
             in_flight: Mutex::new(HashMap::new()),
@@ -79,6 +96,10 @@ impl Ctx {
             room: tokio::sync::Notify::new(),
             admission: Arc::new(tokio::sync::Mutex::new(())),
             queued: AtomicUsize::new(0),
+            events_tx: tokio::sync::broadcast::channel(EVENT_CHANNEL).0,
+            router,
+            waking: Mutex::new(HashMap::new()),
+            layered_skips: AtomicUsize::new(0),
         })
     }
 
@@ -104,7 +125,8 @@ impl Ctx {
 
     /// Searches the machine for Postgres installs again (e.g. one was installed since start).
     async fn rediscover(&self) {
-        if let Ok(found) = tokio::task::spawn_blocking(discover).await {
+        let home = self.home.clone();
+        if let Ok(found) = tokio::task::spawn_blocking(move || discover_with(Some(&home))).await {
             *self.installs.write().unwrap_or_else(|e| e.into_inner()) = found;
         }
     }
@@ -125,6 +147,11 @@ impl Ctx {
         }
         self.rediscover().await;
         newest(&self.installs()).cloned()
+    }
+
+    /// Locks the router state; never hold it across an await or a store call.
+    pub fn router(&self) -> MutexGuard<'_, RouterState> {
+        self.router.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Locks the store; use it for one store call at a time, never across Postgres work.

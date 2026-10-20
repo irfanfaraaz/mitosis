@@ -5,6 +5,7 @@
 use crate::clones::{mark, stop_and_remove};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::events::reason;
 use crate::names::validate_name;
 use crate::pg::{
     psql, read_pg_version, running_server, start, stop, wait_ready, PgInstall, RunningPg,
@@ -14,7 +15,8 @@ use crate::proc_util::process_start_time;
 use crate::protocol::{GenKind, TemplateInfo, TemplateSource};
 use crate::state::{CloneRow, CloneStatus, GenerationRow, TemplateRow};
 use crate::templates::{
-    build_dir_name, commit_built, not_found, now, resume_if_current, template_info, BuildGuard,
+    build_dir_name, build_log_path, commit_built, not_found, now, resume_if_current, template_info,
+    BuildGuard,
 };
 
 fn invalid(msg: impl Into<String>) -> MitosisError {
@@ -62,9 +64,14 @@ pub async fn promote(ctx: &Ctx, id_or_name: &str, target: Option<&str>) -> Resul
         .ok_or_else(|| clone_gone(&found.id))?;
     if clone.status != CloneStatus::Ready {
         return Err(invalid(format!(
-            "clone {} is not ready ({:?})",
-            clone.id, clone.status
-        )));
+            "clone {} is not ready (it is {})",
+            clone.id,
+            clone.status.as_str()
+        ))
+        .with_hint(match clone.status {
+            CloneStatus::Sleeping => "connect to it to wake it, then promote",
+            _ => "wait for the clone to finish its current operation, then promote",
+        }));
     }
     // Possibly corrupt data must not become what every new clone copies.
     if clone.suspect {
@@ -77,6 +84,15 @@ pub async fn promote(ctx: &Ctx, id_or_name: &str, target: Option<&str>) -> Resul
         )));
     }
     let name = target.unwrap_or(&clone.template).to_string();
+    // A branch template's generations are layers on its base's; a promoted one would match no
+    // `base_gen`.
+    if name.contains('~') {
+        return Err(invalid(format!(
+            "clone {} comes from branch template {name}, which cannot take a promoted generation",
+            clone.name.as_deref().unwrap_or(&clone.id)
+        ))
+        .with_hint("promote into a plain template: use --template <template>"));
+    }
     let _guard = BuildGuard::take(ctx, &name)?;
 
     let dir = clone.dir.clone();
@@ -198,7 +214,7 @@ async fn run(
         .map(String::from)
         .collect();
 
-    let log = ctx.home.logs_dir().join(format!("template-{name}.log"));
+    let log = build_log_path(&ctx.home, name);
     std::fs::File::create(&log)?;
     let (i, d) = (install.clone(), clone.dir.clone());
     blocking(move || {
@@ -209,7 +225,7 @@ async fn run(
     })
     .await?;
 
-    // From here the clone is down: every path below starts it again.
+    // From here the clone is down: every path below starts it again (or reconcile does).
     let built_at = now();
     let side = ctx
         .home
@@ -232,31 +248,8 @@ async fn run(
         let _ = blocking(move || Ok(std::fs::remove_dir_all(&s)?)).await;
     }
 
-    // The clone that cannot restart is destroyed; the copy is still committed below.
-    let lost = match restart(ctx, install, clone).await {
-        Ok(()) => None,
-        Err(e) => {
-            let row = ctx
-                .store()
-                .get_clone(&clone.id)
-                .ok()
-                .flatten()
-                .filter(|r| r.id == clone.id)
-                .unwrap_or_else(|| clone.clone());
-            let removed = match stop_and_remove(ctx, &row).await {
-                Ok(()) => "it was destroyed".to_string(),
-                Err(re) => format!("it could not be removed ({re}); run `mitosis gc`"),
-            };
-            Some((
-                e.code,
-                format!(
-                    "clone {} could not be restarted after the promote ({}) and {removed}",
-                    clone.id, e.message
-                ),
-            ))
-        }
-    };
-
+    // Committed before the clone restarts: a kill after this point cannot lose the promoted data,
+    // whatever reconcile then does to the stopped clone.
     let committed = match copied {
         Ok(()) => {
             let row = GenerationRow {
@@ -272,11 +265,37 @@ async fn run(
                 size_bytes: 0,
                 from_clone: Some(clone.id.clone()),
                 from_gen: (clone.template == name).then_some(clone.generation),
+                mask_hash: None,
             };
             commit_built(ctx, install, &log, &[], row, expected).await
         }
         Err(e) => Err(e),
     };
+    // The clone that cannot restart is destroyed; the copy is already committed.
+    let lost = match restart(ctx, install, clone).await {
+        Ok(()) => None,
+        Err(e) => {
+            let row = ctx
+                .store()
+                .get_clone(&clone.id)
+                .ok()
+                .flatten()
+                .filter(|r| r.id == clone.id)
+                .unwrap_or_else(|| clone.clone());
+            let removed = match stop_and_remove(ctx, &row, reason::FAILED).await {
+                Ok(()) => "it was destroyed".to_string(),
+                Err(re) => format!("it could not be removed ({re}); run `mitosis gc`"),
+            };
+            Some((
+                e.code,
+                format!(
+                    "clone {} could not be restarted after the promote ({}) and {removed}",
+                    clone.id, e.message
+                ),
+            ))
+        }
+    };
+
     match (committed, lost) {
         (Ok(()), lost) => {
             // A promote is a manual build: it lifts a pause and clears the last error when current.
@@ -288,7 +307,10 @@ async fn run(
             })();
             match lost {
                 None => {
-                    resumed?;
+                    // The generation is in; a failed resume only leaves the pause as it was.
+                    if let Err(e) = resumed {
+                        crate::lifecycle::log(ctx, &format!("promote {name}: resume: {e}"));
+                    }
                     template_info(ctx, name)
                 }
                 Some((code, msg)) => Err(MitosisError::new(
@@ -315,20 +337,23 @@ async fn restart(ctx: &Ctx, install: &PgInstall, clone: &CloneRow) -> Result<()>
         log_file: ctx.home.logs_dir().join(format!("{}.log", clone.id)),
     };
     let pg = start(install, &clone.dir, &opts)?;
-    wait_ready(install, &pg, &opts, ctx.config().ready_timeout).await?;
-    let store = ctx.store();
-    let mut row = store
-        .get_clone(&clone.id)?
-        .filter(|r| r.id == clone.id)
-        .ok_or_else(|| {
-            MitosisError::new(
-                ErrorCode::CloneNotFound,
-                format!("clone {} no longer exists", clone.id),
-            )
-        })?;
-    row.pg_pid = Some(pg.pid);
-    row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
-    store.update_clone(&row)
+    // Recorded before the wait, so a restart that never gets ready stops exactly this server.
+    {
+        let store = ctx.store();
+        let mut row = store
+            .get_clone(&clone.id)?
+            .filter(|r| r.id == clone.id)
+            .ok_or_else(|| {
+                MitosisError::new(
+                    ErrorCode::CloneNotFound,
+                    format!("clone {} no longer exists", clone.id),
+                )
+            })?;
+        row.pg_pid = Some(pg.pid);
+        row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
+        store.update_clone(&row)?;
+    }
+    wait_ready(install, &pg, &opts, ctx.config().ready_timeout).await
 }
 
 #[cfg(test)]
@@ -341,5 +366,38 @@ mod tests {
     fn futures_are_send(ctx: &'static Arc<Ctx>) {
         fn send<T: Send>(_: T) {}
         send(promote(ctx, "x", None));
+    }
+
+    #[tokio::test]
+    async fn promote_names_the_status_of_a_clone_that_is_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::paths::Home::at(tmp.path().to_path_buf());
+        let ctx = Ctx::open(home, crate::ctx::Config::default()).unwrap();
+        let row = CloneRow {
+            id: "c0a1b2".into(),
+            name: None,
+            template: "main".into(),
+            dir: ctx.home.clones_dir().join("c0a1b2"),
+            port: 54321,
+            socket_dir: ctx.home.sockets_dir().join("c0a1b2"),
+            password: "pw".into(),
+            database: "app".into(),
+            pg_pid: None,
+            pg_start_time: None,
+            parent_pid: None,
+            parent_start_time: None,
+            created_at: 0,
+            expires_at: i64::MAX,
+            durable: false,
+            status: CloneStatus::Sleeping,
+            generation: 1,
+            protected: false,
+            suspect: false,
+        };
+        ctx.store().insert_clone(&row).unwrap();
+        let e = promote(&ctx, "c0a1b2", None).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(e.message.contains("it is sleeping"), "{}", e.message);
+        assert!(e.hint.unwrap_or_default().contains("wake"));
     }
 }

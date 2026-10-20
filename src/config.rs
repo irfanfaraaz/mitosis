@@ -1,8 +1,9 @@
 use crate::error::{ErrorCode, MitosisError, Result};
-use crate::names::{format_duration, parse_duration};
+use crate::names::parse_duration;
 use crate::paths::Home;
 use serde::Serialize;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
 use std::ops::RangeInclusive;
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
@@ -25,6 +26,15 @@ pub struct Config {
     pub stop_timeout: Duration,
     /// How often the template scheduler looks for work; not user-settable, tests shorten it.
     pub scheduler_tick: Duration,
+    /// Serve every clone on one port, picked by database name; off makes `url` the direct URL.
+    pub router: bool,
+    pub router_port: u16,
+    /// The address the router binds; `0.0.0.0` makes it reachable from the network.
+    pub router_listen: IpAddr,
+    /// A clone with no connections for this long is put to sleep; `None` (off) never.
+    pub idle_sleep: Option<Duration>,
+    /// An unnamed, unprotected clone idle for this long is destroyed; `None` (off) never.
+    pub idle_reap: Option<Duration>,
 }
 
 impl Default for Config {
@@ -41,13 +51,19 @@ impl Default for Config {
             ready_timeout: Duration::from_secs(10),
             stop_timeout: Duration::from_secs(10),
             scheduler_tick: Duration::from_secs(60),
+            router: true,
+            router_port: 54300,
+            router_listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            idle_sleep: Some(Duration::from_secs(600)),
+            idle_reap: None,
         }
     }
 }
 
-/// Where a setting's value came from.
+/// Where a setting's value came from. In JSON: `"source": "default" | "file" | "env"`, plus
+/// `"env_var"` for `env`, so `source` is always a string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "source", content = "env_var", rename_all = "snake_case")]
 pub enum ConfigSource {
     Default,
     File,
@@ -70,6 +86,7 @@ impl ConfigSource {
 pub struct ConfigEntry {
     pub key: String,
     pub value: String,
+    #[serde(flatten)]
     pub source: ConfigSource,
 }
 
@@ -81,7 +98,7 @@ struct KeySpec {
     example: &'static str,
 }
 
-const KEYS: [KeySpec; 6] = [
+const KEYS: [KeySpec; 11] = [
     KeySpec {
         key: "max_clones",
         env: "MITOSIS_MAX_CLONES",
@@ -118,10 +135,45 @@ const KEYS: [KeySpec; 6] = [
         want: "a size like 5GB, or a number of bytes",
         example: "5GB",
     },
+    KeySpec {
+        key: "router",
+        env: "MITOSIS_ROUTER",
+        want: "on or off",
+        example: "on",
+    },
+    KeySpec {
+        key: "router_port",
+        env: "MITOSIS_ROUTER_PORT",
+        want: "a port number from 1 to 65535, outside the clone ports 54320-54999",
+        example: "54300",
+    },
+    KeySpec {
+        key: "router_listen",
+        env: "MITOSIS_ROUTER_LISTEN",
+        want: "127.0.0.1, 0.0.0.0 or ::",
+        example: "127.0.0.1",
+    },
+    KeySpec {
+        key: "idle_sleep",
+        env: "MITOSIS_IDLE_SLEEP",
+        want: "a duration like 10m or 1h, or off",
+        example: "10m",
+    },
+    KeySpec {
+        key: "idle_reap",
+        env: "MITOSIS_IDLE_REAP",
+        want: "a duration like 2h or 1d, or off",
+        example: "1d",
+    },
 ];
 
 fn invalid(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::InvalidRequest, msg)
+}
+
+/// Every setting as `(config key, environment variable)`, in `mitosis config` order.
+pub fn keys() -> impl Iterator<Item = (&'static str, &'static str)> {
+    KEYS.iter().map(|k| (k.key, k.env))
 }
 
 fn key_list() -> String {
@@ -181,6 +233,19 @@ fn format_size(n: u64) -> String {
     n.to_string()
 }
 
+/// One unit, the largest that divides the duration exactly (`90s`, not `1m30s`), so that
+/// `parse_wait(format_setting_duration(d)) == d` and the shown value can be pasted into
+/// `config set`. `0s` for zero.
+fn format_setting_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    for (unit, size) in [('d', 86_400), ('h', 3600), ('m', 60)] {
+        if secs != 0 && secs.is_multiple_of(size) {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
 fn parse_budget(v: &str) -> Option<Option<u64>> {
     if v.eq_ignore_ascii_case("off") {
         Some(None)
@@ -190,12 +255,35 @@ fn parse_budget(v: &str) -> Option<Option<u64>> {
     }
 }
 
-fn parse_wait(v: &str) -> Option<Duration> {
-    if v == "0" || v == "0s" {
-        Some(Duration::ZERO)
-    } else {
-        parse_duration(v).ok()
+fn parse_switch(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" => Some(true),
+        "off" | "false" => Some(false),
+        _ => None,
     }
+}
+
+fn parse_idle(v: &str) -> Option<Option<Duration>> {
+    if v.eq_ignore_ascii_case("off") {
+        Some(None)
+    } else {
+        parse_duration(v).ok().map(Some)
+    }
+}
+
+/// `127.0.0.1` or every interface only: `url` always names `127.0.0.1`, which any other single
+/// address (including `::1`) would not answer on. On macOS `::` is dual-stack, so it answers too.
+fn parse_listen(v: &str) -> Option<IpAddr> {
+    let ip: IpAddr = v.parse().ok()?;
+    let ok = match ip {
+        IpAddr::V4(a) => a == Ipv4Addr::LOCALHOST || a.is_unspecified(),
+        IpAddr::V6(a) => a.is_unspecified(),
+    };
+    ok.then_some(ip)
+}
+
+fn parse_wait(v: &str) -> Option<Duration> {
+    crate::names::parse_wait(v).ok()
 }
 
 impl Config {
@@ -216,8 +304,14 @@ impl Config {
             scheduler_tick: self.scheduler_tick,
             ..Config::default()
         };
+        // The router binds once at start, so its settings change on a daemon restart only.
         base.layered(home, &|k| std::env::var(k).ok())
-            .map(|(c, _)| c)
+            .map(|(c, _)| Config {
+                router: self.router,
+                router_port: self.router_port,
+                router_listen: self.router_listen,
+                ..c
+            })
     }
 
     /// One entry per setting with its current value and where it came from.
@@ -234,6 +328,27 @@ impl Config {
             .collect())
     }
 
+    /// The environment variable that overrides `key` and the value in effect, if one is set.
+    pub fn env_override(home: &Home, key: &str) -> Result<Option<(String, String)>> {
+        Config::env_override_with(home, key, &|k| std::env::var(k).ok())
+    }
+
+    fn env_override_with(
+        home: &Home,
+        key: &str,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<(String, String)>> {
+        let (cfg, sources) = Config::default().layered(home, var)?;
+        Ok(KEYS
+            .iter()
+            .zip(sources)
+            .find(|(k, _)| k.key == key)
+            .and_then(|(k, source)| match source {
+                ConfigSource::Env(v) => Some((v, cfg.show(k.key))),
+                _ => None,
+            }))
+    }
+
     /// Validates `value`, then stores it in `<home>/config.toml`, keeping the other keys.
     pub fn set_in_file(home: &Home, key: &str, value: &str) -> Result<()> {
         let value = value.trim();
@@ -244,7 +359,7 @@ impl Config {
         home.ensure_dirs()?;
         let mut table = read_table(home)?;
         let stored = match key {
-            "max_clones" => value.parse::<i64>().map(toml::Value::Integer).ok(),
+            "max_clones" | "router_port" => value.parse::<i64>().map(toml::Value::Integer).ok(),
             _ => None,
         };
         table.insert(
@@ -254,7 +369,10 @@ impl Config {
         let text = toml::to_string(&table)
             .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("encode config: {e}")))?;
         // A temp file and a rename, so a reader never sees a half-written file.
-        let tmp = home.root.join("config.toml.tmp");
+        // Named by pid, so two processes writing at once never share a half-written file.
+        let tmp = home
+            .root
+            .join(format!("config.toml.tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -263,7 +381,10 @@ impl Config {
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, home.config_file())?;
+        if let Err(e) = std::fs::rename(&tmp, home.config_file()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -276,6 +397,17 @@ impl Config {
             "disk_budget" => self.disk_budget = parse_budget(v)?,
             "queue_wait" => self.queue_wait = parse_wait(v)?,
             "clone_disk_warn" => self.clone_disk_warn = parse_size(v).ok()?,
+            "router" => self.router = parse_switch(v)?,
+            "router_port" => {
+                // Inside `port_range` a clone could take it while the router waits to bind.
+                self.router_port = v
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p >= 1 && !self.port_range.contains(p))?
+            }
+            "router_listen" => self.router_listen = parse_listen(v)?,
+            "idle_sleep" => self.idle_sleep = parse_idle(v)?,
+            "idle_reap" => self.idle_reap = parse_idle(v)?,
             _ => return None,
         }
         Some(())
@@ -288,8 +420,15 @@ impl Config {
             "min_free_disk" => format_size(self.min_free_bytes),
             "ram_budget" => budget(self.ram_budget),
             "disk_budget" => budget(self.disk_budget),
-            "queue_wait" => format_duration(self.queue_wait),
+            "queue_wait" => format_setting_duration(self.queue_wait),
             "clone_disk_warn" => format_size(self.clone_disk_warn),
+            "router" => if self.router { "on" } else { "off" }.to_string(),
+            "router_port" => self.router_port.to_string(),
+            "router_listen" => self.router_listen.to_string(),
+            "idle_sleep" => self
+                .idle_sleep
+                .map_or("off".into(), format_setting_duration),
+            "idle_reap" => self.idle_reap.map_or("off".into(), format_setting_duration),
             _ => String::new(),
         }
     }
@@ -310,6 +449,7 @@ impl Config {
             let text = match value {
                 toml::Value::Integer(n) => n.to_string(),
                 toml::Value::String(s) => s.clone(),
+                toml::Value::Boolean(b) => b.to_string(),
                 other => {
                     return Err(invalid(format!(
                         "{origin} must be {}, got a {}",
@@ -405,6 +545,76 @@ mod tests {
         assert_eq!(c.ready_timeout, Duration::from_secs(10));
         assert_eq!(c.stop_timeout, Duration::from_secs(10));
         assert_eq!(c.scheduler_tick, Duration::from_secs(60));
+        assert!(c.router);
+        assert_eq!(c.router_port, 54300);
+        assert_eq!(c.router_listen.to_string(), "127.0.0.1");
+        assert_eq!(c.idle_sleep, Some(Duration::from_secs(600)));
+        assert_eq!(c.idle_reap, None);
+    }
+
+    #[test]
+    fn idle_keys() {
+        let (_tmp, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "idle_sleep = \"off\"\nidle_reap = \"2h\"\n",
+        )
+        .unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(
+            (c.idle_sleep, c.idle_reap),
+            (None, Some(Duration::from_secs(7200)))
+        );
+        assert_eq!(entry(&home, &no_env, "idle_sleep").0, "off");
+        assert_eq!(entry(&home, &no_env, "idle_reap").0, "2h");
+        let env = |k: &str| (k == "MITOSIS_IDLE_SLEEP").then(|| "0s".to_string());
+        assert!(Config::default().layered(&home, &env).is_err());
+        assert!(Config::set_in_file(&home, "idle_sleep", "soon").is_err());
+        Config::set_in_file(&home, "idle_sleep", "5m").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(c.idle_sleep, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn router_keys() {
+        let (_tmp, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "router = false\nrouter_port = 6000\nrouter_listen = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!((c.router, c.router_port), (false, 6000));
+        assert_eq!(c.router_listen.to_string(), "0.0.0.0");
+        let env = |k: &str| (k == "MITOSIS_ROUTER").then(|| "on".to_string());
+        assert_eq!(entry(&home, &env, "router").0, "on");
+        for (k, v) in [
+            ("MITOSIS_ROUTER", "maybe"),
+            ("MITOSIS_ROUTER_PORT", "0"),
+            ("MITOSIS_ROUTER_PORT", "70000"),
+            ("MITOSIS_ROUTER_LISTEN", "localhost"),
+            ("MITOSIS_ROUTER_LISTEN", "192.168.1.5"),
+            ("MITOSIS_ROUTER_LISTEN", "127.0.0.2"),
+            ("MITOSIS_ROUTER_LISTEN", "fe80::1"),
+            ("MITOSIS_ROUTER_LISTEN", "::1"),
+            ("MITOSIS_ROUTER_PORT", "54320"),
+            ("MITOSIS_ROUTER_PORT", "54999"),
+        ] {
+            let env = |n: &str| (n == k).then(|| v.to_string());
+            let e = Config::default().layered(&home, &env).unwrap_err();
+            assert!(e.message.starts_with(k), "{e}");
+        }
+        for ok in ["127.0.0.1", "0.0.0.0", "::"] {
+            let env = |n: &str| (n == "MITOSIS_ROUTER_LISTEN").then(|| ok.to_string());
+            let (c, _) = Config::default().layered(&home, &env).unwrap();
+            assert_eq!(c.router_listen.to_string(), ok);
+        }
+        assert!(Config::set_in_file(&home, "router_port", "54400").is_err());
+        assert!(Config::set_in_file(&home, "router_listen", "10.0.0.1").is_err());
+        Config::set_in_file(&home, "router_port", "6001").unwrap();
+        Config::set_in_file(&home, "router", "off").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!((c.router, c.router_port), (false, 6001));
     }
 
     #[test]
@@ -561,5 +771,49 @@ mod tests {
             assert_eq!(c.port_range, 60000..=60019);
             assert_eq!(c.scheduler_tick, Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn shown_durations_parse_back() {
+        for secs in [0, 1, 45, 60, 90, 3600, 5400, 7200, 86_400, 90_000] {
+            let d = Duration::from_secs(secs);
+            let shown = format_setting_duration(d);
+            assert_eq!(parse_wait(&shown), Some(d), "{secs}s shown as {shown}");
+        }
+        assert_eq!(format_setting_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(format_setting_duration(Duration::from_secs(7200)), "2h");
+    }
+
+    #[test]
+    fn set_in_file_leaves_no_temp_file() {
+        let (_tmp, home) = home();
+        Config::set_in_file(&home, "max_clones", "4").unwrap();
+        Config::set_in_file(&home, "router", "off").unwrap();
+        let names: Vec<String> = std::fs::read_dir(&home.root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".tmp")), "{names:?}");
+        assert!(names.contains(&"config.toml".to_string()));
+    }
+
+    #[test]
+    fn env_override_names_the_variable_in_effect() {
+        let (_tmp, home) = home();
+        Config::set_in_file(&home, "max_clones", "4").unwrap();
+        assert_eq!(
+            Config::env_override_with(&home, "max_clones", &no_env).unwrap(),
+            None
+        );
+        let env = |k: &str| (k == "MITOSIS_MAX_CLONES").then(|| "9".to_string());
+        assert_eq!(
+            Config::env_override_with(&home, "max_clones", &env).unwrap(),
+            Some(("MITOSIS_MAX_CLONES".to_string(), "9".to_string()))
+        );
+        assert_eq!(
+            Config::env_override_with(&home, "router", &env).unwrap(),
+            None
+        );
     }
 }

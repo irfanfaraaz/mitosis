@@ -8,7 +8,9 @@ use crate::client;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::random_hex;
 use crate::paths::Home;
-use crate::protocol::{CloneCreateArgs, CloneInfo, EnvTarget, PendingRestore, Request, Response};
+use crate::protocol::{
+    BranchArgs, CloneCreateArgs, CloneInfo, EnvTarget, PendingRestore, Request, Response,
+};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -239,16 +241,23 @@ pub fn rewrite(path: &Path, var: &str, old_url: &str, new_url: &str) -> Result<b
     Ok(true)
 }
 
-fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
-    let var = var.unwrap_or_else(|| DEFAULT_VAR.to_string());
+/// A variable name a `.env` line can hold: a letter or `_`, then letters, digits or `_`.
+pub fn check_var(var: &str) -> Result<()> {
     let mut chars = var.chars();
     let valid = chars
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !valid {
-        return Err(invalid(format!("{var} is not a valid variable name")));
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(format!("{var} is not a valid variable name")))
     }
+}
+
+fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
+    let var = var.unwrap_or_else(|| DEFAULT_VAR.to_string());
+    check_var(&var)?;
     let file = std::env::current_dir()?.join(file);
     check_name(&file)?;
     let previous = read_file(&file)?.and_then(|t| get_raw(&t, &var));
@@ -259,9 +268,67 @@ fn env_target(file: PathBuf, var: Option<String>) -> Result<EnvTarget> {
     })
 }
 
+/// Completes a `clone --branch` request. The caller sets `name` to the branch it asked for (empty:
+/// the branch checked out) and `repo_root` to its working folder; this resolves both with git and
+/// adds the caller's `PATH`.
+async fn fill_branch(b: &mut BranchArgs) -> Result<()> {
+    let cwd = b.repo_root.clone();
+    let git = move |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let (root, current) = tokio::task::spawn_blocking(move || {
+        (
+            git(&["rev-parse", "--show-toplevel"]),
+            git(&["branch", "--show-current"]),
+        )
+    })
+    .await
+    .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("git: {e}")))?;
+    let root = root.filter(|r| !r.is_empty()).ok_or_else(|| {
+        invalid(format!(
+            "{} is not in a git work tree",
+            b.repo_root.display()
+        ))
+        .with_hint("run mitosis clone --branch inside your git checkout")
+    })?;
+    let current = current.unwrap_or_default();
+    if b.name.is_empty() {
+        if current.is_empty() {
+            return Err(invalid("the checkout is not on a branch (detached HEAD)")
+                .with_hint("name the branch: mitosis clone --branch <branch>"));
+        }
+        b.name = current;
+    } else if !current.is_empty() && current != b.name {
+        // The build runs this checkout's migrations, which belong to the branch checked out.
+        return Err(invalid(format!(
+            "the checkout in {root} is on branch {current}, not {}",
+            b.name
+        ))
+        .with_hint(format!(
+            "git switch {}, or run it in a worktree of that branch",
+            b.name
+        )));
+    }
+    b.repo_root = PathBuf::from(root);
+    if b.path.is_none() {
+        b.path = std::env::var("PATH").ok();
+    }
+    Ok(())
+}
+
 /// Creates a clone through the daemon and, with `env_file`, writes its URL into that file
 /// (`env_var`, default `DATABASE_URL`). A file that cannot be written is a warning on the returned
-/// info: the clone exists and its URL is in the result.
+/// info: the clone exists and its URL is in the result. With `args.branch` (see `fill_branch`),
+/// the clone comes from the template built for that git branch.
 pub async fn create_clone(
     home: &Home,
     mut args: CloneCreateArgs,
@@ -273,6 +340,9 @@ pub async fn create_clone(
     }
     // Before `env_target` reads `previous`: a restore left by a dead clone must put the user's
     // value back first, or the dead clone's URL is recorded as `previous` and the value is lost.
+    if let Some(b) = &mut args.branch {
+        fill_branch(b).await?;
+    }
     let mut pending = finish_pending(home).await;
     args.env = match env_file {
         Some(f) => Some(env_target(f, env_var)?),
@@ -281,13 +351,7 @@ pub async fn create_clone(
     let env = args.env.clone();
     let mut info = match client::request(home, Request::CloneCreate(args)).await? {
         Response::CloneCreated(info) => info,
-        // Not the reply itself: it holds a password-bearing URL.
-        _ => {
-            return Err(
-                MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
-                    .with_hint("restart the daemon: mitosis daemon stop"),
-            )
-        }
+        _ => return Err(unexpected_reply()),
     };
     if let Some(t) = env {
         let written = read_file(&t.file).and_then(|text| {
@@ -316,18 +380,98 @@ pub async fn create_clone(
     Ok(info)
 }
 
-/// Finishes the `.env` restores the daemon could not do. Returns warnings, never fails.
-pub async fn finish_pending(home: &Home) -> Vec<String> {
-    let items = match client::request(home, Request::PendingRestores).await {
-        Ok(Response::PendingRestores { items }) => items,
-        Ok(_) => return vec!["unexpected daemon reply to a pending .env restore request".into()],
-        Err(e) => return vec![format!("pending .env restores: {}", e.message)],
+// Not the reply itself: it can hold a password-bearing URL.
+fn unexpected_reply() -> MitosisError {
+    MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
+        .with_hint("restart the daemon: mitosis daemon stop")
+}
+
+/// The URL `mitosis env` prints for clone `id_or_name`: its `url`, or with `direct` its
+/// `direct_url`. A direct URL refuses connections while the clone sleeps, so when the printed URL
+/// is the direct one (`direct`, or the router off) a sleeping clone is woken first; its port may
+/// move on the wake. Returns the URL and the wake's warnings.
+pub async fn env_url(home: &Home, id_or_name: &str, direct: bool) -> Result<(String, Vec<String>)> {
+    let clones = match client::request(home, Request::CloneList).await? {
+        Response::Clones { clones } => clones,
+        _ => return Err(unexpected_reply()),
     };
-    let mut warnings = Vec::new();
+    let c = clones
+        .into_iter()
+        .find(|c| c.id == id_or_name || c.name.as_deref() == Some(id_or_name))
+        .ok_or_else(|| {
+            MitosisError::new(
+                ErrorCode::CloneNotFound,
+                format!("clone {id_or_name} not found"),
+            )
+            .with_hint("see running clones with `mitosis list`")
+        })?;
+    let not_usable = match c.status.as_str() {
+        "starting" => Some("is still starting; try again in a moment"),
+        "stopping" => Some("is being destroyed"),
+        _ => None,
+    };
+    if let Some(why) = not_usable {
+        return Err(invalid(format!("clone {id_or_name} {why}")));
+    }
+    let direct = direct || c.url == c.direct_url;
+    if !direct {
+        // The router URL works while the clone sleeps: the router wakes it.
+        return Ok((c.url, Vec::new()));
+    }
+    if c.status != "sleeping" {
+        return Ok((c.direct_url, Vec::new()));
+    }
+    // By id, so a name reused meanwhile cannot redirect the wake.
+    match client::request(home, Request::CloneWake { id_or_name: c.id }).await? {
+        Response::Clone(info) => Ok((info.direct_url, info.warnings)),
+        _ => Err(unexpected_reply()),
+    }
+}
+
+/// Finishes the `.env` restores the daemon could not do, starting the daemon if none runs.
+/// Returns warnings, never fails.
+pub async fn finish_pending(home: &Home) -> Vec<String> {
+    finish_pending_counted(home).await.1
+}
+
+/// `finish_pending`, with how many restores were finished: a warning is not always one failed
+/// restore (a failed request is one warning for all of them).
+pub async fn finish_pending_counted(home: &Home) -> (usize, Vec<String>) {
+    match client::request(home, Request::PendingRestores).await {
+        Ok(r) => finish_items(home, r).await,
+        Err(e) => (0, vec![format!("pending .env restores: {}", e.message)]),
+    }
+}
+
+/// `finish_pending` when a daemon already runs; nothing (and no daemon start) when none does.
+/// For eager callers such as the MCP server start: a later command finishes them instead.
+pub async fn finish_pending_if_running(home: &Home) -> Vec<String> {
+    match client::request_if_running(home, Request::PendingRestores).await {
+        Ok(Some(r)) => finish_items(home, r).await.1,
+        Ok(None) => Vec::new(),
+        Err(e) => vec![format!("pending .env restores: {}", e.message)],
+    }
+}
+
+/// Applies the restores in a `PendingRestores` reply. The warnings say they come from an earlier
+/// clone, so they are not mistaken for the current command's.
+async fn finish_items(home: &Home, reply: Response) -> (usize, Vec<String>) {
+    let items = match reply {
+        Response::PendingRestores { items } => items,
+        _ => {
+            return (
+                0,
+                vec!["unexpected daemon reply to a pending .env restore request".into()],
+            )
+        }
+    };
+    let (mut done, mut warnings) = (0, Vec::new());
     for item in items {
         match restore(&item) {
-            // Restored, or the user changed the value or removed the file: either way it is done.
+            // Restored, or the user changed the value or removed the file: either way it is done
+            // (a row left by a failed `done` request is finished again, harmlessly, next time).
             Ok(_) => {
+                done += 1;
                 if let Err(e) =
                     client::request(home, Request::PendingRestoreDone { id: item.id }).await
                 {
@@ -335,14 +479,14 @@ pub async fn finish_pending(home: &Home) -> Vec<String> {
                 }
             }
             Err(e) => warnings.push(format!(
-                "could not restore {} in {}: {}",
+                "could not restore {} in {} for an earlier clone: {}",
                 item.var,
                 item.file.display(),
                 e.message
             )),
         }
     }
-    warnings
+    (done, warnings)
 }
 
 #[cfg(test)]

@@ -28,4 +28,18 @@ jobs:
         run: brew install postgresql@18
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Opt-in managed build: a second major for the cross-major upgrade tests. The runner target may
+      # lack a build, so a failure only warns; the tests find it through PATH and skip without it.
+      - name: Install Postgres 17 (mitosis pg install)
+        run: |
+          if out=$(cargo run --quiet -- pg install 17); then
+            bin=$(printf '%s\n' "$out" | tail -n 1)
+          else
+            bin=""
+          fi
+          if [ -d "$bin" ]; then
+            echo "$bin" >> "$GITHUB_PATH"
+          else
+            echo "::warning::no managed Postgres 17 for this runner; the cross-major tests will skip"
+          fi
       - run: cargo test

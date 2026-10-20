@@ -1,0 +1,10 @@
+[
+  {
+    "clone": "string",
+    "detail": {},
+    "id": "number",
+    "kind": "string",
+    "template": "string",
+    "ts": "number"
+  }
+]

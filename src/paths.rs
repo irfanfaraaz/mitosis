@@ -55,6 +55,11 @@ impl Home {
         self.root.join("clones")
     }
 
+    /// Postgres builds installed by `mitosis pg install`, one folder per `x.y` version.
+    pub fn pg_dir(&self) -> PathBuf {
+        self.root.join("pg")
+    }
+
     pub fn sockets_dir(&self) -> PathBuf {
         self.root.join("sockets")
     }
@@ -178,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_home_is_refused_and_left_untouched() {
+    fn foreign_home_is_refused_untouched_then_adopted_once_only_own_entries_remain() {
         let tmp = tempfile::tempdir().unwrap();
         let h = Home::at(tmp.path().join("m"));
         std::fs::create_dir(&h.root).unwrap();

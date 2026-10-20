@@ -5,7 +5,8 @@ use crate::lifecycle;
 use crate::paths::Home;
 use crate::promote;
 use crate::protocol::{
-    DaemonStatus, Request, RequestEnvelope, Response, ResponseEnvelope, PROTOCOL_VERSION,
+    DaemonStatus, EventFilter, EventRow, Request, RequestEnvelope, Response, ResponseEnvelope,
+    PROTOCOL_VERSION,
 };
 use crate::scheduler;
 use crate::templates::{self, now};
@@ -17,6 +18,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
@@ -26,6 +28,10 @@ const REAP_EVERY: Duration = Duration::from_secs(30);
 const RESERVATIONS_EVERY_SECS: i64 = 24 * 3600;
 /// Longest request line accepted; a longer one closes the connection.
 const MAX_LINE: usize = 1 << 20;
+/// Events a plain `events` request returns when it sets no limit of its own.
+pub const EVENTS_DEFAULT_LIMIT: u32 = 1000;
+/// Past events a following request starts with when it sets no limit of its own.
+pub const EVENTS_FOLLOW_BACKLOG: u32 = 20;
 
 fn internal(msg: impl Into<String>) -> MitosisError {
     MitosisError::new(ErrorCode::Internal, msg)
@@ -90,16 +96,32 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
             home.root.display()
         ),
     );
-    match lifecycle::reconcile(ctx.clone(), now()).await {
-        Ok(r) => log(
-            &home,
-            &format!(
-                "startup gc: {}",
-                serde_json::to_string(&r).unwrap_or_default()
-            ),
-        ),
-        Err(e) => log(&home, &format!("startup gc failed: {e}")),
-    }
+    // Bound before the startup gc, which keeps clones asleep only when the router can wake
+    // them; it starts accepting after the gc.
+    let router_listener = if ctx.config().router {
+        Some(crate::router::bind(&ctx).await)
+    } else {
+        None
+    };
+    // Sleeping clones to start again (router not listening) are woken after the socket accepts.
+    let to_wake = match lifecycle::reconcile_deferred(ctx.clone(), now()).await {
+        Ok((r, to_wake)) => {
+            log(
+                &home,
+                &format!(
+                    "startup gc: {}",
+                    serde_json::to_string(&r).unwrap_or_default()
+                ),
+            );
+            to_wake
+        }
+        Err(e) => {
+            log(&home, &format!("startup gc failed: {e}"));
+            Vec::new()
+        }
+    };
+    // Before the socket binds, so no diff is running: anything a diff left is a leftover.
+    lifecycle::remove_diff_leftovers(&ctx).await;
 
     // Safe to replace: we hold the lock, so no other daemon owns this socket.
     let sock = home.daemon_sock();
@@ -119,6 +141,11 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     };
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
     scheduler::run(ctx.clone(), shutdown_rx.clone());
+    let router = router_listener.map(|l| crate::router::spawn(ctx.clone(), l));
+    if !to_wake.is_empty() {
+        let c = ctx.clone();
+        tokio::spawn(async move { lifecycle::wake_sleepers(&c, to_wake).await });
+    }
 
     let mut last_accept_log: Option<std::time::Instant> = None;
     loop {
@@ -141,6 +168,11 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     }
 
     drop(listener);
+    // Stops accepting. Open router connections end when this process exits (the clones keep
+    // running); clients reconnect.
+    if let Some(r) = &router {
+        r.abort();
+    }
     let _ = std::fs::remove_file(&sock);
     drop(work_tx);
     // recv() yields None once every running request has dropped its sender.
@@ -179,6 +211,23 @@ async fn reaper(shared: Shared, mut shutdown: watch::Receiver<bool>) {
             ),
             Ok(_) => {}
             Err(e) => log(&shared.ctx.home, &format!("reaper failed: {e}")),
+        }
+        match lifecycle::idle_pass(&shared.ctx, now()).await {
+            Ok((slept, reaped)) => {
+                if !slept.is_empty() {
+                    log(
+                        &shared.ctx.home,
+                        &format!("idle clones slept: {}", slept.join(", ")),
+                    );
+                }
+                if !reaped.is_empty() {
+                    log(
+                        &shared.ctx.home,
+                        &format!("idle clones destroyed: {}", reaped.join(", ")),
+                    );
+                }
+            }
+            Err(e) => log(&shared.ctx.home, &format!("idle pass failed: {e}")),
         }
         let t = now();
         if t.saturating_sub(reservations_dropped) >= RESERVATIONS_EVERY_SECS {
@@ -222,6 +271,13 @@ async fn connection(shared: Shared, stream: UnixStream) {
                 continue;
             }
             match parse(&line) {
+                Ok(Request::Events {
+                    filter,
+                    follow: true,
+                }) => {
+                    follow_events(&shared, filter, &mut rd, &mut wr).await;
+                    return;
+                }
                 Ok(req) => {
                     let shutdown = matches!(req, Request::Shutdown);
                     (dispatch_watching(&shared, req, &mut rd).await, shutdown)
@@ -246,6 +302,93 @@ async fn connection(shared: Shared, stream: UnixStream) {
         }
         if !sent || too_large || shutdown {
             return;
+        }
+    }
+}
+
+async fn list_events(ctx: &Arc<Ctx>, filter: EventFilter) -> Result<Vec<EventRow>> {
+    let ctx = ctx.clone();
+    tokio::task::spawn_blocking(move || ctx.store().list_events(&filter))
+        .await
+        .map_err(|e| internal(format!("background task failed: {e}")))?
+}
+
+async fn events_after(ctx: &Arc<Ctx>, after: i64, filter: &EventFilter) -> Result<Vec<EventRow>> {
+    let (ctx, filter) = (ctx.clone(), filter.clone());
+    tokio::task::spawn_blocking(move || ctx.store().list_events_after(after, &filter))
+        .await
+        .map_err(|e| internal(format!("background task failed: {e}")))?
+}
+
+/// Writes one reply line; false when the client is gone.
+async fn send(wr: &mut OwnedWriteHalf, result: Result<Response>) -> bool {
+    let Ok(mut out) = serde_json::to_vec(&ResponseEnvelope {
+        v: PROTOCOL_VERSION,
+        result,
+    }) else {
+        return false;
+    };
+    out.push(b'\n');
+    wr.write_all(&out).await.is_ok() && wr.flush().await.is_ok()
+}
+
+/// `Events` with `follow`: the latest matching events, then each new one, until the client hangs
+/// up or the daemon stops. The store is the source of truth: the broadcast channel only wakes the
+/// follower (a late, early or missed broadcast changes nothing), and each wake sends every stored
+/// matching row after the last one sent, in id order. It holds no work token, and it ends when the
+/// daemon's shutdown flag turns true, so it never holds a shutdown up.
+async fn follow_events(
+    shared: &Shared,
+    mut filter: EventFilter,
+    rd: &mut BufReader<OwnedReadHalf>,
+    wr: &mut OwnedWriteHalf,
+) {
+    // Subscribed before the backlog is read, so a wake cannot fall between the two.
+    let mut wake = shared.ctx.events_tx.subscribe();
+    let mut shutdown = shared.shutdown.subscribe();
+    filter.limit.get_or_insert(EVENTS_FOLLOW_BACKLOG);
+    let events = match list_events(&shared.ctx, filter.clone()).await {
+        Ok(events) => events,
+        Err(e) => {
+            send(wr, Err(e)).await;
+            return;
+        }
+    };
+    // With no backlog, no matching row exists yet, so reading from id 0 sends only new ones.
+    let mut last = events.last().map_or(0, |e| e.id);
+    if !send(wr, Ok(Response::Events { events })).await {
+        return;
+    }
+    let mut watching = true;
+    while !*shutdown.borrow() {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            // Input from the client is ignored; only a hang-up ends the stream.
+            filled = rd.fill_buf(), if watching => match filled {
+                Ok(b) if !b.is_empty() => watching = false,
+                _ => return,
+            },
+            woken = wake.recv() => {
+                if matches!(woken, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    return;
+                }
+                // Ok or Lagged alike: the rows are in the store.
+                match events_after(&shared.ctx, last, &filter).await {
+                    Ok(rows) => {
+                        for e in rows {
+                            last = e.id;
+                            if !send(wr, Ok(Response::Event(e))).await {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log(&shared.ctx.home, &format!("events follower: {e}"));
+                        send(wr, Err(e)).await;
+                        return;
+                    }
+                }
+            },
         }
     }
 }
@@ -318,10 +461,14 @@ async fn dispatch(shared: &Shared, req: Request, gone: watch::Receiver<bool>) ->
         .and_then(|v| v["type"].as_str().map(String::from))
         .unwrap_or_default();
     let ctx = shared.ctx.clone();
+    let stopping = shared.shutdown.subscribe();
     let res = tokio::spawn(async move {
         let _token = token;
         crate::budget::CLIENT_GONE
-            .scope(gone, serve_one(ctx, req))
+            .scope(
+                gone,
+                crate::budget::DAEMON_STOPPING.scope(stopping, serve_one(ctx, req)),
+            )
             .await
     })
     .await
@@ -397,6 +544,28 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         } => {
             Response::TemplateBuilt(promote::promote(&ctx, &id_or_name, template.as_deref()).await?)
         }
+        Request::CloneWake { id_or_name } => {
+            Response::Clone(clones::wake_info(&ctx, &id_or_name).await?)
+        }
+        Request::CloneDiff {
+            id_or_name,
+            table,
+            limit,
+            parent_pid,
+        } => {
+            if let Some(pid) = parent_pid {
+                crate::diff::check_session(&ctx, &id_or_name, pid)?;
+            }
+            Response::Diff(
+                crate::diff::diff(
+                    &ctx,
+                    &id_or_name,
+                    table.as_deref(),
+                    limit.unwrap_or(crate::diff::DEFAULT_LIMIT),
+                )
+                .await?,
+            )
+        }
         Request::PendingRestores => Response::PendingRestores {
             items: ctx.store().list_pending_restores()?,
         },
@@ -419,6 +588,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
                 uptime_secs: ctx.started_at.elapsed().as_secs(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 service: std::env::var_os("MITOSIS_SERVICE").is_some_and(|v| v == "1"),
+                router: ctx.config().router.then(|| ctx.router().status.clone()),
             })
         }
         Request::Usage => Response::Usage(crate::budget::usage(&ctx).await?),
@@ -427,6 +597,12 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
             ctx.set_config(new);
             ctx.room.notify_waiters(); // a raised limit may let queued creates in
             Response::Ok
+        }
+        Request::Events { mut filter, .. } => {
+            filter.limit.get_or_insert(EVENTS_DEFAULT_LIMIT);
+            Response::Events {
+                events: list_events(&ctx, filter).await?,
+            }
         }
         Request::Shutdown => Response::Ok,
     })
