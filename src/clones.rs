@@ -46,17 +46,59 @@ where
         .map_err(|e| internal(format!("background task failed: {e}")))?
 }
 
-pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
+/// The URL straight to the clone's own port (the v0.2 URL).
+pub fn direct_url(row: &CloneRow) -> String {
+    format!(
+        "postgres://postgres:{}@127.0.0.1:{}/{}",
+        row.password,
+        row.port,
+        crate::templates::url_encode(&row.database)
+    )
+}
+
+/// The URL through the router: the clone's name (else its id) as the database, so a named
+/// clone's URL stays the same when its direct port moves.
+pub fn router_url(ctx: &Ctx, row: &CloneRow) -> String {
+    format!(
+        "postgres://postgres:{}@127.0.0.1:{}/{}",
+        row.password,
+        ctx.config().router_port,
+        row.name.as_deref().unwrap_or(&row.id)
+    )
+}
+
+/// `CloneInfo.status`.
+fn status_str(s: CloneStatus) -> &'static str {
+    match s {
+        CloneStatus::Creating | CloneStatus::Starting => "starting",
+        CloneStatus::Ready => "ready",
+        CloneStatus::Stopping => "stopping",
+    }
+}
+
+/// The warning for a direct port that had to move from `old`.
+fn port_moved(ctx: &Ctx, old: u16) -> String {
+    if ctx.config().router {
+        format!("port {old} was taken; the direct URL changed, the router URL did not")
+    } else {
+        format!("port {old} was taken; the URL changed")
+    }
+}
+
+/// `url` is the router URL while `router` is on (even while its port is taken), else the direct one.
+pub fn to_info(ctx: &Ctx, row: &CloneRow, template_age_secs: u64) -> CloneInfo {
+    let direct = direct_url(row);
     CloneInfo {
         id: row.id.clone(),
         name: row.name.clone(),
         template: row.template.clone(),
-        url: format!(
-            "postgres://postgres:{}@127.0.0.1:{}/{}",
-            row.password,
-            row.port,
-            crate::templates::url_encode(&row.database)
-        ),
+        url: if ctx.config().router {
+            router_url(ctx, row)
+        } else {
+            direct.clone()
+        },
+        direct_url: direct,
+        status: status_str(row.status).to_string(),
         port: row.port,
         socket_dir: row.socket_dir.clone(),
         template_age_secs,
@@ -80,6 +122,22 @@ pub fn to_info(row: &CloneRow, template_age_secs: u64) -> CloneInfo {
         waited_ms: 0,
         disk_warn: false,
         suspect: row.suspect,
+    }
+}
+
+/// The clone's row when it can take connections now. (Task 3: wakes a sleeping clone.)
+pub async fn ensure_running(ctx: &Arc<Ctx>, id: &str) -> Result<CloneRow> {
+    let row = ctx.store().get_clone(id)?.ok_or_else(|| {
+        MitosisError::new(ErrorCode::CloneNotFound, format!("clone {id} not found"))
+            .with_hint("see existing clones with `mitosis list` (or the clone_list tool)")
+    })?;
+    let label = row.name.as_deref().unwrap_or(&row.id);
+    match row.status {
+        CloneStatus::Ready => Ok(row),
+        CloneStatus::Stopping => Err(invalid(format!("clone {label} is being destroyed"))),
+        CloneStatus::Creating | CloneStatus::Starting => Err(invalid(format!(
+            "clone {label} is still starting; try again in a moment"
+        ))),
     }
 }
 
@@ -154,6 +212,7 @@ pub async fn create(ctx: &Arc<Ctx>, mut args: CloneCreateArgs) -> Result<CloneIn
             ));
         }
     }
+    info.warnings.extend(crate::router::warning(ctx));
     info.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(info)
 }
@@ -261,7 +320,7 @@ async fn reuse_named(
             .current(&row.template)?
             .map_or(0, |(_, g)| age_secs(g.built_at, t))
     };
-    let mut info = to_info(&row, age);
+    let mut info = to_info(ctx, &row, age);
     info.existing = true;
     Ok(Some(info))
 }
@@ -342,7 +401,7 @@ async fn create_inner(
                     .flatten()
                     .filter(|r| r.port != row.port)
                 {
-                    warnings.push(format!("port {} was taken; the URL changed", r.port));
+                    warnings.push(port_moved(ctx, r.port));
                     r.port = row.port;
                     let _ = store.upsert_reservation(&r);
                 }
@@ -507,7 +566,7 @@ fn reserve<'a>(
                     let port =
                         pick_port(cfg.port_range.clone(), &leased, &HashSet::new(), &reserved)?;
                     if let Some(r) = &other {
-                        warnings.push(format!("port {} was taken; the URL changed", r.port));
+                        warnings.push(port_moved(ctx, r.port));
                     }
                     (port, other.map_or_else(|| random_hex(16), |r| r.password))
                 }
@@ -628,7 +687,7 @@ async fn bring_up(
     row.pg_pid = Some(pg.pid);
     row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
     set_status(ctx, row, CloneStatus::Ready)?;
-    Ok(to_info(row, age_secs(gen.built_at, now())))
+    Ok(to_info(ctx, row, age_secs(gen.built_at, now())))
 }
 
 /// Sets the clone's `postgres` password over its private socket.
@@ -715,8 +774,8 @@ pub async fn restart(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
     if row.port == old_port {
         return Ok(Vec::new());
     }
-    let mut warnings = vec![format!("port {old_port} was taken; the URL changed")];
-    let new_url = to_info(row, 0).url;
+    let mut warnings = vec![port_moved(ctx, old_port)];
+    let new_url = to_info(ctx, row, 0).url;
     let store = ctx.store();
     if let Some(name) = &row.name {
         if let Some(mut r) = store.get_reservation(name)? {
@@ -724,7 +783,12 @@ pub async fn restart(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
             store.upsert_reservation(&r)?;
         }
     }
-    for mut rec in store.env_records(&row.id)? {
+    // Records already holding the router URL need no rewrite.
+    for mut rec in store
+        .env_records(&row.id)?
+        .into_iter()
+        .filter(|r| r.url != new_url)
+    {
         if let Err(e) = envfile::rewrite(&rec.file, &rec.var, &rec.url, &new_url) {
             warnings.push(format!(
                 "could not update {} in {}: {}",
@@ -866,6 +930,7 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Res
         remove_if_present(&log, false)
     })
     .await?;
+    ctx.router().close_clone(&row.id);
     restore_env(ctx, &row.id);
     let deleted = ctx.store().delete_clone(&row.id);
     if deleted.is_ok() {
@@ -928,7 +993,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
     Ok(rows
         .iter()
         .map(|r| {
-            let mut ci = to_info(r, ages.get(r.template.as_str()).copied().unwrap_or(0));
+            let mut ci = to_info(ctx, r, ages.get(r.template.as_str()).copied().unwrap_or(0));
             // Postmaster plus its backends; skip a pid that was reused by another process.
             ci.rss_bytes = r
                 .pg_pid
@@ -969,14 +1034,39 @@ mod tests {
             protected: false,
             suspect: false,
         };
-        let i = to_info(&row, 5);
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx::open(
+            crate::paths::Home::at(tmp.path().join("m")),
+            crate::ctx::Config::default(),
+        )
+        .unwrap();
+        let i = to_info(&ctx, &row, 5);
+        let direct = format!(
+            "postgres://postgres:{}@127.0.0.1:54321/app",
+            "ab".repeat(16)
+        );
+        assert_eq!(i.direct_url, direct);
         assert_eq!(
             i.url,
             format!(
-                "postgres://postgres:{}@127.0.0.1:54321/app",
+                "postgres://postgres:{}@127.0.0.1:54300/feat",
                 "ab".repeat(16)
             )
         );
+        assert_eq!(i.status, "ready");
+        let unnamed = CloneRow {
+            name: None,
+            status: CloneStatus::Creating,
+            ..row.clone()
+        };
+        let u = to_info(&ctx, &unnamed, 0);
+        assert!(u.url.ends_with(":54300/c0a1b2"), "{}", u.url);
+        assert_eq!(u.status, "starting");
+        ctx.set_config(crate::ctx::Config {
+            router: false,
+            ..ctx.config()
+        });
+        assert_eq!(to_info(&ctx, &row, 5).url, direct);
         assert_eq!(
             (i.id.as_str(), i.template_age_secs, i.parent_pid, i.durable),
             ("c0a1b2", 5, Some(3), true)
@@ -1009,14 +1099,14 @@ mod tests {
             suspect: false,
         };
         assert_eq!(
-            to_info(&row, 0).url,
+            direct_url(&row),
             format!(
                 "postgres://postgres:{}@127.0.0.1:54321/my%20db%2Fx%3Fy%25z",
                 row.password
             )
         );
         row.database = "app".into();
-        assert!(to_info(&row, 0).url.ends_with("/app"));
+        assert!(direct_url(&row).ends_with("/app"));
     }
 
     // The daemon spawns these futures on a multi-thread runtime, so they must be Send.

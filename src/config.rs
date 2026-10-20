@@ -3,6 +3,7 @@ use crate::names::{format_duration, parse_duration};
 use crate::paths::Home;
 use serde::Serialize;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
 use std::ops::RangeInclusive;
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
@@ -25,6 +26,11 @@ pub struct Config {
     pub stop_timeout: Duration,
     /// How often the template scheduler looks for work; not user-settable, tests shorten it.
     pub scheduler_tick: Duration,
+    /// Serve every clone on one port, picked by database name; off makes `url` the direct URL.
+    pub router: bool,
+    pub router_port: u16,
+    /// The address the router binds; `0.0.0.0` makes it reachable from the network.
+    pub router_listen: IpAddr,
 }
 
 impl Default for Config {
@@ -41,6 +47,9 @@ impl Default for Config {
             ready_timeout: Duration::from_secs(10),
             stop_timeout: Duration::from_secs(10),
             scheduler_tick: Duration::from_secs(60),
+            router: true,
+            router_port: 54300,
+            router_listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
         }
     }
 }
@@ -81,7 +90,7 @@ struct KeySpec {
     example: &'static str,
 }
 
-const KEYS: [KeySpec; 6] = [
+const KEYS: [KeySpec; 9] = [
     KeySpec {
         key: "max_clones",
         env: "MITOSIS_MAX_CLONES",
@@ -117,6 +126,24 @@ const KEYS: [KeySpec; 6] = [
         env: "MITOSIS_CLONE_DISK_WARN",
         want: "a size like 5GB, or a number of bytes",
         example: "5GB",
+    },
+    KeySpec {
+        key: "router",
+        env: "MITOSIS_ROUTER",
+        want: "on or off",
+        example: "on",
+    },
+    KeySpec {
+        key: "router_port",
+        env: "MITOSIS_ROUTER_PORT",
+        want: "a port number from 1 to 65535",
+        example: "54300",
+    },
+    KeySpec {
+        key: "router_listen",
+        env: "MITOSIS_ROUTER_LISTEN",
+        want: "an IP address like 127.0.0.1 or 0.0.0.0",
+        example: "127.0.0.1",
     },
 ];
 
@@ -190,6 +217,14 @@ fn parse_budget(v: &str) -> Option<Option<u64>> {
     }
 }
 
+fn parse_switch(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" => Some(true),
+        "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_wait(v: &str) -> Option<Duration> {
     if v == "0" || v == "0s" {
         Some(Duration::ZERO)
@@ -216,8 +251,14 @@ impl Config {
             scheduler_tick: self.scheduler_tick,
             ..Config::default()
         };
+        // The router binds once at start, so its settings change on a daemon restart only.
         base.layered(home, &|k| std::env::var(k).ok())
-            .map(|(c, _)| c)
+            .map(|(c, _)| Config {
+                router: self.router,
+                router_port: self.router_port,
+                router_listen: self.router_listen,
+                ..c
+            })
     }
 
     /// One entry per setting with its current value and where it came from.
@@ -244,7 +285,7 @@ impl Config {
         home.ensure_dirs()?;
         let mut table = read_table(home)?;
         let stored = match key {
-            "max_clones" => value.parse::<i64>().map(toml::Value::Integer).ok(),
+            "max_clones" | "router_port" => value.parse::<i64>().map(toml::Value::Integer).ok(),
             _ => None,
         };
         table.insert(
@@ -276,6 +317,9 @@ impl Config {
             "disk_budget" => self.disk_budget = parse_budget(v)?,
             "queue_wait" => self.queue_wait = parse_wait(v)?,
             "clone_disk_warn" => self.clone_disk_warn = parse_size(v).ok()?,
+            "router" => self.router = parse_switch(v)?,
+            "router_port" => self.router_port = v.parse::<u16>().ok().filter(|p| *p >= 1)?,
+            "router_listen" => self.router_listen = v.parse().ok()?,
             _ => return None,
         }
         Some(())
@@ -290,6 +334,9 @@ impl Config {
             "disk_budget" => budget(self.disk_budget),
             "queue_wait" => format_duration(self.queue_wait),
             "clone_disk_warn" => format_size(self.clone_disk_warn),
+            "router" => if self.router { "on" } else { "off" }.to_string(),
+            "router_port" => self.router_port.to_string(),
+            "router_listen" => self.router_listen.to_string(),
             _ => String::new(),
         }
     }
@@ -310,6 +357,7 @@ impl Config {
             let text = match value {
                 toml::Value::Integer(n) => n.to_string(),
                 toml::Value::String(s) => s.clone(),
+                toml::Value::Boolean(b) => b.to_string(),
                 other => {
                     return Err(invalid(format!(
                         "{origin} must be {}, got a {}",
@@ -405,6 +453,38 @@ mod tests {
         assert_eq!(c.ready_timeout, Duration::from_secs(10));
         assert_eq!(c.stop_timeout, Duration::from_secs(10));
         assert_eq!(c.scheduler_tick, Duration::from_secs(60));
+        assert!(c.router);
+        assert_eq!(c.router_port, 54300);
+        assert_eq!(c.router_listen.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn router_keys() {
+        let (_tmp, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "router = false\nrouter_port = 6000\nrouter_listen = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!((c.router, c.router_port), (false, 6000));
+        assert_eq!(c.router_listen.to_string(), "0.0.0.0");
+        let env = |k: &str| (k == "MITOSIS_ROUTER").then(|| "on".to_string());
+        assert_eq!(entry(&home, &env, "router").0, "on");
+        for (k, v) in [
+            ("MITOSIS_ROUTER", "maybe"),
+            ("MITOSIS_ROUTER_PORT", "0"),
+            ("MITOSIS_ROUTER_PORT", "70000"),
+            ("MITOSIS_ROUTER_LISTEN", "localhost"),
+        ] {
+            let env = |n: &str| (n == k).then(|| v.to_string());
+            let e = Config::default().layered(&home, &env).unwrap_err();
+            assert!(e.message.starts_with(k), "{e}");
+        }
+        Config::set_in_file(&home, "router_port", "6001").unwrap();
+        Config::set_in_file(&home, "router", "off").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!((c.router, c.router_port), (false, 6001));
     }
 
     #[test]

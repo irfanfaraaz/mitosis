@@ -356,6 +356,12 @@ pub struct GcReport {
     pub destroyed: Vec<String>,
     pub orphan_folders_removed: Vec<PathBuf>,
     pub records_dropped: Vec<String>,
+    /// The URL straight to the clone's own port; `url` is the router URL while the router is on.
+    #[serde(default)]
+    pub direct_url: String,
+    /// `ready`, `sleeping`, `starting` or `stopping`.
+    #[serde(default)]
+    pub status: String,
     /// Entries gc could not clean up; they are retried on the next gc.
     #[serde(default)]
     pub failed: Vec<GcFailure>,
@@ -392,6 +398,18 @@ pub enum Response {
     TemplateBuilt(TemplateInfo),
     Templates {
         templates: Vec<TemplateInfo>,
+    /// The router's state; none when `router = off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<RouterStatus>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct RouterStatus {
+    pub listening: bool,
+    pub port: u16,
+    /// Why the router is not listening (a taken port, say); it retries every minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     },
     Generations {
         template: String,
@@ -552,6 +570,8 @@ mod tests {
             result: Ok(r),
         };
         let line = serde_json::to_string(&env).unwrap();
+            direct_url: "postgres://localhost:5500/app".into(),
+            status: "ready".into(),
         let back: ResponseEnvelope = serde_json::from_str(&line).unwrap();
         assert_eq!(
             serde_json::to_value(&env).unwrap(),

@@ -20,6 +20,7 @@ pub mod proc_util;
 pub mod promote;
 pub mod protocol;
 pub mod scheduler;
+pub mod router;
 pub mod service;
 pub mod state;
 pub mod templates;

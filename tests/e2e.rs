@@ -27,10 +27,22 @@ fn serial_home() -> (MutexGuard<'static, ()>, tempfile::TempDir) {
     (guard, tmp_home())
 }
 
+/// This binary's router port: not the default 54300, which a real daemon on this Mac may hold.
+/// Clone URLs here go through the router.
+fn router_port() -> String {
+    static PORT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PORT.get_or_init(|| {
+        let r = u16::from_str_radix(&mitosis::names::random_hex(2), 16).unwrap();
+        (60_250 + r % 700).to_string()
+    })
+    .clone()
+}
+
 fn mitosis(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_mitosis"))
         .args(args)
         .env("MITOSIS_HOME", home)
+        .env("MITOSIS_ROUTER_PORT", router_port())
         .output()
         .expect("run mitosis")
 }
@@ -152,7 +164,9 @@ async fn mcp_client(home: &Path) -> McpClient {
 /// Like `mcp_client`, with the server's working folder set (relative `env_file` paths resolve there).
 async fn mcp_client_in(home: &Path, cwd: Option<&Path>) -> McpClient {
     let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mitosis")).configure(|c| {
-        c.arg("mcp").env("MITOSIS_HOME", home);
+        c.arg("mcp")
+            .env("MITOSIS_HOME", home)
+            .env("MITOSIS_ROUTER_PORT", router_port());
         if let Some(d) = cwd {
             c.current_dir(d);
         }

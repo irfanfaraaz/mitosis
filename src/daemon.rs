@@ -125,6 +125,10 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     };
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
     scheduler::run(ctx.clone(), shutdown_rx.clone());
+    let router = ctx
+        .config()
+        .router
+        .then(|| crate::router::spawn(ctx.clone()));
 
     let mut last_accept_log: Option<std::time::Instant> = None;
     loop {
@@ -147,6 +151,10 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     }
 
     drop(listener);
+    // Stops accepting; open router connections keep going, like the clones they reach.
+    if let Some(r) = &router {
+        r.abort();
+    }
     let _ = std::fs::remove_file(&sock);
     drop(work_tx);
     // recv() yields None once every running request has dropped its sender.
@@ -519,6 +527,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
                 uptime_secs: ctx.started_at.elapsed().as_secs(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 service: std::env::var_os("MITOSIS_SERVICE").is_some_and(|v| v == "1"),
+                router: ctx.config().router.then(|| ctx.router().status.clone()),
             })
         }
         Request::Usage => Response::Usage(crate::budget::usage(&ctx).await?),

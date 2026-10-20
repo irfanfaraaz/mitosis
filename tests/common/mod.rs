@@ -39,8 +39,12 @@ impl TestEnv {
         });
         let slice = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 250;
         let lo = 55_000 + slice * 20;
+        // No router runs for an in-process ctx, so `url` is the direct URL; tests that start a
+        // daemon with the router on get this slice's own router port.
         let config = Config {
             port_range: lo..=lo + 19,
+            router: false,
+            router_port: 60_000 + slice,
             ..Config::default()
         };
         let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), config).expect("open ctx");

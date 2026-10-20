@@ -72,6 +72,9 @@ enum Cmd {
         id_or_name: String,
         #[arg(long, default_value = "DATABASE_URL")]
         var: String,
+        /// Print the URL straight to the clone's port instead of the router URL.
+        #[arg(long)]
+        direct: bool,
     },
     /// List clones.
     List {
@@ -511,7 +514,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{}", info.url);
             }
         }
-        Cmd::Env { id_or_name, var } => {
+        Cmd::Env {
+            id_or_name,
+            var,
+            direct,
+        } => {
             let clones = match client::request(&home, Request::CloneList).await? {
                 Response::Clones { clones } => clones,
                 other => return Err(unexpected(other)),
@@ -526,7 +533,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     )
                     .with_hint("see running clones with `mitosis list`")
                 })?;
-            println!("{var}={}", c.url);
+            println!("{var}={}", if direct { &c.direct_url } else { &c.url });
         }
         Cmd::List { json } => {
             let clones = match client::request(&home, Request::CloneList).await? {
@@ -704,6 +711,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 Some(other) => return Err(unexpected(other)),
             }
         }
+                match &s.router {
+                    None => println!("router    off"),
+                    Some(r) if r.listening => println!("router    listening on port {}", r.port),
+                    Some(r) => {
+                        println!("router    not listening on port {}", r.port);
+                        if let Some(e) = &r.error {
+                            eprintln!(
+                                "warning: router: {e}; it retries every minute (direct URLs still work: mitosis env <clone> --direct)"
+                            );
+                        }
+                    }
+                }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1034,6 +1053,7 @@ fn print_clones(clones: &[CloneInfo]) {
                         "never".into()
                     } else {
                         secs(c.expires_at - now)
+            "URL",
                     },
                     opt_bytes(c.rss_bytes),
                     opt_bytes(c.own_disk_bytes),
@@ -1048,6 +1068,8 @@ fn print_clones(clones: &[CloneInfo]) {
 fn flags(c: &CloneInfo) -> String {
     let mut f = Vec::new();
     if c.disk_warn {
+                    // The password stays out of the table; `mitosis env` prints the full URL.
+                    crate::templates::redact_url(&c.url),
         f.push("!");
     }
     if c.protected {

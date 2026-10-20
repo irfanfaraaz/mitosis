@@ -4,6 +4,7 @@ use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
 use crate::pg::{discover_with, find_major, newest, PgInstall};
 use crate::protocol::EventRow;
+use crate::router::RouterState;
 use crate::state::Store;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
@@ -49,6 +50,8 @@ pub struct Ctx {
     pub(crate) queued: AtomicUsize,
     /// Every event `events::emit` writes, for `mitosis events --follow` connections.
     pub events_tx: tokio::sync::broadcast::Sender<EventRow>,
+    /// Router connections, cancel keys and listener status; read through `router()`.
+    router: Mutex<RouterState>,
 }
 
 impl Ctx {
@@ -71,6 +74,7 @@ impl Ctx {
         }
         let store = Store::open(&home.state_db())?;
         let installs = discover_with(Some(&home));
+        let router = Mutex::new(RouterState::new(config.router_port));
         Ok(Ctx {
             home,
             config: RwLock::new(config),
@@ -87,6 +91,7 @@ impl Ctx {
             admission: Arc::new(tokio::sync::Mutex::new(())),
             queued: AtomicUsize::new(0),
             events_tx: tokio::sync::broadcast::channel(EVENT_CHANNEL).0,
+            router,
         })
     }
 
@@ -134,6 +139,11 @@ impl Ctx {
         }
         self.rediscover().await;
         newest(&self.installs()).cloned()
+    }
+
+    /// Locks the router state; never hold it across an await or a store call.
+    pub fn router(&self) -> MutexGuard<'_, RouterState> {
+        self.router.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Locks the store; use it for one store call at a time, never across Postgres work.
