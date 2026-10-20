@@ -5,15 +5,19 @@ use mitosis::clones::create;
 use mitosis::error::ErrorCode;
 use mitosis::names::random_hex;
 use mitosis::pg::{newest, psql};
-use mitosis::protocol::{CloneInfo, MigrateCmd, TemplateSetArgs, TemplateSettings};
+use mitosis::protocol::{
+    CloneInfo, GenKind, MigrateCmd, RefreshMode, TemplateSetArgs, TemplateSettings,
+};
+use mitosis::scheduler;
+use mitosis::state::GenerationRow;
 use mitosis::templates::{self, layered, refresh};
 use std::path::{Path, PathBuf};
 
 const USERS: &str = "create table users(id int primary key, email text not null, \
-     full_name varchar(80), phone text, ssn text, notes text, plan text, age int); \
+     full_name varchar(80), phone text, ssn text, notes text, plan text, age int, alt char(40)); \
      insert into users values \
-     (1, 'alice@example.com', 'Alice Smith', '555-1234', '123-45-6789', 'secret', 'pro', 30), \
-     (2, 'bob@example.com', null, null, null, null, null, 40)";
+     (1, 'alice@example.com', 'Alice Smith', '555-1234', '123-45-6789', 'secret', 'pro', 30, 'alice@work.example'), \
+     (2, 'bob@example.com', null, null, null, null, null, 40, null)";
 
 const USERS_MASK: &str = r#"
 [tables.users]
@@ -24,6 +28,7 @@ ssn = "hash"
 notes = "redact"
 plan = "const:free"
 age = "keep"
+alt = "email"
 "#;
 
 fn write_mask(env: &TestEnv, text: &str) -> PathBuf {
@@ -159,7 +164,8 @@ async fn mask_each_strategy() {
 async fn mask_is_idempotent_and_consistent() {
     let Some(env) = TestEnv::new() else { return };
     masked(&env, USERS, USERS_MASK).await.unwrap();
-    let all = "select email, full_name, ssn, notes, plan from users order by id";
+    // `alt` is char(40): a re-run must recognise its padded masked value and leave it.
+    let all = "select email, full_name, ssn, notes, plan, alt from users order by id";
     let first = q(&env, &clone(&env).await, all);
     // A second full build, from the raw source again, gives the same masked values.
     assert_eq!(
@@ -175,7 +181,7 @@ async fn mask_is_idempotent_and_consistent() {
         TemplateSettings {
             migrate: Some(psql_migrate(
                 &env,
-                "insert into users values (3, 'carol@example.com', 'Carol Jones', '1', '2', 'abc', 'pro', 50)",
+                "insert into users values (3, 'carol@example.com', 'Carol Jones', '1', '2', 'abc', 'pro', 50, 'c@x.example')",
             )),
             ..Default::default()
         },
@@ -220,6 +226,75 @@ async fn layered_refuses_a_generation_built_unmasked() {
     let e = layered(&env.ctx, "main", None).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidRequest);
     assert!(e.hint.unwrap().contains("template refresh"));
+
+    // Built masked, then the file changes (a newly masked column): a layered copy would keep
+    // that column's raw values in its pages, so only a full build may follow.
+    refresh(&env.ctx, "main", None).await.unwrap();
+    layered(&env.ctx, "main", None).await.unwrap();
+    write_mask(
+        &env,
+        &USERS_MASK.replace("age = \"keep\"", "age = \"null\""),
+    );
+    let e = layered(&env.ctx, "main", None).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(
+        e.hint.unwrap().contains("template refresh"),
+        "{}",
+        e.message
+    );
+}
+
+#[tokio::test]
+async fn scheduled_layered_refresh_after_a_mask_change_builds_full() {
+    let Some(env) = TestEnv::new() else { return };
+    masked(&env, USERS, USERS_MASK).await.unwrap();
+    set(
+        &env,
+        TemplateSettings {
+            migrate: Some(psql_migrate(&env, "select 1")),
+            every_secs: Some(60),
+            every_mode: Some(RefreshMode::Layered),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_mask(
+        &env,
+        &USERS_MASK.replace("age = \"keep\"", "age = \"null\""),
+    );
+    // Make the schedule due: generation 1 built two minutes ago (rows only).
+    {
+        let store = env.ctx.store();
+        let g = store.get_generation("main", 1).unwrap().unwrap();
+        store.delete_generation("main", 1).unwrap();
+        store
+            .insert_generation(&GenerationRow {
+                built_at: g.built_at - 120,
+                ..g
+            })
+            .unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    scheduler::tick(&env.ctx, now).await;
+    // The background build records its attempt as it finishes.
+    for _ in 0..600 {
+        let t = env.ctx.store().get_template("main").unwrap().unwrap();
+        if t.last_attempt_at.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let history = templates::history(&env.ctx, "main").unwrap();
+    let g2 = history.iter().find(|g| g.gen == 2).expect("generation 2");
+    assert_eq!(g2.kind, GenKind::Full);
+    let t = templates::list(&env.ctx).unwrap().remove(0);
+    assert!(t.last_error.is_none(), "{:?}", t.last_error);
+    assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+    let c = clone(&env).await;
+    assert_eq!(q(&env, &c, "select count(age) from users"), "0");
 }
 
 #[tokio::test]

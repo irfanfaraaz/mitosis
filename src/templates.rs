@@ -107,7 +107,17 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
     preview.migrations = args.migrations.clone();
     preview.source = args.source.clone();
     apply_settings(&mut preview, None, &args.settings)?;
+    check_mask_file(&args.settings)?;
     build(ctx, args).await
+}
+
+/// A masking file given in a request must load. Checked at request time only: the settings
+/// written after a build never fail on a file edited meanwhile.
+fn check_mask_file(s: &TemplateSettings) -> Result<()> {
+    match &s.mask {
+        Some(p) => MaskFile::load(p).map(drop),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn not_found(name: &str) -> MitosisError {
@@ -161,6 +171,7 @@ fn refresh_args(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateI
 /// Changes the settings of `name`; `resume` clears `paused`.
 pub fn set(ctx: &Ctx, args: TemplateSetArgs) -> Result<TemplateInfo> {
     validate_name("template", &args.name)?;
+    check_mask_file(&args.settings)?;
     {
         let store = ctx.store();
         let mut t = store
@@ -189,9 +200,6 @@ fn apply_settings(
     }
     if s.mask.is_some() && s.mask_off {
         return Err(invalid("set --mask to a file or to off, not both"));
-    }
-    if let Some(p) = &s.mask {
-        MaskFile::load(p)?;
     }
     if s.keep == Some(0) {
         return Err(invalid("--keep must be at least 1"));
@@ -728,6 +736,16 @@ pub(crate) fn is_building(ctx: &Ctx, name: &str) -> bool {
         .contains(name)
 }
 
+/// True when `name` has a masking file its current generation was not built with (or that
+/// cannot be read): only a full build may make its next generation.
+fn mask_stale(ctx: &Ctx, name: &str) -> Result<bool> {
+    let Some((t, cur)) = ctx.store().current(name)? else {
+        return Ok(false);
+    };
+    Ok(t.mask_path
+        .is_some_and(|p| MaskFile::hash(&p).ok() != cur.mask_hash))
+}
+
 /// A scheduled or stale-triggered build of `name` in `mode`. The caller took the build slot with
 /// `claim_build`; it is released when this returns. Never clears `paused`. The outcome is stored
 /// before the slot is released, so no new attempt can start without seeing it: `last_attempt_at`
@@ -739,6 +757,12 @@ pub(crate) async fn background(ctx: &Ctx, name: &str, mode: RefreshMode) {
         name: name.to_string(),
     };
     let started = now();
+    // A layered build would be refused while the masking file is newer than the current
+    // generation; an automatic build does the full build that re-bases it instead.
+    let mode = match mode {
+        RefreshMode::Layered if mask_stale(ctx, name).unwrap_or(false) => RefreshMode::Full,
+        m => m,
+    };
     let res = match mode {
         RefreshMode::Full => match refresh_args(ctx, name, None) {
             Ok(args) => build_held(ctx, args, false).await,
@@ -1575,22 +1599,27 @@ async fn layered_held(
         );
     };
     migrate.path = path.or(migrate.path);
-    // Masking in place covers only what the migration adds; the copied rows must be masked already.
-    if let (Some(p), None) = (&t.mask_path, &cur.mask_hash) {
-        return Err(invalid(format!(
-            "template {name} has the masking file {} but its current generation was not built masked",
-            p.display()
-        ))
-        .with_hint(format!(
-            "run a full build first: mitosis template refresh {name}"
-        )));
-    }
+    // Masking in place covers only what the migration adds: the copied pages must already be
+    // masked with this very file, or raw values of newly masked columns would stay in them.
     let masking = match t.mask_path.as_deref() {
-        Some(p) => Some(Masking {
-            file: MaskFile::load(p)?,
-            hash: MaskFile::hash(p)?,
-            salt: ctx.store().ensure_mask_salt(name, &random_hex(32))?,
-        }),
+        Some(p) => {
+            let hash = MaskFile::hash(p)?;
+            if cur.mask_hash.as_deref() != Some(hash.as_str()) {
+                return Err(invalid(format!(
+                    "the current generation of template {name} was not built with the masking \
+                     file {} as it is now",
+                    p.display()
+                ))
+                .with_hint(format!(
+                    "run a full build first: mitosis template refresh {name}"
+                )));
+            }
+            Some(Masking {
+                file: MaskFile::load(p)?,
+                hash,
+                salt: ctx.store().ensure_mask_salt(name, &random_hex(32))?,
+            })
+        }
         None => None,
     };
     let install = ctx.install_major(cur.pg_major).await?;
@@ -1740,9 +1769,10 @@ async fn build_gen(
     let build_dir = ctx.home.templates_dir().join(build_dir_name(name, ts));
     let mut opts = build_start_options(ctx, name)?;
     let log = opts.log_file.clone();
+    let staging = masking.map(|_| Staging::new(ctx, install, name, &build_dir));
 
-    let result = match masking {
-        None => {
+    let result = match (masking, &staging) {
+        (None, _) | (_, None) => {
             run_steps(
                 ctx,
                 install,
@@ -1754,12 +1784,9 @@ async fn build_gen(
             )
             .await
         }
-        Some(m) => {
+        (Some(m), Some(st)) => {
             let source = &args.source;
-            masked_steps(
-                ctx, install, name, &build_dir, &mut opts, database, source, m,
-            )
-            .await
+            masked_steps(ctx, install, st, &build_dir, &mut opts, database, source, m).await
         }
     };
     let result = match result {
@@ -1771,6 +1798,10 @@ async fn build_gen(
             Err(if bad_request { e } else { failed })
         }
     };
+    // Removed only now, so `fail` read the log tail before the staging server's shutdown lines.
+    if let Some(st) = staging {
+        st.remove(&log).await;
+    }
     let _ = std::fs::remove_dir(&opts.socket_dir); // empty once the server is stopped
     let row = GenerationRow {
         template: name.clone(),
@@ -1846,9 +1877,13 @@ async fn apply_mask(
     if statements.is_empty() {
         return Ok(());
     }
-    // The statements hold the salt: a failing one must not be copied into the server log.
+    // Only the `SET LOCAL` of the salt holds it. Nothing may echo statement text: no statement
+    // logging (whatever the cluster's settings say), no failing statement in the server log, no
+    // `LINE` excerpt from psql, no utility tracking by pg_stat_statements.
     let sql = format!(
-        "SET log_min_error_statement = panic;\nBEGIN;\nSET LOCAL session_replication_role = replica;\n{};\nCOMMIT;\n",
+        "\\set VERBOSITY terse\nSET log_statement = 'none';\nSET log_min_duration_statement = -1;\n\
+         SET log_min_error_statement = panic;\nSET pg_stat_statements.track_utility = off;\n\
+         BEGIN;\nSET LOCAL session_replication_role = replica;\n{};\nCOMMIT;\n",
         statements.join(";\n")
     );
     run_psql(install, opts, database, sql).await.map(drop)
@@ -1914,14 +1949,16 @@ async fn mask_and_dump(
             &g,
             &[&globals_args[..], &[globals.as_os_str()]].concat(),
         )?;
-        let dump_args = ["-Fc", "-d", &db, "-f"].map(OsStr::new);
-        run_tool(
-            &i,
-            "pg_dump",
-            &o,
-            &g,
-            &[&dump_args[..], &[dump.as_os_str()]].concat(),
-        )
+        // --create: the database's owner, settings and grants come along. No statistics: they
+        // are computed from the raw data (pg_dump 18 is the first to know the flag).
+        let mut dump_args = vec!["-Fc", "--create"];
+        if i.major >= 18 {
+            dump_args.push("--no-statistics");
+        }
+        dump_args.extend(["-d", &db, "-f"]);
+        let mut dump_args: Vec<&OsStr> = dump_args.into_iter().map(OsStr::new).collect();
+        dump_args.push(dump.as_os_str());
+        run_tool(&i, "pg_dump", &o, &g, &dump_args)
     })
     .await
     .map_err(at("dump"))
@@ -1953,21 +1990,20 @@ async fn restore_steps(
     run_psql(install, opts, "postgres", globals)
         .await
         .map_err(at("roles"))?;
-    if database != "postgres" {
-        let sql = format!("CREATE DATABASE {}", quote_ident(database));
-        run_psql(install, opts, "postgres", sql)
-            .await
-            .map_err(at("create database"))?;
-    }
-    let (i, o, db, f, g) = (
+    let (i, o, f, g) = (
         install.clone(),
         opts.clone(),
-        database.to_string(),
         staging.join(DUMP_FILE),
         ctx.build_groups.clone(),
     );
+    // -C makes the database from the dump (owner, settings, grants); `postgres` exists already.
+    let create = database != "postgres";
     blocking(move || {
-        let args = [OsStr::new("-d"), OsStr::new(&db), f.as_os_str()];
+        let mut args = vec![OsStr::new("-d"), OsStr::new("postgres")];
+        if create {
+            args.push(OsStr::new("-C"));
+        }
+        args.push(f.as_os_str());
         run_tool(&i, "pg_restore", &o, &g, &args)
     })
     .await
@@ -1992,6 +2028,24 @@ struct Staging {
 }
 
 impl Staging {
+    /// A staging folder of template `name` next to its build folder `build_dir`.
+    fn new(ctx: &Ctx, install: &PgInstall, name: &str, build_dir: &Path) -> Staging {
+        let mut ts = now();
+        let dir = loop {
+            let d = ctx.home.templates_dir().join(build_dir_name(name, ts));
+            if d != build_dir && !d.exists() {
+                break d;
+            }
+            ts += 1;
+        };
+        Staging {
+            install: install.clone(),
+            dir,
+            timeout: ctx.config().stop_timeout,
+            removed: false,
+        }
+    }
+
     async fn remove(mut self, log: &Path) {
         self.removed = true;
         let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
@@ -2019,40 +2073,21 @@ impl Drop for Staging {
 /// The two-stage build: the source is built into a staging cluster, subset and masked there,
 /// and only a dump of the result is restored into a fresh cluster in `build_dir`, so the
 /// generation's data files and WAL never hold raw values.
+/// The caller removes `staging` afterwards, on every path.
 #[allow(clippy::too_many_arguments)]
 async fn masked_steps(
     ctx: &Ctx,
     install: &PgInstall,
-    name: &str,
+    staging: &Staging,
     build_dir: &Path,
     opts: &mut StartOptions,
     database: &str,
     source: &TemplateSource,
     m: &Masking,
 ) -> StepResult<Vec<String>> {
-    let mut ts = now();
-    let dir = loop {
-        let d = ctx.home.templates_dir().join(build_dir_name(name, ts));
-        if d != build_dir && !d.exists() {
-            break d;
-        }
-        ts += 1;
-    };
-    let staging = Staging {
-        install: install.clone(),
-        dir,
-        timeout: ctx.config().stop_timeout,
-        removed: false,
-    };
-    let result = async {
-        let extensions =
-            run_steps(ctx, install, &staging.dir, opts, database, source, Some(m)).await?;
-        restore_steps(ctx, install, build_dir, opts, database, &staging.dir).await?;
-        Ok(extensions)
-    }
-    .await;
-    staging.remove(&opts.log_file).await;
-    result
+    let extensions = run_steps(ctx, install, &staging.dir, opts, database, source, Some(m)).await?;
+    restore_steps(ctx, install, build_dir, opts, database, &staging.dir).await?;
+    Ok(extensions)
 }
 
 /// Step 7: measures the built side folder `row.dir` (filling `pg_major` and `size_bytes`), then

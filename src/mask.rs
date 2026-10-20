@@ -55,6 +55,9 @@ pub struct ForeignKey {
     pub parent_cols: Vec<String>,
 }
 
+/// The temp table that holds one sampled table's row ids while its other rows are deleted.
+const SAMPLE_TABLE: &str = "mitosis_sample";
+
 /// Foreign-key cleanup passes after a subset before the build gives up.
 const MAX_PASSES: u32 = 100;
 
@@ -115,7 +118,14 @@ impl MaskFile {
                         let mut out = BTreeMap::new();
                         for (c, s) in cols {
                             let s = s.as_str().ok_or_else(|| {
-                                invalid(format!("tables.{t}.{c} must be a string"))
+                                if s.is_table() {
+                                    invalid(format!(
+                                        "tables.{t}.{c} must be a string; for a schema-qualified \
+                                         table, quote the key: [tables.\"{t}.{c}\"]"
+                                    ))
+                                } else {
+                                    invalid(format!("tables.{t}.{c} must be a string"))
+                                }
                             })?;
                             let strategy = parse_strategy(s).ok_or_else(|| {
                                 invalid(format!(
@@ -133,9 +143,16 @@ impl MaskFile {
                         invalid("subset must be a table of table = \"filter or percent\"")
                     })?;
                     for (t, s) in rules {
-                        let s = s
-                            .as_str()
-                            .ok_or_else(|| invalid(format!("subset.{t} must be a string")))?;
+                        let s = s.as_str().ok_or_else(|| {
+                            if s.is_table() {
+                                invalid(format!(
+                                    "subset.{t} must be a string; for a schema-qualified table, \
+                                     quote the key: \"{t}.<table>\" = \"...\""
+                                ))
+                            } else {
+                                invalid(format!("subset.{t} must be a string"))
+                            }
+                        })?;
                         m.subset.insert(t.clone(), parse_subset(t, s)?);
                     }
                 }
@@ -210,12 +227,12 @@ fn strategy_name(s: &Strategy) -> &'static str {
 }
 
 /// For one masked column: the condition under which a row still needs masking (NULL for a NULL
-/// value, so NULLs stay NULL) and the new value. `None` for `keep`.
+/// value, so NULLs stay NULL) and the new value. `None` for `keep`. The checks compare `col::text`,
+/// which drops a `char(n)` column's padding, so a masked value is recognised there too.
 fn column_sql(
     table: &str,
     info: &ColumnInfo,
     strategy: &Strategy,
-    salt_hex: &str,
 ) -> Result<Option<(String, String)>> {
     let c = quote_ident(&info.column);
     let name = format!("{table}.{}", info.column);
@@ -230,21 +247,26 @@ fn column_sql(
             strategy_name(strategy)
         )));
     }
-    let h =
-        format!("encode(sha256(decode('{salt_hex}','hex') || convert_to({c}::text,'UTF8')),'hex')");
+    // The salt comes from a setting, so it never appears in the statement text.
+    let h = format!(
+        "encode(sha256(decode(current_setting('{SALT_SETTING}'),'hex') || convert_to({c}::text,'UTF8')),'hex')"
+    );
     Ok(Some(match strategy {
         Strategy::Keep => return Ok(None),
         Strategy::Email => (
-            format!("{c} NOT LIKE '%@masked.invalid'"),
+            format!("{c}::text NOT LIKE '%@masked.invalid'"),
             format!("'u_' || left({h},12) || '@masked.invalid'"),
         ),
         Strategy::Name => (
-            format!("{c} NOT LIKE 'Masked %'"),
+            format!("{c}::text NOT LIKE 'Masked %'"),
             format!("'Masked ' || left({h},8)"),
         ),
-        Strategy::Hash => (format!("{c} NOT LIKE 'mh\\_%'"), format!("'mh_' || {h}")),
+        Strategy::Hash => (
+            format!("{c}::text NOT LIKE 'mh\\_%'"),
+            format!("'mh_' || {h}"),
+        ),
         Strategy::Redact => (
-            format!("{c} <> repeat('x', length({c}))"),
+            format!("{c}::text <> repeat('x', length({c}))"),
             format!("repeat('x', length({c}))"),
         ),
         Strategy::Null => {
@@ -262,9 +284,14 @@ fn column_sql(
     }))
 }
 
-/// One `UPDATE` per masked table, setting all its masked columns; rows already masked are left
-/// alone, so running the statements twice changes nothing. Unknown tables or columns, and
-/// strategies that do not fit the column, are errors naming the column.
+/// The setting the masking statements read the salt from.
+const SALT_SETTING: &str = "mitosis.salt";
+
+/// `SET LOCAL mitosis.salt`, then one `UPDATE` per masked table, setting all its masked columns
+/// (empty when nothing is masked). Only the `SET` holds the salt; it must run in the same
+/// transaction as the updates. Rows already masked are left alone, so running the statements
+/// twice changes nothing. Unknown tables or columns, and strategies that do not fit the column,
+/// are errors naming the column.
 pub fn mask_statements(
     m: &MaskFile,
     salt_hex: &str,
@@ -292,7 +319,7 @@ pub fn mask_statements(
                 .iter()
                 .find(|c| c.column == *col)
                 .ok_or_else(|| invalid(format!("masked column {table}.{col} does not exist")))?;
-            let Some((need, value)) = column_sql(table, info, strategy, salt_hex)? else {
+            let Some((need, value)) = column_sql(table, info, strategy)? else {
                 continue;
             };
             let c = quote_ident(col);
@@ -308,6 +335,9 @@ pub fn mask_statements(
             ));
         }
     }
+    if !out.is_empty() {
+        out.insert(0, format!("SET LOCAL {SALT_SETTING} = '{salt_hex}'"));
+    }
     Ok(out)
 }
 
@@ -317,17 +347,30 @@ pub fn mask_statements(
 pub fn subset_statements(m: &MaskFile, fks: &[ForeignKey]) -> Result<Vec<String>> {
     let mut out = Vec::new();
     if m.subset.is_empty() {
-        return Ok(out);
+        return Ok(Vec::new());
     }
     for (table, rule) in &m.subset {
         let t = qualified(table);
         out.push(match rule {
-            SubsetRule::Where(w) => format!("DELETE FROM {t} WHERE NOT ({w})"),
-            SubsetRule::Sample(p) => format!(
-                "DELETE FROM {t} WHERE ctid NOT IN (SELECT ctid FROM {t} TABLESAMPLE SYSTEM ({p}))"
-            ),
+            SubsetRule::Where(w) => vec![format!("DELETE FROM {t} WHERE ({w}) IS NOT TRUE")],
+            // The sampled row ids go into a temp table and the delete is an anti-join against
+            // it, which hashes or merges (and spills to disk) instead of rescanning per row.
+            // `tableoid` keeps partitions apart: their ctids repeat.
+            SubsetRule::Sample(p) => vec![
+                format!(
+                    "CREATE TEMP TABLE {SAMPLE_TABLE} AS \
+                     SELECT tableoid AS o, ctid AS k FROM {t} TABLESAMPLE SYSTEM ({p})"
+                ),
+                format!("ANALYZE {SAMPLE_TABLE}"),
+                format!(
+                    "DELETE FROM {t} AS x WHERE NOT EXISTS \
+                     (SELECT 1 FROM {SAMPLE_TABLE} s WHERE s.o = x.tableoid AND s.k = x.ctid)"
+                ),
+                format!("DROP TABLE {SAMPLE_TABLE}"),
+            ],
         });
     }
+    let mut out: Vec<String> = out.into_iter().flatten().collect();
     if fks.is_empty() {
         return Ok(out);
     }
@@ -436,6 +479,11 @@ events = "10%"          # TABLESAMPLE SYSTEM
         assert!(msg("[subset]\norders = \"\"").contains("subset.orders"));
         assert!(msg("[subset]\norders = 1").contains("subset.orders"));
         assert!(msg("[mask]\nx = 1").contains("unknown key mask"));
+        // An unquoted dotted table key gets a hint to quote it.
+        assert!(
+            msg("[tables.billing.cards]\nnumber = \"keep\"").contains("[tables.\"billing.cards\"]")
+        );
+        assert!(msg("[subset]\nbilling.cards = \"1%\"").contains("quote the key"));
         // A syntax error names the line.
         assert!(
             msg("[tables.users]\nemail = \n").contains("line 2"),
@@ -464,17 +512,22 @@ events = "10%"          # TABLESAMPLE SYSTEM
     fn statements_skip_already_masked() {
         let m = MaskFile::parse(EXAMPLE).unwrap();
         let sql = mask_statements(&m, "00ff", &users()).unwrap();
-        assert_eq!(sql.len(), 1, "one UPDATE per table");
-        let s = &sql[0];
+        assert_eq!(sql.len(), 2, "the salt, then one UPDATE per table");
+        assert_eq!(sql[0], "SET LOCAL mitosis.salt = '00ff'");
+        let s = &sql[1];
+        assert!(!s.contains("00ff"), "the salt stays out of the UPDATE: {s}");
         assert!(s.starts_with("UPDATE \"public\".\"users\" SET "), "{s}");
-        assert!(s.contains("\"email\" NOT LIKE '%@masked.invalid'"), "{s}");
-        assert!(s.contains("'u_' || left(encode(sha256(decode('00ff','hex') || convert_to(\"email\"::text,'UTF8')),'hex'),12) || '@masked.invalid'"), "{s}");
-        assert!(s.contains("\"full_name\" NOT LIKE 'Masked %'"), "{s}");
+        assert!(
+            s.contains("\"email\"::text NOT LIKE '%@masked.invalid'"),
+            "{s}"
+        );
+        assert!(s.contains("'u_' || left(encode(sha256(decode(current_setting('mitosis.salt'),'hex') || convert_to(\"email\"::text,'UTF8')),'hex'),12) || '@masked.invalid'"), "{s}");
+        assert!(s.contains("\"full_name\"::text NOT LIKE 'Masked %'"), "{s}");
         assert!(s.contains("'Masked ' || left(encode("), "{s}");
-        assert!(s.contains("\"ssn\" NOT LIKE 'mh\\_%'"), "{s}");
+        assert!(s.contains("\"ssn\"::text NOT LIKE 'mh\\_%'"), "{s}");
         assert!(s.contains("'mh_' || encode("), "{s}");
         assert!(
-            s.contains("\"notes\" <> repeat('x', length(\"notes\"))"),
+            s.contains("\"notes\"::text <> repeat('x', length(\"notes\"))"),
             "{s}"
         );
         assert!(
@@ -482,10 +535,25 @@ events = "10%"          # TABLESAMPLE SYSTEM
             "{s}"
         );
         assert!(s.contains("'free'::text"), "{s}");
-        assert!(s.contains(" WHERE (\"email\" NOT LIKE"), "{s}");
+        assert!(s.contains(" WHERE (\"email\"::text NOT LIKE"), "{s}");
 
         let keep = MaskFile::parse("[tables.users]\nemail = \"keep\"").unwrap();
         assert!(mask_statements(&keep, "00", &users()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn email_rerun_on_char_column_matches_the_unpadded_value() {
+        // A char(40) value is padded with spaces; LIKE on the column itself would see them and
+        // mask an already-masked value again on every layered build.
+        let cols = vec![col("users", "alt", "character(40)", false)];
+        let m = MaskFile::parse("[tables.users]\nalt = \"email\"").unwrap();
+        let sql = mask_statements(&m, "00", &cols).unwrap();
+        assert!(
+            sql[1].contains("WHEN \"alt\"::text NOT LIKE '%@masked.invalid' THEN"),
+            "{}",
+            sql[1]
+        );
+        assert!(sql[1].contains("WHERE (\"alt\"::text NOT LIKE '%@masked.invalid')"));
     }
 
     #[test]
@@ -513,13 +581,16 @@ events = "10%"          # TABLESAMPLE SYSTEM
             parent_cols: vec!["\"id\"".into()],
         }];
         let sql = subset_statements(&m, &fks).unwrap();
-        assert_eq!(sql[0], "DELETE FROM \"public\".\"events\" WHERE ctid NOT IN (SELECT ctid FROM \"public\".\"events\" TABLESAMPLE SYSTEM (10))");
+        assert_eq!(sql[0], "CREATE TEMP TABLE mitosis_sample AS SELECT tableoid AS o, ctid AS k FROM \"public\".\"events\" TABLESAMPLE SYSTEM (10)");
+        assert_eq!(sql[1], "ANALYZE mitosis_sample");
+        assert_eq!(sql[2], "DELETE FROM \"public\".\"events\" AS x WHERE NOT EXISTS (SELECT 1 FROM mitosis_sample s WHERE s.o = x.tableoid AND s.k = x.ctid)");
+        assert_eq!(sql[3], "DROP TABLE mitosis_sample");
         assert_eq!(
-            sql[1],
-            "DELETE FROM \"public\".\"orders\" WHERE NOT (created_at > now() - interval '90 days')"
+            sql[4],
+            "DELETE FROM \"public\".\"orders\" WHERE (created_at > now() - interval '90 days') IS NOT TRUE"
         );
-        assert!(sql[2].contains("DELETE FROM \"public\".\"order_items\" AS c WHERE (c.\"order_id\") IS NOT NULL AND NOT EXISTS (SELECT 1 FROM \"public\".\"orders\" AS p WHERE p.\"id\" = c.\"order_id\")"), "{}", sql[2]);
-        assert!(sql[2].contains("passes >= 100"));
+        assert!(sql[5].contains("DELETE FROM \"public\".\"order_items\" AS c WHERE (c.\"order_id\") IS NOT NULL AND NOT EXISTS (SELECT 1 FROM \"public\".\"orders\" AS p WHERE p.\"id\" = c.\"order_id\")"), "{}", sql[5]);
+        assert!(sql[5].contains("passes >= 100"));
         assert!(subset_statements(&MaskFile::default(), &fks)
             .unwrap()
             .is_empty());
