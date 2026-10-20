@@ -41,13 +41,14 @@ pub mod reason {
     pub const FAILED: &str = "failed";
 }
 
-/// Writes the event and sends it to the followers. A failure is logged and never reaches the
-/// caller. Do not call it while holding the store lock.
+/// Writes the event, then wakes the followers (they read the row from the store, so the order
+/// of these wake-ups does not matter). A failure is logged and never reaches the caller. Do not
+/// call it while holding the store lock.
 pub fn emit(ctx: &Ctx, kind: &str, clone: Option<&str>, template: Option<&str>, detail: Value) {
     let written = ctx.store().add_event(kind, clone, template, &detail);
     match written {
         Ok(row) => {
-            // No follower is not an error.
+            // The payload is only a wake-up. No follower is not an error.
             let _ = ctx.events_tx.send(row);
         }
         Err(e) => crate::lifecycle::log(ctx, &format!("event {kind} not recorded: {e}")),

@@ -270,6 +270,13 @@ async fn list_events(ctx: &Arc<Ctx>, filter: EventFilter) -> Result<Vec<EventRow
         .map_err(|e| internal(format!("background task failed: {e}")))?
 }
 
+async fn events_after(ctx: &Arc<Ctx>, after: i64, filter: &EventFilter) -> Result<Vec<EventRow>> {
+    let (ctx, filter) = (ctx.clone(), filter.clone());
+    tokio::task::spawn_blocking(move || ctx.store().list_events_after(after, &filter))
+        .await
+        .map_err(|e| internal(format!("background task failed: {e}")))?
+}
+
 /// Writes one reply line; false when the client is gone.
 async fn send(wr: &mut OwnedWriteHalf, result: Result<Response>) -> bool {
     let Ok(mut out) = serde_json::to_vec(&ResponseEnvelope {
@@ -282,16 +289,19 @@ async fn send(wr: &mut OwnedWriteHalf, result: Result<Response>) -> bool {
     wr.write_all(&out).await.is_ok() && wr.flush().await.is_ok()
 }
 
-/// `Events` with `follow`: the latest matching events, then each new one as it happens, until the
-/// client hangs up or the daemon stops. It holds no work token, so a shutdown never waits for it.
+/// `Events` with `follow`: the latest matching events, then each new one, until the client hangs
+/// up or the daemon stops. The store is the source of truth: the broadcast channel only wakes the
+/// follower (a late, early or missed broadcast changes nothing), and each wake sends every stored
+/// matching row after the last one sent, in id order. It holds no work token, and it ends when the
+/// daemon's shutdown flag turns true, so it never holds a shutdown up.
 async fn follow_events(
     shared: &Shared,
     mut filter: EventFilter,
     rd: &mut BufReader<OwnedReadHalf>,
     wr: &mut OwnedWriteHalf,
 ) {
-    // Subscribed before the backlog is read, so no event falls between the two.
-    let mut live = shared.ctx.events_tx.subscribe();
+    // Subscribed before the backlog is read, so a wake cannot fall between the two.
+    let mut wake = shared.ctx.events_tx.subscribe();
     let mut shutdown = shared.shutdown.subscribe();
     filter.limit.get_or_insert(EVENTS_FOLLOW_BACKLOG);
     let events = match list_events(&shared.ctx, filter.clone()).await {
@@ -301,6 +311,7 @@ async fn follow_events(
             return;
         }
     };
+    // With no backlog, no matching row exists yet, so reading from id 0 sends only new ones.
     let mut last = events.last().map_or(0, |e| e.id);
     if !send(wr, Ok(Response::Events { events })).await {
         return;
@@ -309,23 +320,31 @@ async fn follow_events(
     while !*shutdown.borrow() {
         tokio::select! {
             _ = shutdown.changed() => return,
-            // Anything the client sends, or a hang-up, ends the stream; this only watches for it.
+            // Input from the client is ignored; only a hang-up ends the stream.
             filled = rd.fill_buf(), if watching => match filled {
                 Ok(b) if !b.is_empty() => watching = false,
                 _ => return,
             },
-            ev = live.recv() => match ev {
-                Ok(e) if e.id > last && crate::events::matches(&filter, &e) => {
-                    last = e.id;
-                    if !send(wr, Ok(Response::Event(e))).await {
+            woken = wake.recv() => {
+                if matches!(woken, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    return;
+                }
+                // Ok or Lagged alike: the rows are in the store.
+                match events_after(&shared.ctx, last, &filter).await {
+                    Ok(rows) => {
+                        for e in rows {
+                            last = e.id;
+                            if !send(wr, Ok(Response::Event(e))).await {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log(&shared.ctx.home, &format!("events follower: {e}"));
+                        send(wr, Err(e)).await;
                         return;
                     }
                 }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    log(&shared.ctx.home, &format!("events follower skipped {n} events"));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
         }
     }

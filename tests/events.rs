@@ -366,3 +366,74 @@ async fn follow_receives_new_event() {
     let mut rest = String::new();
     assert_eq!(follower.rd.read_line(&mut rest).await.unwrap(), 0);
 }
+
+/// The broadcast only wakes a follower; the rows come from the store. Two rows written without
+/// any broadcast (as a lagged or reordered delivery would leave them) still arrive, in id order,
+/// when the next event wakes the follower.
+#[tokio::test(flavor = "multi_thread")]
+async fn follow_reads_the_store_not_the_broadcast() {
+    let tmp = tmp_home();
+    let root = tmp.path();
+    let handle = tokio::spawn(daemon::run(
+        Home::at(root.to_path_buf()),
+        mitosis::ctx::Config::default(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while UnixStream::connect(root.join("daemon.sock")).await.is_err() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut follower = Conn::open(root).await;
+    follower
+        .send(Request::Events {
+            filter: EventFilter::default(),
+            follow: true,
+        })
+        .await;
+    let Response::Events { events } = follower.recv().await else {
+        panic!("the first reply is the past events")
+    };
+    let seen = events.last().map_or(0, |e| e.id);
+
+    // Written behind the daemon's back: its channel never carries them.
+    let store = mitosis::state::Store::open(&Home::at(root.to_path_buf()).state_db()).unwrap();
+    let a = store
+        .add_event("clone.slept", Some("a"), None, &serde_json::json!({}))
+        .unwrap();
+    let b = store
+        .add_event("clone.woke", Some("a"), None, &serde_json::json!({}))
+        .unwrap();
+    assert!(seen < a.id && a.id < b.id);
+
+    // Now an event through the daemon wakes the follower.
+    assert!(matches!(
+        Conn::open(root).await.call(Request::Gc).await,
+        Response::Gc(_)
+    ));
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let Response::Event(ev) = tokio::time::timeout(Duration::from_secs(5), follower.recv())
+            .await
+            .expect("no event within 5 s")
+        else {
+            panic!("the follower got something else")
+        };
+        got.push((ev.id, ev.kind));
+    }
+    assert_eq!(got[0], (a.id, "clone.slept".to_string()));
+    assert_eq!(got[1], (b.id, "clone.woke".to_string()));
+    assert_eq!(got[2].1, "gc");
+    assert!(got[2].0 > b.id);
+
+    assert!(matches!(
+        Conn::open(root).await.call(Request::Shutdown).await,
+        Response::Ok
+    ));
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut rest = String::new();
+    assert_eq!(follower.rd.read_line(&mut rest).await.unwrap(), 0);
+}

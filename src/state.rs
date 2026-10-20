@@ -815,11 +815,26 @@ impl Store {
 
     /// The events matching `f`, oldest first; with a limit, the newest `limit` of them.
     pub fn list_events(&self, f: &EventFilter) -> Result<Vec<EventRow>> {
+        self.query_events(0, f)
+    }
+
+    /// Every event with `id > after` that matches `f` (its `limit` is ignored), oldest first.
+    /// A follower reads the log with this, so it can neither lose nor reorder an event.
+    pub fn list_events_after(&self, after: i64, f: &EventFilter) -> Result<Vec<EventRow>> {
+        let all = EventFilter {
+            limit: None,
+            ..f.clone()
+        };
+        self.query_events(after, &all)
+    }
+
+    fn query_events(&self, after: i64, f: &EventFilter) -> Result<Vec<EventRow>> {
         // A clone filter matches the name or id column, or the id kept in a named clone's detail.
         let mut stmt = self.conn.prepare(
             "SELECT id, ts, kind, clone, template, detail FROM (
                  SELECT id, ts, kind, clone, template, detail FROM events
-                 WHERE (?1 IS NULL OR clone = ?1 OR json_extract(detail, '$.id') = ?1)
+                 WHERE id > ?6
+                   AND (?1 IS NULL OR clone = ?1 OR json_extract(detail, '$.id') = ?1)
                    AND (?2 IS NULL OR template = ?2)
                    AND (?3 IS NULL OR kind = ?3 OR substr(kind, 1, length(?3) + 1) = ?3 || '.')
                    AND (?4 IS NULL OR ts >= ?4)
@@ -833,7 +848,8 @@ impl Store {
                     f.template,
                     f.kind,
                     f.since,
-                    f.limit.map_or(-1, i64::from)
+                    f.limit.map_or(-1, i64::from),
+                    after
                 ],
                 |r| {
                     Ok(EventRow {
