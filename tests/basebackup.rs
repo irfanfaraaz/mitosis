@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use mitosis::clones::create;
 use mitosis::error::ErrorCode;
-use mitosis::pg::{discover, initdb, make_standalone, newest};
+use mitosis::pg::{disable_preload_libraries, discover, initdb, make_standalone, newest};
 use mitosis::protocol::{CloneCreateArgs, TemplateSource};
 use mitosis::templates;
 use std::io::Write;
@@ -168,6 +168,7 @@ fn make_standalone_cleans_files() {
     .unwrap();
     std::fs::write(d.join("postgresql.auto.conf"), "primary_conninfo = 'x'\n").unwrap();
     std::fs::write(d.join("postgresql.conf"), "shared_buffers = 1GB\n").unwrap();
+    std::fs::write(d.join("pg_ident.conf"), "").unwrap();
 
     let warnings = make_standalone(d).unwrap();
 
@@ -203,4 +204,90 @@ fn make_standalone_cleans_files() {
     };
     let real_hba = std::fs::read_to_string(real.join("pg_hba.conf")).unwrap();
     assert_eq!(words(&hba), words(&real_hba));
+}
+
+#[test]
+fn make_standalone_without_conf_files_writes_defaults() {
+    // The Debian layout: pg_basebackup copies only the data folder, which then has neither
+    // postgresql.conf nor pg_ident.conf.
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+
+    let warnings = make_standalone(d).unwrap();
+
+    assert!(
+        warnings.iter().any(|w| w.contains("postgresql.conf")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("pg_ident.conf")),
+        "{warnings:?}"
+    );
+    for f in ["postgresql.conf", "pg_ident.conf", "pg_hba.conf"] {
+        assert!(d.join(f).is_file(), "{f} should exist");
+    }
+    // Nothing to disable, and no file needed for that.
+    let tmp2 = tempfile::tempdir().unwrap();
+    assert!(disable_preload_libraries(tmp2.path()).unwrap().is_empty());
+}
+
+#[test]
+fn make_standalone_turns_off_archive_and_ssl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    std::fs::write(
+        d.join("postgresql.conf"),
+        "shared_buffers = 1GB\narchive_mode = on\nARCHIVE_COMMAND = 'aws s3 cp %p s3://wal/%f'\n\
+         ssl = on\nssl_cert_file = '/etc/ssl/pg.crt'\nrestore_command = 'cp /a/%f %p'\n\
+         primary_conninfo = 'host=prod'\nprimary_slot_name = 'slot'\nhba_file = '/etc/pg/hba'\n",
+    )
+    .unwrap();
+
+    let warnings = make_standalone(d).unwrap();
+
+    let conf = std::fs::read_to_string(d.join("postgresql.conf")).unwrap();
+    // The originals are commented out, not deleted.
+    for original in [
+        "#mitosis: archive_mode = on",
+        "#mitosis: ARCHIVE_COMMAND = 'aws s3 cp %p s3://wal/%f'",
+        "#mitosis: ssl = on",
+        "#mitosis: restore_command = 'cp /a/%f %p'",
+        "#mitosis: primary_conninfo = 'host=prod'",
+        "#mitosis: primary_slot_name = 'slot'",
+        "#mitosis: hba_file = '/etc/pg/hba'",
+    ] {
+        assert!(conf.contains(original), "{original} in:\n{conf}");
+    }
+    // The values that now apply: the last line of each setting.
+    let last = |name: &str| {
+        conf.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter(|l| l.split(" =").next() == Some(name))
+            .last()
+            .map(String::from)
+    };
+    assert_eq!(last("archive_mode").as_deref(), Some("archive_mode = off"));
+    assert_eq!(
+        last("archive_command").as_deref(),
+        Some("archive_command = ''")
+    );
+    assert_eq!(last("ssl").as_deref(), Some("ssl = off"));
+    assert_eq!(
+        last("restore_command").as_deref(),
+        Some("restore_command = ''")
+    );
+    assert_eq!(
+        last("primary_conninfo").as_deref(),
+        Some("primary_conninfo = ''")
+    );
+    assert_eq!(
+        last("primary_slot_name").as_deref(),
+        Some("primary_slot_name = ''")
+    );
+    assert_eq!(last("hba_file"), None);
+    assert!(conf.contains("\nshared_buffers = 1GB\n"));
+    assert!(
+        warnings.iter().any(|w| w.contains("archive_mode = on")),
+        "{warnings:?}"
+    );
 }

@@ -1144,8 +1144,9 @@ async fn run_steps(
     extensions_and_stop(ctx, install, data_dir, opts, database, pg).await
 }
 
-/// Step name of a missing source database; `build_gen` turns it into `invalid_request`.
-const DATABASE_STEP: &str = "database";
+/// Step name used only for "the source has no such database"; `build_gen` turns that
+/// `invalid_request` into a plain bad request instead of a failed build.
+const MISSING_DATABASE_STEP: &str = "missing database";
 
 /// The major version of the server at `url`, read with `psql` of any install.
 fn source_major(install: &PgInstall, url: &str) -> Result<u32> {
@@ -1333,7 +1334,7 @@ async fn basebackup_server(
             .into(),
     )
     .await
-    .map_err(at("database"))?;
+    .map_err(at("list databases"))?;
     let have: Vec<&str> = out
         .lines()
         .map(str::trim)
@@ -1341,7 +1342,7 @@ async fn basebackup_server(
         .collect();
     if !have.contains(&database) {
         return Err((
-            DATABASE_STEP,
+            MISSING_DATABASE_STEP,
             invalid(format!(
                 "database {database} does not exist in the source (it has: {})",
                 have.join(", ")
@@ -1793,7 +1794,7 @@ async fn build_gen(
         Ok(ext) => Ok(ext),
         Err((step, e)) => {
             // The caller named a database the source does not have: a bad request, not a failed build.
-            let bad_request = step == DATABASE_STEP;
+            let bad_request = step == MISSING_DATABASE_STEP && e.code == ErrorCode::InvalidRequest;
             let failed = fail(ctx, install, &build_dir, &log, &secrets, step, e.clone()).await;
             Err(if bad_request { e } else { failed })
         }

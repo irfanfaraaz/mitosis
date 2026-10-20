@@ -94,13 +94,13 @@ fn comment_out(text: &str, hit: impl Fn(&str) -> bool) -> (String, Vec<String>) 
     (out, hits)
 }
 
-/// The setting name of an active `postgresql.conf` line (`name = value`, `name value`), if any.
-fn setting_name(line: &str) -> Option<&str> {
-    let name = line
-        .split(|c: char| c == '=' || c.is_whitespace())
+/// The setting name of an active `postgresql.conf` line (`name = value`, `name value`), if any,
+/// in lower case: Postgres reads names case-insensitively.
+fn setting_name(line: &str) -> Option<String> {
+    line.split(|c: char| c == '=' || c.is_whitespace())
         .next()
-        .filter(|n| !n.is_empty() && !n.starts_with('#'))?;
-    Some(name)
+        .filter(|n| !n.is_empty() && !n.starts_with('#'))
+        .map(str::to_ascii_lowercase)
 }
 
 /// True when the `include*` line `line` points outside `data_dir`: an absolute path elsewhere, or
@@ -123,10 +123,29 @@ fn include_leaves_dir(line: &str, data_dir: &Path) -> bool {
     }
 }
 
+/// Settings a copy must not inherit: the value it gets instead (appended to `postgresql.conf`),
+/// or `None` to just comment the source's line out. A copy must not run the source's
+/// `archive_command` against its WAL archive, load its certificates, follow a primary, or read
+/// its `hba_file`, `ident_file` or data folder.
+const NEUTRALISED: [(&str, Option<&str>); 10] = [
+    ("archive_mode", Some("off")),
+    ("archive_command", Some("''")),
+    ("ssl", Some("off")),
+    ("restore_command", Some("''")),
+    ("primary_conninfo", Some("''")),
+    ("primary_slot_name", Some("''")),
+    ("data_directory", None),
+    ("hba_file", None),
+    ("ident_file", None),
+    ("external_pid_file", None),
+];
+
 /// Makes a folder copied by `pg_basebackup` a normal standalone cluster, before its first start:
 /// removes the standby, recovery and pid files, writes the `pg_hba.conf` `initdb` writes, empties
-/// `postgresql.auto.conf` and comments out `include` lines that point outside the folder.
-/// Returns warnings for the build log.
+/// `postgresql.auto.conf`, comments out `include` lines that point outside the folder and the
+/// `NEUTRALISED` settings (the copy gets safe values appended). A `postgresql.conf` or
+/// `pg_ident.conf` the source keeps outside its data folder (Debian layout) is not copied, so
+/// an empty one stands in. Returns warnings for the build log.
 pub fn make_standalone(data_dir: &Path) -> Result<Vec<String>> {
     for name in [
         "standby.signal",
@@ -145,37 +164,61 @@ pub fn make_standalone(data_dir: &Path) -> Result<Vec<String>> {
         std::fs::write(data_dir.join(name), text)
             .map_err(|e| internal(format!("write {name}: {e}")))
     };
+    let mut warnings = Vec::new();
     write("pg_hba.conf", &hba_text())?;
     write("postgresql.auto.conf", "")?;
-
-    let mut warnings = Vec::new();
-    let conf = data_dir.join("postgresql.conf");
-    let text = std::fs::read_to_string(&conf)
-        .map_err(|e| internal(format!("read {}: {e}", conf.display())))?;
-    let (text, hits) = comment_out(&text, |line| {
-        matches!(
-            setting_name(line),
-            Some("include" | "include_dir" | "include_if_exists")
-        ) && include_leaves_dir(line, data_dir)
-    });
-    if !hits.is_empty() {
-        write("postgresql.conf", &text)?;
-        warnings.extend(
-            hits.into_iter()
-                .map(|l| format!("commented out an include that points outside the copy: {l}")),
-        );
+    if !data_dir.join("pg_ident.conf").exists() {
+        warnings.push("pg_ident.conf was not in the copied folder; wrote an empty one".into());
+        write("pg_ident.conf", "# Mitosis: no user name maps\n")?;
     }
+
+    let conf = data_dir.join("postgresql.conf");
+    let text = match std::fs::read_to_string(&conf) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(
+                "postgresql.conf was not in the copied folder (the source keeps it elsewhere); \
+                 using Postgres defaults"
+                    .into(),
+            );
+            String::new()
+        }
+        Err(e) => return Err(internal(format!("read {}: {e}", conf.display()))),
+    };
+    let (mut text, hits) = comment_out(&text, |line| match setting_name(line).as_deref() {
+        Some("include" | "include_dir" | "include_if_exists") => include_leaves_dir(line, data_dir),
+        Some(name) => NEUTRALISED.iter().any(|(n, _)| *n == name),
+        None => false,
+    });
+    warnings.extend(
+        hits.into_iter()
+            .map(|l| format!("commented out in the copy: {l}")),
+    );
+    // Later lines win, so these also beat a setting an included file inside the folder sets.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("# Mitosis: a copy must not inherit these\n");
+    for (name, value) in NEUTRALISED {
+        if let Some(v) = value {
+            text.push_str(&format!("{name} = {v}\n"));
+        }
+    }
+    write("postgresql.conf", &text)?;
     Ok(warnings)
 }
 
 /// Comments out the active `shared_preload_libraries` line(s) of `postgresql.conf`; returns them
-/// (empty when there was none). For a copy whose libraries this machine does not have.
+/// (empty when there was none, or no file). For a copy whose libraries this machine does not have.
 pub fn disable_preload_libraries(data_dir: &Path) -> Result<Vec<String>> {
     let conf = data_dir.join("postgresql.conf");
-    let text = std::fs::read_to_string(&conf)
-        .map_err(|e| internal(format!("read {}: {e}", conf.display())))?;
+    let text = match std::fs::read_to_string(&conf) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(internal(format!("read {}: {e}", conf.display()))),
+    };
     let (text, hits) = comment_out(&text, |line| {
-        setting_name(line) == Some("shared_preload_libraries")
+        setting_name(line).as_deref() == Some("shared_preload_libraries")
     });
     if !hits.is_empty() {
         std::fs::write(&conf, text)
@@ -887,15 +930,20 @@ mod tests {
             format!(
                 "shared_buffers = 1GB\n#include 'commented.conf'\ninclude '/etc/pg/extra.conf'\n\
                  include_dir = '../conf.d'  # up\ninclude_if_exists='/etc/pg/maybe.conf'\n\
-                 include 'local.conf'\ninclude_dir '{}/conf.d'\nshared_preload_libraries = 'x'\n",
+                 include 'local.conf'\ninclude_dir '{}/conf.d'\nshared_preload_libraries = 'x'\n\
+                 INCLUDE '/etc/pg/upper.conf'\n",
                 d.display()
             ),
         )
         .unwrap();
+        std::fs::write(d.join("pg_ident.conf"), "").unwrap();
 
         let warnings = make_standalone(d).unwrap();
 
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(std::fs::read_to_string(d.join("postgresql.conf"))
+            .unwrap()
+            .contains("#mitosis: INCLUDE '/etc/pg/upper.conf'"));
         let conf = std::fs::read_to_string(d.join("postgresql.conf")).unwrap();
         assert!(conf.contains("#mitosis: include '/etc/pg/extra.conf'"));
         assert!(conf.contains("#mitosis: include_dir = '../conf.d'"));
