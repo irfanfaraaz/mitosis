@@ -10,7 +10,7 @@ use crate::envfile;
 use crate::names::is_clone_id;
 use crate::paths::Home;
 use crate::pg::cluster::{check_socket_path, log_tail};
-use crate::pg::{check_extensions, discover, find_major, initdb, start, stop, wait_ready};
+use crate::pg::{check_extensions, discover_with, find_major, initdb, start, stop, wait_ready};
 use crate::pg::{PgInstall, StartOptions};
 use crate::protocol::{MigrateCmd, Request, Response, TemplateSource};
 use crate::service;
@@ -883,7 +883,8 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     let svc = service_status().await;
     out.push(check_service(&svc));
 
-    let installs = tokio::task::spawn_blocking(discover)
+    let h = home.clone();
+    let installs = tokio::task::spawn_blocking(move || discover_with(Some(&h)))
         .await
         .unwrap_or_default();
     out.push(check_postgres(&installs));

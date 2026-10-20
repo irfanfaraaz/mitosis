@@ -32,7 +32,12 @@ jobs:
       # lack a build, so a failure only warns; the tests find it through PATH and skip without it.
       - name: Install Postgres 17 (mitosis pg install)
         run: |
-          if bin=$(cargo run --quiet -- pg install 17 | tail -n 1); then
+          if out=$(cargo run --quiet -- pg install 17); then
+            bin=$(printf '%s\n' "$out" | tail -n 1)
+          else
+            bin=""
+          fi
+          if [ -d "$bin" ]; then
             echo "$bin" >> "$GITHUB_PATH"
           else
             echo "::warning::no managed Postgres 17 for this runner; the cross-major tests will skip"
