@@ -1,9 +1,11 @@
-use crate::clones::{destroy_for, install_for, mark, restart, stop_and_remove, suspect_warning};
+use crate::clones::{
+    destroy_for, install_for, mark, restart_or_undo, sleep, stop_and_remove, suspect_warning,
+};
 use crate::ctx::{Ctx, InFlightOp};
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::events::{self, reason};
 use crate::names::is_clone_id;
-use crate::pg::{control_state, running_server, stop, ControlState, RunningPg};
+use crate::pg::{control_state, psql, running_server, stop, ControlState, RunningPg};
 use crate::proc_util::{has_exited, is_alive, process_start_time};
 use crate::protocol::{GcFailure, GcReport};
 use crate::state::{CloneRow, CloneStatus};
@@ -75,15 +77,16 @@ fn in_flight(ctx: &Ctx, id: &str) -> bool {
 /// A name's port and password are kept this long after its last create.
 const RESERVATION_KEEP_SECS: i64 = 30 * 24 * 3600;
 
-/// Destroys Ready clones whose TTL has run out; returns the ids destroyed.
+/// Destroys Ready and Sleeping clones whose TTL has run out; returns the ids destroyed.
 pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
     let rows = ctx.store().list_clones()?;
     let mut reaped = Vec::new();
     // Creating/Starting rows belong to an in-flight create; the next pass gets them.
-    for row in rows
-        .iter()
-        .filter(|r| r.status == CloneStatus::Ready && !r.protected && r.expires_at <= now)
-    {
+    for row in rows.iter().filter(|r| {
+        matches!(r.status, CloneStatus::Ready | CloneStatus::Sleeping)
+            && !r.protected
+            && r.expires_at <= now
+    }) {
         if in_flight(ctx, &row.id) {
             continue;
         }
@@ -94,6 +97,108 @@ pub async fn reap_expired(ctx: &Ctx, now: i64) -> Result<Vec<String>> {
         }
     }
     Ok(reaped)
+}
+
+/// Client backends other than this check's own session, from `pg_stat_activity`: the users of
+/// the direct port, whom the router cannot see. Blocking work runs off the runtime.
+async fn client_backends(ctx: &Ctx, row: &CloneRow) -> Result<usize> {
+    let install = install_for(ctx, &row.dir).ok_or_else(|| {
+        internal(format!(
+            "no Postgres install found for {}",
+            row.dir.display()
+        ))
+    })?;
+    let (sock, port, db) = (row.socket_dir.clone(), row.port, row.database.clone());
+    let out = tokio::task::spawn_blocking(move || {
+        psql(
+            &install,
+            &sock,
+            port,
+            &db,
+            "select count(*) from pg_stat_activity \
+             where backend_type = 'client backend' and pid <> pg_backend_pid()",
+        )
+    })
+    .await
+    .map_err(|e| internal(format!("background task failed: {e}")))??;
+    out.trim()
+        .parse()
+        .map_err(|_| internal(format!("unexpected pg_stat_activity count {out:?}")))
+}
+
+/// Ready and Sleeping clones (no operation running) with no connections right now, each with
+/// the time its idle spell began: the latest of its last router activity, the last time a check
+/// saw a client backend, its creation and this daemon's start. A Ready clone with a client
+/// backend counts as active at `now` and is left out. Clones are read from the store, so router
+/// entries of clones that are gone play no part.
+pub(crate) async fn idle_clones(ctx: &Ctx, now: i64) -> Result<Vec<(CloneRow, i64)>> {
+    // From the wall clock, not `now`: a caller may pass a later `now` to look ahead.
+    let started = crate::templates::now()
+        .saturating_sub(i64::try_from(ctx.started_at.elapsed().as_secs()).unwrap_or(0));
+    let rows = ctx.store().list_clones()?;
+    let mut idle = Vec::new();
+    for row in rows
+        .into_iter()
+        .filter(|r| matches!(r.status, CloneStatus::Ready | CloneStatus::Sleeping))
+    {
+        if in_flight(ctx, &row.id) {
+            continue;
+        }
+        let (conns, last) = {
+            let r = ctx.router();
+            (r.open_conns(&row.id), r.last_active(&row.id))
+        };
+        if conns > 0 {
+            continue;
+        }
+        if row.status == CloneStatus::Ready {
+            match client_backends(ctx, &row).await {
+                Ok(0) => {}
+                Ok(_) => {
+                    ctx.router().last_active.insert(row.id.clone(), now);
+                    continue;
+                }
+                Err(e) => {
+                    log(ctx, &format!("idle check of clone {}: {e}", row.id));
+                    continue;
+                }
+            }
+        }
+        let since = last.unwrap_or(0).max(row.created_at).max(started);
+        idle.push((row, since));
+    }
+    Ok(idle)
+}
+
+/// The reaper's idle pass: destroys unnamed, unprotected clones idle for `idle_reap` (reason
+/// `idle`), then puts Ready clones idle for `idle_sleep` to sleep. Sleeping needs the router (it
+/// is what wakes them). Returns `(slept, destroyed)` ids.
+pub async fn idle_pass(ctx: &Ctx, now: i64) -> Result<(Vec<String>, Vec<String>)> {
+    let cfg = ctx.config();
+    let sleep_after = cfg.idle_sleep.filter(|_| cfg.router);
+    let (mut slept, mut reaped) = (Vec::new(), Vec::new());
+    if sleep_after.is_none() && cfg.idle_reap.is_none() {
+        return Ok((slept, reaped));
+    }
+    let longer = |idle: i64, d: Option<Duration>| {
+        d.is_some_and(|d| idle >= i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    };
+    for (row, since) in idle_clones(ctx, now).await? {
+        let idle = now.saturating_sub(since);
+        if row.name.is_none() && !row.protected && longer(idle, cfg.idle_reap) {
+            match destroy_for(ctx, &row.id, reason::IDLE).await {
+                Ok(id) => reaped.push(id),
+                Err(e) if e.code == ErrorCode::CloneNotFound => {}
+                Err(e) => log(ctx, &format!("idle reap: clone {}: {e}", row.id)),
+            }
+        } else if row.status == CloneStatus::Ready && longer(idle, sleep_after) {
+            match sleep(ctx, &row.id, reason::IDLE).await {
+                Ok(()) => slept.push(row.id),
+                Err(e) => log(ctx, &format!("idle sleep: clone {}: {e}", row.id)),
+            }
+        }
+    }
+    Ok((slept, reaped))
 }
 
 /// Watches `parent_pid` on a thread; when it exits, destroys the clone on the current tokio runtime.
@@ -345,6 +450,9 @@ async fn reconcile_clone(
         report.records_dropped.push(row.id.clone());
         return Ok(());
     }
+    if row.status == CloneStatus::Sleeping {
+        return reconcile_sleeping(ctx, row, now, report).await;
+    }
     let running = row.status == CloneStatus::Ready && postmaster_running(row);
     // Whether the machine rebooted or the server just died (a full disk, a manual stop, a
     // logout), a clone someone may want back is restarted, never destroyed outright.
@@ -373,6 +481,86 @@ async fn reconcile_clone(
     Ok(())
 }
 
+/// A sleeping clone keeps sleeping under the TTL and parent rules of a running one. A server
+/// left running by a wake or sleep that crashed half-way is stopped, so Sleeping means stopped.
+async fn reconcile_sleeping(
+    ctx: &Arc<Ctx>,
+    row: &CloneRow,
+    now: i64,
+    report: &mut GcReport,
+) -> Result<()> {
+    let parent_gone = row
+        .parent_pid
+        .is_some_and(|p| !parent_alive(p, row.parent_start_time));
+    if parent_gone || row.expires_at <= now {
+        let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
+            return Ok(());
+        };
+        stop_and_remove(ctx, row, reason::GC).await?;
+        report.destroyed.push(row.id.clone());
+        return Ok(());
+    }
+    if postmaster_running(row) {
+        let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Create) else {
+            return Ok(());
+        };
+        let install = install_for(ctx, &row.dir).ok_or_else(|| {
+            internal(format!(
+                "no Postgres install found for {}",
+                row.dir.display()
+            ))
+        })?;
+        let expected = row
+            .pg_pid
+            .zip(row.pg_start_time)
+            .map(|(pid, start_time)| RunningPg { pid, start_time });
+        let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
+        tokio::task::spawn_blocking(move || stop(&install, &dir, expected, t))
+            .await
+            .map_err(|e| internal(format!("background task failed: {e}")))??;
+        let mut row = row.clone();
+        (row.pg_pid, row.pg_start_time) = (None, None);
+        ctx.store().update_clone(&row)?;
+    }
+    report.adopted.push(row.id.clone());
+    if let Some(pid) = row.parent_pid {
+        watch_parent(ctx.clone(), row.id.clone(), pid);
+    }
+    Ok(())
+}
+
+/// True when a non-durable clone's cluster did not shut down cleanly (fsync was off, so recent
+/// writes may be lost). Durable clones are never unclean in this sense. The server must be down.
+pub(crate) async fn unclean(ctx: &Ctx, row: &CloneRow) -> Result<bool> {
+    if row.durable {
+        return Ok(false);
+    }
+    let install = install_for(ctx, &row.dir).ok_or_else(|| {
+        internal(format!(
+            "no Postgres install found for {}",
+            row.dir.display()
+        ))
+    })?;
+    let dir = row.dir.clone();
+    let state = tokio::task::spawn_blocking(move || control_state(&install, &dir))
+        .await
+        .map_err(|e| internal(format!("background task failed: {e}")))??;
+    Ok(state != ControlState::ShutDown)
+}
+
+/// Records that the clone may hold lost or corrupt writes.
+pub(crate) fn mark_suspect(ctx: &Ctx, row: &mut CloneRow) -> Result<()> {
+    row.suspect = true;
+    ctx.store().update_clone(row)?;
+    events::emit_clone(
+        ctx,
+        events::CLONE_SUSPECT,
+        row,
+        serde_json::json!({ "cause": "unclean shutdown with fsync off" }),
+    );
+    Ok(())
+}
+
 /// Destroys a clone gc decided to drop, unless another operation owns it now.
 async fn drop_clone(ctx: &Ctx, row: &CloneRow, report: &mut GcReport) -> Result<()> {
     let Ok(_mark) = mark(ctx, &row.id, InFlightOp::Destroy) else {
@@ -383,8 +571,9 @@ async fn drop_clone(ctx: &Ctx, row: &CloneRow, report: &mut GcReport) -> Result<
     Ok(())
 }
 
-/// A named, protected or parentless Ready clone whose server is gone (a reboot or a crash). It is
-/// restarted; a non-durable one that did not shut down cleanly is suspect (fsync was off), and a
+/// A named, protected or parentless Ready clone whose server is gone (a reboot or a crash). With
+/// the router on it is marked Sleeping (the router or `clone --name` wakes it), else restarted
+/// as in v0.2; a non-durable one that did not shut down cleanly is suspect (fsync was off), and a
 /// suspect clone without a name is destroyed instead, as is an expired one or one whose parent
 /// exited.
 async fn recover_dead(
@@ -403,41 +592,43 @@ async fn recover_dead(
         return Ok(());
     };
     let mut row = row.clone();
-    if !row.durable {
-        let install = install_for(ctx, &row.dir).ok_or_else(|| {
-            internal(format!(
-                "no Postgres install found for {}",
-                row.dir.display()
-            ))
-        })?;
-        let dir = row.dir.clone();
-        let state = tokio::task::spawn_blocking(move || control_state(&install, &dir))
-            .await
-            .map_err(|e| internal(format!("background task failed: {e}")))??;
-        if state != ControlState::ShutDown {
-            if row.name.is_none() {
-                drop(mark);
-                log(
-                    ctx,
-                    &format!(
-                        "gc: clone {} did not shut down cleanly with fsync off; destroyed",
-                        row.id
-                    ),
-                );
-                return drop_clone(ctx, &row, report).await;
-            }
-            row.suspect = true;
-            ctx.store().update_clone(&row)?;
-            events::emit_clone(
+    if unclean(ctx, &row).await? {
+        if row.name.is_none() {
+            drop(mark);
+            log(
                 ctx,
-                events::CLONE_SUSPECT,
-                &row,
-                serde_json::json!({ "cause": "unclean shutdown with fsync off" }),
+                &format!(
+                    "gc: clone {} did not shut down cleanly with fsync off; destroyed",
+                    row.id
+                ),
             );
+            return drop_clone(ctx, &row, report).await;
         }
+        mark_suspect(ctx, &mut row)?;
     }
-    let (old_pid, old_start, old_port) = (row.pg_pid, row.pg_start_time, row.port);
-    match restart(ctx, &mut row).await {
+    if ctx.config().router {
+        // Not started now: the first router connection (or `clone --name`) wakes it.
+        row.status = CloneStatus::Sleeping;
+        (row.pg_pid, row.pg_start_time) = (None, None);
+        ctx.store().update_clone(&row)?;
+        events::emit_clone(
+            ctx,
+            events::RECOVERY,
+            &row,
+            serde_json::json!({ "restarted": false, "sleeping": true, "suspect": row.suspect }),
+        );
+        report.adopted.push(row.id.clone());
+        if let Some(w) = row.suspect.then(|| suspect_warning(&row)) {
+            log(ctx, &format!("gc: clone {}: {w}", row.id));
+            report.warnings.push(w);
+        }
+        if let Some(pid) = row.parent_pid {
+            watch_parent(ctx.clone(), row.id.clone(), pid);
+        }
+        return Ok(());
+    }
+    let old_port = row.port;
+    match restart_or_undo(ctx, &mut row).await {
         Ok(warnings) => {
             events::emit_clone(
                 ctx,
@@ -460,27 +651,9 @@ async fn recover_dead(
             }
             Ok(())
         }
-        Err(e) => {
-            // Kept, not destroyed: it may hold data someone wants. The old identity stays recorded,
-            // so the next daemon start or gc tries again.
-            let started = row
-                .pg_pid
-                .zip(row.pg_start_time)
-                .filter(|_| row.pg_pid != old_pid)
-                .map(|(pid, start_time)| RunningPg { pid, start_time });
-            if let (Some(pg), Some(install)) = (started, install_for(ctx, &row.dir)) {
-                let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
-                let _ =
-                    tokio::task::spawn_blocking(move || stop(&install, &dir, Some(pg), t)).await;
-            }
-            row.pg_pid = old_pid;
-            row.pg_start_time = old_start;
-            // A port move already saved must be undone too, or the retry would think the URL never
-            // changed and leave the reservation and .env records on the old port.
-            row.port = old_port;
-            let _ = ctx.store().update_clone(&row);
-            Err(e)
-        }
+        // Kept, not destroyed: it may hold data someone wants. `restart_or_undo` put the old
+        // identity back, so the next daemon start or gc tries again.
+        Err(e) => Err(e),
     }
 }
 
@@ -827,6 +1000,7 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(reap_expired(ctx, 0));
         send(reconcile(arc.clone(), 0));
+        send(idle_pass(ctx, 0));
         send(destroy_after_parent_exit(Watch {
             ctx: arc,
             id: String::new(),

@@ -75,6 +75,7 @@ fn kill_9(env: &TestEnv, info: &CloneInfo) {
     std::thread::sleep(Duration::from_secs(2));
 }
 
+/// The router is off in `TestEnv`, so this is the v0.2 restart.
 #[tokio::test]
 async fn named_clone_restarts_after_clean_stop() {
     let Some(env) = TestEnv::new() else { return };
@@ -174,4 +175,30 @@ async fn dead_unnamed_clone_with_parent_is_destroyed() {
     assert_eq!(report.destroyed, vec![c.id.clone()], "{report:?}");
     assert!(row(&env, &c.id).is_none());
     assert!(!dir.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn named_clone_sleeps_after_dead_server_and_router_wakes_it() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    start_router(&env).await;
+    let x = create(&env.ctx, args(Some("x"), false)).await.unwrap();
+    psql_url(&env, &x.url, "insert into t values (2)");
+    pg_ctl_stop(&env, &x);
+    // With the router on, recovery marks it sleeping instead of starting it.
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert!(report.adopted.contains(&x.id), "{report:?}");
+    assert!(report.destroyed.is_empty(), "{report:?}");
+    let r = row(&env, &x.id).unwrap();
+    assert_eq!(r.pg_pid, None);
+    assert_eq!(listed(&env, &x.id).status, "sleeping");
+    // A second gc leaves it asleep.
+    reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert_eq!(listed(&env, &x.id).status, "sleeping");
+    // The first router connection wakes it, data intact.
+    assert_eq!(psql_url(&env, &x.url, "select count(*) from t"), "2");
+    let info = listed(&env, &x.id);
+    assert_eq!(info.status, "ready");
+    assert_eq!(info.url, x.url);
+    assert!(!info.suspect);
 }

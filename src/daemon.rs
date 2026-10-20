@@ -194,6 +194,17 @@ async fn reaper(shared: Shared, mut shutdown: watch::Receiver<bool>) {
             Ok(_) => {}
             Err(e) => log(&shared.ctx.home, &format!("reaper failed: {e}")),
         }
+        match lifecycle::idle_pass(&shared.ctx, now()).await {
+            Ok((slept, reaped)) => {
+                if !slept.is_empty() {
+                    log(&shared.ctx.home, &format!("idle clones slept: {}", slept.join(", ")));
+                }
+                if !reaped.is_empty() {
+                    log(&shared.ctx.home, &format!("idle clones destroyed: {}", reaped.join(", ")));
+                }
+            }
+            Err(e) => log(&shared.ctx.home, &format!("idle pass failed: {e}")),
+        }
         let t = now();
         if t.saturating_sub(reservations_dropped) >= RESERVATIONS_EVERY_SECS {
             lifecycle::drop_unused_reservations(&shared.ctx, t);
@@ -504,6 +515,9 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
             template,
         } => {
             Response::TemplateBuilt(promote::promote(&ctx, &id_or_name, template.as_deref()).await?)
+        }
+        Request::CloneWake { id_or_name } => {
+            Response::Clone(clones::wake_info(&ctx, &id_or_name).await?)
         }
         Request::PendingRestores => Response::PendingRestores {
             items: ctx.store().list_pending_restores()?,

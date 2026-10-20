@@ -11,7 +11,7 @@ use crate::events;
 use crate::lifecycle::log;
 use crate::names::format_duration;
 use crate::protocol::RouterStatus;
-use crate::state::CloneRow;
+use crate::state::{CloneRow, CloneStatus};
 use crate::templates::now;
 use serde_json::json;
 use std::collections::HashMap;
@@ -332,9 +332,25 @@ async fn startup(
         }
         Err(e) => return refuse(&mut client, "58000", &e.message, None).await,
     };
-    let row = match clones::ensure_running(&ctx, &row.id).await {
-        Ok(row) => row,
-        Err(e) => return refuse(&mut client, "57P03", &e.message, e.hint.as_deref()).await,
+    // Counted before the status check: a sleep that has not marked the clone yet sees the count
+    // and backs off; one that has is seen here, and the clone is woken again.
+    let mut tries = 0;
+    let (row, mut tracked, close) = loop {
+        tries += 1;
+        let row = match clones::ensure_running(&ctx, &row.id).await {
+            Ok(row) => row,
+            Err(e) => return refuse(&mut client, "57P03", &e.message, e.hint.as_deref()).await,
+        };
+        let (tracked, close) = Tracked::begin(&ctx, &row.id);
+        let same = ctx
+            .store()
+            .get_clone(&row.id)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.status == CloneStatus::Ready && r.port == row.port);
+        if same || tries >= 3 {
+            break (row, tracked, close);
+        }
     };
     match params.iter_mut().find(|(k, _)| k == "database") {
         Some((_, v)) => *v = row.database.clone(),
@@ -352,7 +368,6 @@ async fn startup(
             }
         };
     let _ = server.set_nodelay(true);
-    let (mut tracked, close) = Tracked::begin(&ctx, &row.id);
 
     let (mut cr, mut cw) = client.into_split();
     let (mut sr, mut sw) = server.into_split();

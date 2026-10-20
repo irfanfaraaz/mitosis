@@ -128,9 +128,13 @@ fn collect(ctx: &Ctx, want_ram: bool, want_disk: bool) -> Result<(Usage, u64)> {
     }
     let running: Vec<u64> = clones.iter().filter_map(|c| c.rss_bytes).collect();
     let estimate = ram_estimate(&running);
-    // A clone that is still starting has no reading yet, but it will use memory.
+    // A clone that is still starting has no reading yet, but it will use memory. A sleeping one
+    // uses none: it counts for the cap and the disk only.
     let unread = if want_ram {
-        (clones.len() - running.len()) as u64
+        rows.iter()
+            .zip(&clones)
+            .filter(|(r, c)| r.status != CloneStatus::Sleeping && c.rss_bytes.is_none())
+            .count() as u64
     } else {
         0
     };
@@ -276,6 +280,31 @@ pub async fn admit(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
     }
 }
 
+/// Puts the idle clone with the oldest activity to sleep (reason `evicted`); false when no clone
+/// can be slept. A clone with an open connection is never chosen. Needs the router, which is
+/// what wakes a sleeping clone.
+async fn sleep_least_recent_idle(ctx: &Arc<Ctx>) -> bool {
+    if !ctx.config().router {
+        return false;
+    }
+    let mut idle = match crate::lifecycle::idle_clones(ctx, crate::templates::now()).await {
+        Ok(idle) => idle,
+        Err(e) => {
+            crate::lifecycle::log(ctx, &format!("eviction: {e}"));
+            return false;
+        }
+    };
+    idle.retain(|(r, _)| r.status == CloneStatus::Ready);
+    idle.sort_by_key(|(_, since)| *since);
+    for (row, _) in idle {
+        match crate::clones::sleep(ctx, &row.id, "evicted").await {
+            Ok(()) => return true,
+            Err(e) => crate::lifecycle::log(ctx, &format!("eviction: clone {}: {e}", row.id)),
+        }
+    }
+    false
+}
+
 async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
     let start = Instant::now();
     let _counted = InQueue::new(&ctx.queued);
@@ -315,7 +344,15 @@ async fn admit_in_line(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
         tokio::pin!(woken);
         woken.as_mut().enable();
         let (u, est) = snapshot(ctx, false).await?;
-        let Some(limit) = fits(&u, est) else {
+        let limit = fits(&u, est);
+        // Only the RAM budget is in the way: sleeping an idle clone may make room at once.
+        if limit == Some(Limit::Ram)
+            && u.disk_budget.is_none_or(|b| u.disk_bytes < b)
+            && sleep_least_recent_idle(ctx).await
+        {
+            continue;
+        }
+        let Some(limit) = limit else {
             if waited_for_room {
                 events::emit(
                     ctx,

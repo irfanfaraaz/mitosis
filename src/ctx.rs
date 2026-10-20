@@ -52,6 +52,8 @@ pub struct Ctx {
     pub events_tx: tokio::sync::broadcast::Sender<EventRow>,
     /// Router connections, cancel keys and listener status; read through `router()`.
     router: Mutex<RouterState>,
+    /// Clone id → the lock one wake or sleep of that clone holds; others wait on it.
+    pub(crate) waking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Ctx {
@@ -92,6 +94,7 @@ impl Ctx {
             queued: AtomicUsize::new(0),
             events_tx: tokio::sync::broadcast::channel(EVENT_CHANNEL).0,
             router,
+            waking: Mutex::new(HashMap::new()),
         })
     }
 

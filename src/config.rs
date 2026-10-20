@@ -31,6 +31,10 @@ pub struct Config {
     pub router_port: u16,
     /// The address the router binds; `0.0.0.0` makes it reachable from the network.
     pub router_listen: IpAddr,
+    /// A clone with no connections for this long is put to sleep; `None` (off) never.
+    pub idle_sleep: Option<Duration>,
+    /// An unnamed, unprotected clone idle for this long is destroyed; `None` (off) never.
+    pub idle_reap: Option<Duration>,
 }
 
 impl Default for Config {
@@ -50,6 +54,8 @@ impl Default for Config {
             router: true,
             router_port: 54300,
             router_listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            idle_sleep: Some(Duration::from_secs(600)),
+            idle_reap: None,
         }
     }
 }
@@ -90,7 +96,7 @@ struct KeySpec {
     example: &'static str,
 }
 
-const KEYS: [KeySpec; 9] = [
+const KEYS: [KeySpec; 11] = [
     KeySpec {
         key: "max_clones",
         env: "MITOSIS_MAX_CLONES",
@@ -144,6 +150,18 @@ const KEYS: [KeySpec; 9] = [
         env: "MITOSIS_ROUTER_LISTEN",
         want: "an IP address like 127.0.0.1 or 0.0.0.0",
         example: "127.0.0.1",
+    },
+    KeySpec {
+        key: "idle_sleep",
+        env: "MITOSIS_IDLE_SLEEP",
+        want: "a duration like 10m or 1h, or off",
+        example: "10m",
+    },
+    KeySpec {
+        key: "idle_reap",
+        env: "MITOSIS_IDLE_REAP",
+        want: "a duration like 2h or 1d, or off",
+        example: "1d",
     },
 ];
 
@@ -222,6 +240,14 @@ fn parse_switch(v: &str) -> Option<bool> {
         "on" | "true" => Some(true),
         "off" | "false" => Some(false),
         _ => None,
+    }
+}
+
+fn parse_idle(v: &str) -> Option<Option<Duration>> {
+    if v.eq_ignore_ascii_case("off") {
+        Some(None)
+    } else {
+        parse_duration(v).ok().map(Some)
     }
 }
 
@@ -320,6 +346,8 @@ impl Config {
             "router" => self.router = parse_switch(v)?,
             "router_port" => self.router_port = v.parse::<u16>().ok().filter(|p| *p >= 1)?,
             "router_listen" => self.router_listen = v.parse().ok()?,
+            "idle_sleep" => self.idle_sleep = parse_idle(v)?,
+            "idle_reap" => self.idle_reap = parse_idle(v)?,
             _ => return None,
         }
         Some(())
@@ -337,6 +365,8 @@ impl Config {
             "router" => if self.router { "on" } else { "off" }.to_string(),
             "router_port" => self.router_port.to_string(),
             "router_listen" => self.router_listen.to_string(),
+            "idle_sleep" => self.idle_sleep.map_or("off".into(), format_duration),
+            "idle_reap" => self.idle_reap.map_or("off".into(), format_duration),
             _ => String::new(),
         }
     }
@@ -456,6 +486,31 @@ mod tests {
         assert!(c.router);
         assert_eq!(c.router_port, 54300);
         assert_eq!(c.router_listen.to_string(), "127.0.0.1");
+        assert_eq!(c.idle_sleep, Some(Duration::from_secs(600)));
+        assert_eq!(c.idle_reap, None);
+    }
+
+    #[test]
+    fn idle_keys() {
+        let (_tmp, home) = home();
+        std::fs::write(
+            home.config_file(),
+            "idle_sleep = \"off\"\nidle_reap = \"2h\"\n",
+        )
+        .unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(
+            (c.idle_sleep, c.idle_reap),
+            (None, Some(Duration::from_secs(7200)))
+        );
+        assert_eq!(entry(&home, &no_env, "idle_sleep").0, "off");
+        assert_eq!(entry(&home, &no_env, "idle_reap").0, "2h");
+        let env = |k: &str| (k == "MITOSIS_IDLE_SLEEP").then(|| "0s".to_string());
+        assert!(Config::default().layered(&home, &env).is_err());
+        assert!(Config::set_in_file(&home, "idle_sleep", "soon").is_err());
+        Config::set_in_file(&home, "idle_sleep", "5m").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(c.idle_sleep, Some(Duration::from_secs(300)));
     }
 
     #[test]

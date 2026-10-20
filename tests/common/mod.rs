@@ -129,3 +129,22 @@ pub async fn template(env: &TestEnv, name: &str, sql: &str) -> TemplateInfo {
         .await
         .expect("build template")
 }
+
+/// Turns the router on for this env's in-process ctx (on its own slice port) and waits until it
+/// listens. Needs a multi-thread runtime: blocking `psql` calls must not starve the router.
+pub async fn start_router(env: &TestEnv) {
+    env.ctx.set_config(Config {
+        router: true,
+        ..env.ctx.config()
+    });
+    mitosis::router::spawn(env.ctx.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !env.ctx.router().status.listening {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "router never listened: {:?}",
+            env.ctx.router().status
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

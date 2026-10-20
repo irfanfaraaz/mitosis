@@ -225,6 +225,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         template: Option<String>,
     },
+    /// Starts a sleeping clone (a no-op for a running one); answered with `Response::Clone`.
+    CloneWake {
+        id_or_name: String,
+    },
     /// `.env` restores the daemon could not finish.
     PendingRestores,
     PendingRestoreDone {
@@ -431,6 +435,8 @@ pub enum Response {
         paused: bool,
     },
     CloneCreated(CloneInfo),
+    /// One clone, e.g. after `CloneWake`.
+    Clone(CloneInfo),
     Clones {
         clones: Vec<CloneInfo>,
     },

@@ -93,6 +93,8 @@ enum Cmd {
         #[arg(long)]
         forget: bool,
     },
+    /// Start a sleeping clone now instead of on its first connection.
+    Wake { id_or_name: String },
     /// Make a running clone the newest generation of its template (or of --template).
     Promote {
         clone: String,
@@ -181,15 +183,15 @@ enum TemplateCmd {
             required_unless_present_any = ["seed", "basebackup"]
         )]
         from_url: Option<String>,
-        /// Shell command run in this folder with DATABASE_URL set.
-        #[arg(long)]
         /// Copy a running server physically with pg_basebackup (needs a role with REPLICATION).
         #[arg(long, conflicts_with = "seed")]
         basebackup: Option<String>,
+        /// Shell command run in this folder with DATABASE_URL set.
+        #[arg(long)]
         seed: Option<String>,
+        /// The database to keep (a --basebackup copy has all of the server's; default: the URL's).
         #[arg(long)]
         database: Option<String>,
-        /// The database to keep (a --basebackup copy has all of the server's; default: the URL's).
         /// Migrations folder; the template is flagged stale when it changes.
         #[arg(long)]
         migrations: Option<std::path::PathBuf>,
@@ -595,6 +597,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 eprintln!("warning: {w}");
             }
         }
+        Cmd::Wake { id_or_name } => {
+            let req = Request::CloneWake { id_or_name };
+            match client::request(&home, req).await? {
+                Response::Clone(info) => {
+                    for w in &info.warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    println!("{}", info.name.as_deref().unwrap_or(&info.id));
+                }
+                other => return Err(unexpected(other)),
+            }
+        }
         Cmd::Promote { clone, template } => {
             let req = Request::ClonePromote {
                 id_or_name: clone.clone(),
@@ -820,6 +834,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         TemplateCmd::Init {
             name,
             from_url,
+            basebackup,
             seed,
             database,
             migrations,
@@ -834,7 +849,6 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                         MitosisError::new(
                             ErrorCode::InvalidRequest,
                             format!("migrations folder {}: {e}", dir.display()),
-            basebackup,
                         )
                     })
                 })
@@ -1025,6 +1039,7 @@ fn source_cell(source: &TemplateSource) -> String {
     const MAX: usize = 48;
     let text = match source {
         TemplateSource::Url { url } => url.clone(),
+        TemplateSource::Basebackup { url } => format!("basebackup: {url}"),
         TemplateSource::Seed { command, .. } => {
             format!(
                 "seed: {}",
@@ -1039,7 +1054,6 @@ fn source_cell(source: &TemplateSource) -> String {
     let cut: String = text.chars().take(MAX - 1).collect();
     format!("{cut}…")
 }
-        TemplateSource::Basebackup { url } => format!("basebackup: {url}"),
 
 fn paused_line(name: &str) -> String {
     format!(
@@ -1098,9 +1112,12 @@ fn print_clones(clones: &[CloneInfo]) {
     );
 }
 
-/// `!` for a clone past its disk warning, then `protected`.
+/// `sleeping`, `!` for a clone past its disk warning, then `protected`.
 fn flags(c: &CloneInfo) -> String {
     let mut f = Vec::new();
+    if c.status == "sleeping" {
+        f.push("sleeping");
+    }
     if c.disk_warn {
         f.push("!");
     }
@@ -1329,6 +1346,15 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["mitosis", "template", "init", "--seed", "x"]).is_ok());
+        let basebackup = |extra: &[&str]| {
+            let mut args = vec!["mitosis", "template", "init", "--basebackup", "u"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(basebackup(&[]).is_ok());
+        assert!(basebackup(&["--database", "shop"]).is_ok());
+        assert!(basebackup(&["--seed", "x"]).is_err());
+        assert!(basebackup(&["--from-url", "y"]).is_err());
     }
 
     #[test]
@@ -1346,15 +1372,6 @@ mod tests {
             "layered",
             "--migrate",
             "make migrate",
-        let basebackup = |extra: &[&str]| {
-            let mut args = vec!["mitosis", "template", "init", "--basebackup", "u"];
-            args.extend_from_slice(extra);
-            Cli::try_parse_from(args)
-        };
-        assert!(basebackup(&[]).is_ok());
-        assert!(basebackup(&["--database", "shop"]).is_ok());
-        assert!(basebackup(&["--seed", "x"]).is_err());
-        assert!(basebackup(&["--from-url", "y"]).is_err());
             "--auto-migrate",
             "on",
             "--on-stale",

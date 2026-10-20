@@ -16,6 +16,8 @@ pub enum CloneStatus {
     Starting,
     Ready,
     Stopping,
+    /// Postgres stopped cleanly; folder, port, password and `.env` records kept until a wake.
+    Sleeping,
 }
 
 impl CloneStatus {
@@ -25,6 +27,7 @@ impl CloneStatus {
             CloneStatus::Starting => "starting",
             CloneStatus::Ready => "ready",
             CloneStatus::Stopping => "stopping",
+            CloneStatus::Sleeping => "sleeping",
         }
     }
 
@@ -34,6 +37,7 @@ impl CloneStatus {
             "starting" => CloneStatus::Starting,
             "ready" => CloneStatus::Ready,
             "stopping" => CloneStatus::Stopping,
+            "sleeping" => CloneStatus::Sleeping,
             _ => return None,
         })
     }

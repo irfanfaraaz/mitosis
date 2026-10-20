@@ -73,6 +73,7 @@ fn status_str(s: CloneStatus) -> &'static str {
         CloneStatus::Creating | CloneStatus::Starting => "starting",
         CloneStatus::Ready => "ready",
         CloneStatus::Stopping => "stopping",
+        CloneStatus::Sleeping => "sleeping",
     }
 }
 
@@ -125,20 +126,193 @@ pub fn to_info(ctx: &Ctx, row: &CloneRow, template_age_secs: u64) -> CloneInfo {
     }
 }
 
-/// The clone's row when it can take connections now. (Task 3: wakes a sleeping clone.)
+fn not_found(id: &str) -> MitosisError {
+    MitosisError::new(ErrorCode::CloneNotFound, format!("clone {id} not found"))
+        .with_hint("see existing clones with `mitosis list` (or the clone_list tool)")
+}
+
+/// The clone's row when it can take connections now; a sleeping clone is woken first.
 pub async fn ensure_running(ctx: &Arc<Ctx>, id: &str) -> Result<CloneRow> {
-    let row = ctx.store().get_clone(id)?.ok_or_else(|| {
-        MitosisError::new(ErrorCode::CloneNotFound, format!("clone {id} not found"))
-            .with_hint("see existing clones with `mitosis list` (or the clone_list tool)")
-    })?;
+    let row = ctx.store().get_clone(id)?.ok_or_else(|| not_found(id))?;
     let label = row.name.as_deref().unwrap_or(&row.id);
     match row.status {
         CloneStatus::Ready => Ok(row),
+        CloneStatus::Sleeping => {
+            let (row, warnings) = wake(ctx, &row.id).await?;
+            for w in warnings {
+                log(ctx, &format!("wake of clone {}: {w}", row.id));
+            }
+            Ok(row)
+        }
         CloneStatus::Stopping => Err(invalid(format!("clone {label} is being destroyed"))),
         CloneStatus::Creating | CloneStatus::Starting => Err(invalid(format!(
             "clone {label} is still starting; try again in a moment"
         ))),
     }
+}
+
+/// The lock that one wake or sleep of clone `id` holds at a time.
+fn clone_turn(ctx: &Ctx, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    ctx.waking
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The row of `id` (an id, else a name) and that row re-read under its wake/sleep lock.
+async fn locked_row(
+    ctx: &Ctx,
+    id_or_name: &str,
+) -> Result<(CloneRow, tokio::sync::OwnedMutexGuard<()>)> {
+    let id = ctx
+        .store()
+        .get_clone(id_or_name)?
+        .ok_or_else(|| not_found(id_or_name))?
+        .id;
+    let turn = clone_turn(ctx, &id).lock_owned().await;
+    // A destroy, wake or sleep may have finished while this one waited.
+    let row = ctx
+        .store()
+        .get_clone(&id)?
+        .filter(|r| r.id == id)
+        .ok_or_else(|| not_found(&id))?;
+    Ok((row, turn))
+}
+
+/// Starts a sleeping clone: the suspect check of recovery, then Postgres on the same folder,
+/// port (moved when taken, with the reservation and `.env` records following) and password.
+/// One wake per clone at a time; a caller that waited on another's wake gets the woken row.
+/// Returns the warnings of the start (a moved port).
+pub async fn wake(ctx: &Arc<Ctx>, id_or_name: &str) -> Result<(CloneRow, Vec<String>)> {
+    let (mut row, _turn) = locked_row(ctx, id_or_name).await?;
+    let label = row.name.clone().unwrap_or_else(|| row.id.clone());
+    match row.status {
+        CloneStatus::Ready => return Ok((row, Vec::new())),
+        CloneStatus::Sleeping => {}
+        CloneStatus::Stopping => return Err(invalid(format!("clone {label} is being destroyed"))),
+        CloneStatus::Creating | CloneStatus::Starting => {
+            return Err(invalid(format!(
+                "clone {label} is still starting; try again in a moment"
+            )))
+        }
+    }
+    let _mark = mark(ctx, &row.id, InFlightOp::Create)
+        .map_err(|_| invalid(format!("clone {label} is busy; try again in a moment")))?;
+    let started = Instant::now();
+    let old_port = row.port;
+    let res = async {
+        if crate::lifecycle::unclean(ctx, &row).await? && !row.suspect {
+            crate::lifecycle::mark_suspect(ctx, &mut row)?;
+        }
+        let warnings = restart_or_undo(ctx, &mut row).await?;
+        row.status = CloneStatus::Ready;
+        ctx.store().update_clone(&row)?;
+        Ok::<_, MitosisError>(warnings)
+    }
+    .await;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match res {
+        Ok(warnings) => {
+            // The idle clock starts again now, also for a wake by hand.
+            ctx.router().last_active.insert(row.id.clone(), now());
+            events::emit_clone(
+                ctx,
+                events::CLONE_WOKE,
+                &row,
+                serde_json::json!({
+                    "ok": true,
+                    "duration_ms": ms,
+                    "port_moved": row.port != old_port,
+                    "suspect": row.suspect,
+                }),
+            );
+            Ok((row, warnings))
+        }
+        Err(e) => {
+            log(ctx, &format!("wake of clone {} failed: {e}", row.id));
+            events::emit_clone(
+                ctx,
+                events::CLONE_WOKE,
+                &row,
+                serde_json::json!({ "ok": false, "duration_ms": ms, "error": e.code }),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// `mitosis wake`: wakes the clone (a no-op when it runs) and returns its info.
+pub async fn wake_info(ctx: &Arc<Ctx>, id_or_name: &str) -> Result<CloneInfo> {
+    let (row, warnings) = wake(ctx, id_or_name).await?;
+    let age = ctx
+        .store()
+        .current(&row.template)?
+        .map_or(0, |(_, g)| age_secs(g.built_at, now()));
+    let mut info = to_info(ctx, &row, age);
+    info.warnings.extend(warnings);
+    info.warnings.extend(crate::router::warning(ctx));
+    Ok(info)
+}
+
+/// Stops a running clone cleanly and marks it `Sleeping` (folder, port, password and `.env`
+/// records kept). Refuses while the router has a connection open to it; already sleeping is fine.
+/// `why` is the `reason` of the `clone.slept` event.
+pub async fn sleep(ctx: &Ctx, id_or_name: &str, why: &str) -> Result<()> {
+    let (mut row, _turn) = locked_row(ctx, id_or_name).await?;
+    let label = row.name.clone().unwrap_or_else(|| row.id.clone());
+    match row.status {
+        CloneStatus::Ready => {}
+        CloneStatus::Sleeping => return Ok(()),
+        _ => return Err(invalid(format!("clone {label} is not running"))),
+    }
+    let _mark = mark(ctx, &row.id, InFlightOp::Create)
+        .map_err(|_| invalid(format!("clone {label} is busy; try again in a moment")))?;
+    let open = || invalid(format!("clone {label} has open connections"));
+    if ctx.router().open_conns(&row.id) > 0 {
+        return Err(open());
+    }
+    // Marked first: a router connection that starts after this sees Sleeping and waits for the
+    // wake; one counted before it shows up in the second check.
+    ctx.store()
+        .set_clone_status(&row.id, CloneStatus::Sleeping)?;
+    if ctx.router().open_conns(&row.id) > 0 {
+        ctx.store().set_clone_status(&row.id, CloneStatus::Ready)?;
+        return Err(open());
+    }
+    ctx.router().close_clone(&row.id);
+    let install = install_for(ctx, &row.dir).ok_or_else(|| {
+        internal(format!(
+            "no Postgres install found for {}",
+            row.dir.display()
+        ))
+    });
+    let expected = row
+        .pg_pid
+        .zip(row.pg_start_time)
+        .map(|(pid, start_time)| RunningPg { pid, start_time });
+    let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
+    let stopped = match install {
+        Ok(i) => blocking(move || stop(&i, &dir, expected, t)).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = stopped {
+        // Possibly still running: it stays Ready, so nothing treats it as stopped.
+        let _ = ctx.store().set_clone_status(&row.id, CloneStatus::Ready);
+        return Err(e);
+    }
+    row.status = CloneStatus::Sleeping;
+    row.pg_pid = None;
+    row.pg_start_time = None;
+    ctx.store().update_clone(&row)?;
+    events::emit_clone(
+        ctx,
+        events::CLONE_SLEPT,
+        &row,
+        serde_json::json!({ "reason": why }),
+    );
+    Ok(())
 }
 
 /// Why a suspect clone should be replaced, and how.
@@ -292,6 +466,10 @@ async fn reuse_named(
         ))
         .with_hint("use --fresh"));
     }
+    let mut woke = Vec::new();
+    if row.status == CloneStatus::Sleeping {
+        (row, woke) = wake(ctx, &row.id).await?;
+    }
     let busy = ctx
         .in_flight
         .lock()
@@ -321,6 +499,7 @@ async fn reuse_named(
             .map_or(0, |(_, g)| age_secs(g.built_at, t))
     };
     let mut info = to_info(ctx, &row, age);
+    info.warnings.extend(woke);
     info.existing = true;
     Ok(Some(info))
 }
@@ -803,6 +982,32 @@ pub async fn restart(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
     Ok(warnings)
 }
 
+/// `restart`, and on error stops whatever it started and puts the old pid and port back, so the
+/// next try starts from the recorded identity (the status is left as it was).
+pub(crate) async fn restart_or_undo(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
+    let (old_pid, old_start, old_port) = (row.pg_pid, row.pg_start_time, row.port);
+    let err = match restart(ctx, row).await {
+        Ok(warnings) => return Ok(warnings),
+        Err(e) => e,
+    };
+    let started = row
+        .pg_pid
+        .zip(row.pg_start_time)
+        .filter(|_| row.pg_pid != old_pid)
+        .map(|(pid, start_time)| RunningPg { pid, start_time });
+    if let (Some(pg), Some(install)) = (started, install_for(ctx, &row.dir)) {
+        let (dir, t) = (row.dir.clone(), ctx.config().stop_timeout);
+        let _ = blocking(move || stop(&install, &dir, Some(pg), t)).await;
+    }
+    row.pg_pid = old_pid;
+    row.pg_start_time = old_start;
+    // A port move already saved must be undone too, or the retry would think the URL never
+    // changed and leave the reservation and .env records on the old port.
+    row.port = old_port;
+    let _ = ctx.store().update_clone(row);
+    Err(err)
+}
+
 /// Destroy as a user asks for it: a protected clone needs `force`; `forget` also drops the
 /// name's reservation (even when no clone of that name is left).
 pub async fn destroy_with(
@@ -906,6 +1111,8 @@ fn remove_if_present(path: &Path, dir: bool) -> Result<()> {
 pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Result<()> {
     ctx.store()
         .set_clone_status(&row.id, CloneStatus::Stopping)?;
+    // Router clients go first, so the stop does not wait on them and none stays half-open.
+    ctx.router().close_clone(&row.id);
     let dir = ctx.home.clones_dir().join(&row.id);
     let sock = ctx.home.sockets_dir().join(&row.id);
     let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
@@ -930,7 +1137,10 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Res
         remove_if_present(&log, false)
     })
     .await?;
-    ctx.router().close_clone(&row.id);
+    ctx.waking
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&row.id);
     restore_env(ctx, &row.id);
     let deleted = ctx.store().delete_clone(&row.id);
     if deleted.is_ok() {
@@ -1117,5 +1327,8 @@ mod tests {
         send(destroy(ctx, "x"));
         send(stop_and_remove(ctx, row, "user"));
         send(restart(ctx, Box::leak(Box::new(row.clone()))));
+        send(wake(ctx, "x"));
+        send(sleep(ctx, "x", "idle"));
+        send(ensure_running(ctx, "x"));
     }
 }
