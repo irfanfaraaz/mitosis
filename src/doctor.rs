@@ -1,7 +1,8 @@
 //! `mitosis doctor`: read-only health checks that work with the daemon down.
 //!
 //! The store is opened read-only and never migrated; nothing here deletes or starts anything
-//! except `--fix` (finish pending `.env` restores, then the usual gc) and the throwaway Postgres
+//! except `--fix` (finish pending `.env` restores, then gc unless it would also destroy clones) and
+//! the throwaway Postgres
 //! per installed major, which lives under `<home>/logs/doctor-*` and is always cleaned up.
 use crate::client;
 use crate::clone_backend::{free_space, same_volume, ApfsBackend, CloneBackend};
@@ -13,6 +14,7 @@ use crate::paths::Home;
 use crate::pg::cluster::{check_socket_path, log_tail};
 use crate::pg::{check_extensions, discover_with, find_major, initdb, start, stop, wait_ready};
 use crate::pg::{managed, parse_version, PgInstall, StartOptions};
+use crate::proc_util::{is_alive, process_start_time};
 use crate::protocol::{DaemonStatus, MigrateCmd, Request, Response, TemplateSource};
 use crate::service;
 use crate::state::SCHEMA_VERSION;
@@ -125,6 +127,9 @@ struct CloneRow {
     name: Option<String>,
     dir: PathBuf,
     suspect: bool,
+    expires_at: i64,
+    parent_pid: Option<i32>,
+    parent_start_time: Option<u64>,
 }
 
 struct EnvRef {
@@ -239,29 +244,34 @@ fn read_snapshot(path: &Path) -> rusqlite::Result<StoreView> {
             })
         },
     )?;
-    let clones = rows(&conn, "SELECT id, name, dir, suspect FROM clones", |r| {
-        Ok(CloneRow {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            dir: PathBuf::from(r.get::<_, String>(2)?),
-            suspect: r.get(3)?,
-        })
-    })?;
-    // Older v2 stores may lack these tables until a daemon opens them: read as empty.
+    let clones = rows(
+        &conn,
+        "SELECT id, name, dir, suspect, expires_at, parent_pid, parent_start_time FROM clones",
+        |r| {
+            Ok(CloneRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                dir: PathBuf::from(r.get::<_, String>(2)?),
+                suspect: r.get(3)?,
+                expires_at: r.get(4)?,
+                parent_pid: r.get(5)?,
+                parent_start_time: r.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+            })
+        },
+    )?;
+    // A current-schema store has every table: a failed read is a real error, not an empty list.
     let pending = rows(&conn, "SELECT file FROM pending_restores", |r| {
         Ok(EnvRef {
             clone_id: None,
             file: PathBuf::from(r.get::<_, String>(0)?),
         })
-    })
-    .unwrap_or_default();
+    })?;
     let records = rows(&conn, "SELECT clone_id, file FROM env_records", |r| {
         Ok(EnvRef {
             clone_id: Some(r.get(0)?),
             file: PathBuf::from(r.get::<_, String>(1)?),
         })
-    })
-    .unwrap_or_default();
+    })?;
     let pending_n = pending.len();
     let mut env_files = pending;
     env_files.extend(records);
@@ -276,27 +286,24 @@ fn read_snapshot(path: &Path) -> rusqlite::Result<StoreView> {
                 branch: r.get(3)?,
             })
         },
-    )
-    .unwrap_or_default();
+    )?;
     let mask_hashes = rows(
         &conn,
         "SELECT template, gen, mask_hash FROM generations",
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-    .unwrap_or_default();
-    let events = conn
-        .query_row(
-            "SELECT COUNT(*), MIN(ts), COALESCE(SUM(length(detail)), 0) FROM events",
-            [],
-            |r| {
-                Ok(EventStats {
-                    rows: r.get::<_, i64>(0)?.max(0) as u64,
-                    oldest: r.get(1)?,
-                    bytes: r.get::<_, i64>(2)?.max(0) as u64,
-                })
-            },
-        )
-        .ok();
+    )?;
+    let events = conn.query_row(
+        "SELECT COUNT(*), MIN(ts), COALESCE(SUM(length(detail)), 0) FROM events",
+        [],
+        |r| {
+            Ok(EventStats {
+                rows: r.get::<_, i64>(0)?.max(0) as u64,
+                oldest: r.get(1)?,
+                bytes: r.get::<_, i64>(2)?.max(0) as u64,
+            })
+        },
+    )?;
+    let events = Some(events);
     Ok(StoreView::Ready(Snapshot {
         templates,
         gens,
@@ -384,6 +391,28 @@ fn stale_rows(snap: &Snapshot) -> Vec<String> {
     out
 }
 
+/// Clones a gc would destroy for their TTL or because their parent process is gone, as one line
+/// each. Looked at by name and time only: a clone whose server also died is restarted or removed
+/// by gc as its kind decides, which this does not predict.
+fn doomed_clones(snap: &Snapshot, now: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in &snap.clones {
+        let who = c.name.as_deref().unwrap_or(&c.id);
+        if c.expires_at <= now {
+            let ago = format_duration(Duration::from_secs((now - c.expires_at) as u64));
+            out.push(format!("clone {who} (expired {ago} ago)"));
+        } else if let Some(pid) = c.parent_pid {
+            let alive = is_alive(pid)
+                && c.parent_start_time
+                    .is_none_or(|t| process_start_time(pid) == Some(t));
+            if !alive {
+                out.push(format!("clone {who} (its parent process {pid} is gone)"));
+            }
+        }
+    }
+    out
+}
+
 // ---- throwaway Postgres ----------------------------------------------------------------------
 
 async fn smoke_inner(
@@ -414,6 +443,34 @@ async fn smoke_inner(
     wait_ready(install, &pg, &opts, Duration::from_secs(30))
         .await
         .map_err(|e| e.message)
+}
+
+/// Removes `logs/doctor-<major>-<pid>` folders that an interrupted doctor run left behind: the
+/// process that made one is gone. A server still running in one is stopped first, and a folder
+/// whose server will not stop stays.
+fn sweep_smoke(home: &Home, installs: &[PgInstall]) {
+    for (name, dir) in entries(&home.logs_dir()) {
+        let Some(rest) = name.strip_prefix("doctor-") else {
+            continue;
+        };
+        let parts = rest
+            .split_once('-')
+            .and_then(|(m, p)| Some((m.parse::<u32>().ok()?, p.parse::<i32>().ok()?)));
+        let Some((major, pid)) = parts else { continue };
+        if pid == std::process::id() as i32 || is_alive(pid) {
+            continue;
+        }
+        let data = dir.join("data");
+        if data.join("postmaster.pid").exists() {
+            let Some(i) = installs.iter().find(|i| i.major == major) else {
+                continue;
+            };
+            if stop(i, &data, None, Duration::from_secs(10)).is_err() {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// initdb, start and stop one Postgres of `install` in a temp folder, and clean up either way.
@@ -985,7 +1042,11 @@ async fn check_smoke(home: &Home, cfg: &Config, installs: &[PgInstall]) -> Check
     if !home.logs_dir().is_dir() {
         return Check::new("postgres_smoke", Level::Ok, "skipped: no home folder");
     }
+    // Only names the socket file: the throwaway server opens no TCP listener.
     let port = *cfg.port_range.start();
+    let h = home.clone();
+    let swept = installs.to_vec();
+    let _ = tokio::task::spawn_blocking(move || sweep_smoke(&h, &swept)).await;
     let mut f = Vec::new();
     let mut ok = Vec::new();
     for i in installs {
@@ -1090,6 +1151,12 @@ fn check_gc(home: &Home, snap: &Snapshot, daemon_up: bool) -> Check {
         .map(|p| (Level::Warn, format!("orphan folder {}", p.display())))
         .collect();
     f.extend(stale_rows(snap).into_iter().map(|s| (Level::Warn, s)));
+    let doomed = doomed_clones(snap, now());
+    f.extend(
+        doomed
+            .iter()
+            .map(|d| (Level::Warn, format!("gc would destroy {d}"))),
+    );
     if daemon_up && !orphans.is_empty() {
         f.push((
             Level::Warn,
@@ -1099,8 +1166,11 @@ fn check_gc(home: &Home, snap: &Snapshot, daemon_up: bool) -> Check {
     let c = summarize("gc_dry_run", f, "nothing for gc to clean");
     if c.level == Level::Ok {
         c
-    } else {
+    } else if doomed.is_empty() {
         c.fix("mitosis doctor --fix (or mitosis gc)")
+    } else {
+        // --fix leaves gc alone while it would destroy clones; that is a decision for the user.
+        c.fix("mitosis gc (it destroys the clones listed above too)")
     }
 }
 
@@ -1199,7 +1269,19 @@ async fn apply_fix(home: &Home) -> Check {
         ));
         f.extend(warnings.into_iter().map(|w| (Level::Warn, w)));
     }
-    if !orphan_folders(home, &snap).is_empty() || !stale_rows(&snap).is_empty() {
+    let doomed = doomed_clones(&snap, now());
+    if !doomed.is_empty() {
+        // gc destroys what is due, along with the orphans; the user decides that, not --fix.
+        f.push((
+            Level::Warn,
+            format!(
+                "gc skipped: it would also destroy {} clone(s) you did not ask about: {}",
+                doomed.len(),
+                doomed.join(", ")
+            ),
+        ));
+        f.push((Level::Warn, "run `mitosis gc` to run it anyway".into()));
+    } else if !orphan_folders(home, &snap).is_empty() || !stale_rows(&snap).is_empty() {
         match client::request(home, Request::Gc).await {
             Ok(Response::Gc(r)) => {
                 f.push((
@@ -1393,5 +1475,107 @@ mod tests {
             ]
         );
         assert!(home.clones_dir().join("c0000aa").exists());
+    }
+
+    fn clone_row(id: &str, expires_at: i64, parent: Option<i32>) -> crate::state::CloneRow {
+        crate::state::CloneRow {
+            id: id.into(),
+            name: None,
+            template: "main".into(),
+            dir: PathBuf::from(format!("/h/clones/{id}")),
+            port: 54321,
+            socket_dir: PathBuf::from(format!("/h/sockets/{id}")),
+            password: "pw".into(),
+            database: "app".into(),
+            pg_pid: None,
+            pg_start_time: None,
+            parent_pid: parent,
+            parent_start_time: None,
+            created_at: 0,
+            expires_at,
+            durable: false,
+            status: crate::state::CloneStatus::Ready,
+            generation: 1,
+            protected: false,
+            suspect: false,
+        }
+    }
+
+    #[test]
+    fn doomed_clones_lists_expired_and_orphaned_ones() {
+        let row = |id: &str, expires_at, parent_pid| CloneRow {
+            id: id.into(),
+            name: None,
+            dir: PathBuf::new(),
+            suspect: false,
+            expires_at,
+            parent_pid,
+            parent_start_time: None,
+        };
+        let snap = Snapshot {
+            clones: vec![
+                row("c000001", 100, None),
+                row("c000002", 10_000, None),
+                row("c000003", 10_000, Some(std::process::id() as i32)),
+                // Far above any real pid limit on macOS.
+                row("c000004", 10_000, Some(2_000_000_000)),
+            ],
+            ..Snapshot::default()
+        };
+        let got = doomed_clones(&snap, 7_300);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].starts_with("clone c000001 (expired 2h"), "{got:?}");
+        assert!(
+            got[1].contains("c000004") && got[1].contains("parent"),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_gc_alone_while_it_would_destroy_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        {
+            let store = crate::state::Store::open(&home.state_db()).unwrap();
+            store.insert_clone(&clone_row("c000001", 1, None)).unwrap();
+        }
+        let orphan = home.clones_dir().join("c000002");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let check = apply_fix(&home).await;
+        assert!(check.detail.contains("gc skipped"), "{}", check.detail);
+        assert!(check.detail.contains("c000001"), "{}", check.detail);
+        // Nothing was removed, and no daemon was asked (there is none to answer).
+        assert!(orphan.exists());
+        assert!(!home.daemon_sock().exists());
+        // The dry run lists the same clone.
+        let StoreView::Ready(snap) = read_store(&home) else {
+            panic!("store not readable");
+        };
+        let gc = check_gc(&home, &snap, false);
+        assert!(
+            gc.detail.contains("gc would destroy clone c000001"),
+            "{}",
+            gc.detail
+        );
+    }
+
+    #[test]
+    fn sweep_removes_folders_of_dead_runs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().to_path_buf());
+        home.ensure_dirs().unwrap();
+        let dead = home.logs_dir().join("doctor-18-2000000000");
+        let mine = home
+            .logs_dir()
+            .join(format!("doctor-18-{}", std::process::id()));
+        let other = home.logs_dir().join("service.log.d");
+        for d in [&dead, &mine, &other] {
+            std::fs::create_dir_all(d.join("data")).unwrap();
+        }
+        sweep_smoke(&home, &[]);
+        assert!(!dead.exists());
+        assert!(mine.exists());
+        assert!(other.exists());
     }
 }

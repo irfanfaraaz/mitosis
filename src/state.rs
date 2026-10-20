@@ -21,7 +21,7 @@ pub enum CloneStatus {
 }
 
 impl CloneStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             CloneStatus::Creating => "creating",
             CloneStatus::Starting => "starting",
@@ -613,11 +613,12 @@ impl Store {
     }
 
     /// Removes the template and all its generation rows (not their folders).
+    /// Removes the template and its generation rows together, so a failure never leaves one half.
     pub fn delete_template(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM generations WHERE template = ?1", [name])?;
-        self.conn
-            .execute("DELETE FROM templates WHERE name = ?1", [name])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM generations WHERE template = ?1", [name])?;
+        tx.execute("DELETE FROM templates WHERE name = ?1", [name])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1132,6 +1133,28 @@ mod tests {
         assert_eq!(store.list_templates().unwrap().len(), 2);
         store.delete_template("other").unwrap();
         assert_eq!(store.list_templates().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_template_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).unwrap();
+        store.insert_template(&tpl("main")).unwrap();
+        store.insert_generation(&gen("main", 1)).unwrap();
+        // A failing second delete must take the first one back with it.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER no_tpl_delete BEFORE DELETE ON templates
+                 BEGIN SELECT RAISE(ABORT, 'no'); END;",
+            )
+            .unwrap();
+        assert!(store.delete_template("main").is_err());
+        assert_eq!(store.list_generations("main").unwrap().len(), 1);
+        store.conn.execute_batch("DROP TRIGGER no_tpl_delete").unwrap();
+        store.delete_template("main").unwrap();
+        assert!(store.list_generations("main").unwrap().is_empty());
+        assert!(store.get_template("main").unwrap().is_none());
     }
 
     #[test]

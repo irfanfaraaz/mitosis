@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_home_is_refused_and_left_untouched() {
+    fn foreign_home_is_refused_untouched_then_adopted_once_only_own_entries_remain() {
         let tmp = tempfile::tempdir().unwrap();
         let h = Home::at(tmp.path().join("m"));
         std::fs::create_dir(&h.root).unwrap();

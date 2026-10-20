@@ -1,5 +1,5 @@
 use crate::error::{ErrorCode, MitosisError, Result};
-use crate::names::{format_duration, parse_duration};
+use crate::names::parse_duration;
 use crate::paths::Home;
 use serde::Serialize;
 use std::io::Write;
@@ -226,6 +226,19 @@ fn format_size(n: u64) -> String {
     n.to_string()
 }
 
+/// One unit, the largest that divides the duration exactly (`90s`, not `1m30s`), so that
+/// `parse_wait(format_setting_duration(d)) == d` and the shown value can be pasted into
+/// `config set`. `0s` for zero.
+fn format_setting_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    for (unit, size) in [('d', 86_400), ('h', 3600), ('m', 60)] {
+        if secs != 0 && secs % size == 0 {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
 fn parse_budget(v: &str) -> Option<Option<u64>> {
     if v.eq_ignore_ascii_case("off") {
         Some(None)
@@ -301,6 +314,27 @@ impl Config {
             .collect())
     }
 
+    /// The environment variable that overrides `key` and the value in effect, if one is set.
+    pub fn env_override(home: &Home, key: &str) -> Result<Option<(String, String)>> {
+        Config::env_override_with(home, key, &|k| std::env::var(k).ok())
+    }
+
+    fn env_override_with(
+        home: &Home,
+        key: &str,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<(String, String)>> {
+        let (cfg, sources) = Config::default().layered(home, var)?;
+        Ok(KEYS
+            .iter()
+            .zip(sources)
+            .find(|(k, _)| k.key == key)
+            .and_then(|(k, source)| match source {
+                ConfigSource::Env(v) => Some((v, cfg.show(k.key))),
+                _ => None,
+            }))
+    }
+
     /// Validates `value`, then stores it in `<home>/config.toml`, keeping the other keys.
     pub fn set_in_file(home: &Home, key: &str, value: &str) -> Result<()> {
         let value = value.trim();
@@ -321,7 +355,10 @@ impl Config {
         let text = toml::to_string(&table)
             .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("encode config: {e}")))?;
         // A temp file and a rename, so a reader never sees a half-written file.
-        let tmp = home.root.join("config.toml.tmp");
+        // Named by pid, so two processes writing at once never share a half-written file.
+        let tmp = home
+            .root
+            .join(format!("config.toml.tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -330,7 +367,10 @@ impl Config {
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, home.config_file())?;
+        if let Err(e) = std::fs::rename(&tmp, home.config_file()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -360,13 +400,15 @@ impl Config {
             "min_free_disk" => format_size(self.min_free_bytes),
             "ram_budget" => budget(self.ram_budget),
             "disk_budget" => budget(self.disk_budget),
-            "queue_wait" => format_duration(self.queue_wait),
+            "queue_wait" => format_setting_duration(self.queue_wait),
             "clone_disk_warn" => format_size(self.clone_disk_warn),
             "router" => if self.router { "on" } else { "off" }.to_string(),
             "router_port" => self.router_port.to_string(),
             "router_listen" => self.router_listen.to_string(),
-            "idle_sleep" => self.idle_sleep.map_or("off".into(), format_duration),
-            "idle_reap" => self.idle_reap.map_or("off".into(), format_duration),
+            "idle_sleep" => self
+                .idle_sleep
+                .map_or("off".into(), format_setting_duration),
+            "idle_reap" => self.idle_reap.map_or("off".into(), format_setting_duration),
             _ => String::new(),
         }
     }
@@ -696,5 +738,49 @@ mod tests {
             assert_eq!(c.port_range, 60000..=60019);
             assert_eq!(c.scheduler_tick, Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn shown_durations_parse_back() {
+        for secs in [0, 1, 45, 60, 90, 3600, 5400, 7200, 86_400, 90_000] {
+            let d = Duration::from_secs(secs);
+            let shown = format_setting_duration(d);
+            assert_eq!(parse_wait(&shown), Some(d), "{secs}s shown as {shown}");
+        }
+        assert_eq!(format_setting_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(format_setting_duration(Duration::from_secs(7200)), "2h");
+    }
+
+    #[test]
+    fn set_in_file_leaves_no_temp_file() {
+        let (_tmp, home) = home();
+        Config::set_in_file(&home, "max_clones", "4").unwrap();
+        Config::set_in_file(&home, "router", "off").unwrap();
+        let names: Vec<String> = std::fs::read_dir(&home.root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".tmp")), "{names:?}");
+        assert!(names.contains(&"config.toml".to_string()));
+    }
+
+    #[test]
+    fn env_override_names_the_variable_in_effect() {
+        let (_tmp, home) = home();
+        Config::set_in_file(&home, "max_clones", "4").unwrap();
+        assert_eq!(
+            Config::env_override_with(&home, "max_clones", &no_env).unwrap(),
+            None
+        );
+        let env = |k: &str| (k == "MITOSIS_MAX_CLONES").then(|| "9".to_string());
+        assert_eq!(
+            Config::env_override_with(&home, "max_clones", &env).unwrap(),
+            Some(("MITOSIS_MAX_CLONES".to_string(), "9".to_string()))
+        );
+        assert_eq!(
+            Config::env_override_with(&home, "router", &env).unwrap(),
+            None
+        );
     }
 }

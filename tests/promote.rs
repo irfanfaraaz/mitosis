@@ -56,6 +56,44 @@ async fn promote_creates_generation_and_clone_keeps_url() {
     assert_eq!(psql_url(&env, &n.url, "select v from t"), "p");
 }
 
+/// A kill while the clone is stopped must not lose the promoted data: the generation is in the
+/// store before the clone's server is started again.
+#[tokio::test]
+async fn promoted_generation_is_committed_before_the_clone_restarts() {
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(v text)").await;
+    let c = create(&env.ctx, clone_args("main")).await.unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], c.port));
+    let done = Arc::new(AtomicBool::new(false));
+    let (ctx, flag) = (env.ctx.clone(), done.clone());
+    // Watches the clone's port: once it was closed and is open again, generation 2 must exist.
+    let watcher = std::thread::spawn(move || {
+        let mut was_down = false;
+        while !flag.load(Ordering::Relaxed) {
+            let up = TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_ok();
+            if !up {
+                was_down = true;
+            } else if was_down {
+                let committed = ctx.store().get_generation("main", 2).unwrap().is_some();
+                return Some(committed);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        None
+    });
+    promote(&env.ctx, &c.id, None).await.unwrap();
+    done.store(true, Ordering::Relaxed);
+    assert_eq!(
+        watcher.join().unwrap(),
+        Some(true),
+        "restart began before the commit"
+    );
+}
+
 #[tokio::test]
 async fn promote_refuses_a_suspect_clone() {
     let Some(env) = TestEnv::new() else { return };

@@ -186,6 +186,33 @@ async fn failed_migrate_keeps_current() {
 }
 
 #[tokio::test]
+async fn template_set_with_nothing_to_change_is_refused() {
+    let (_tmp, ctx) = bare_ctx();
+    fake_template(&ctx);
+    let e = templates::set(&ctx, set_args(TemplateSettings::default())).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.message.contains("setting to change"), "{}", e.message);
+    // A resume alone is a change, and it lifts the retry gate of a failed automatic build.
+    {
+        let store = ctx.store();
+        let mut t = store.get_template("main").unwrap().unwrap();
+        t.paused = true;
+        t.last_error = Some("boom".into());
+        t.last_attempt_at = Some(1_700_000_000);
+        store.update_template_settings(&t).unwrap();
+    }
+    let args = TemplateSetArgs {
+        resume: true,
+        ..set_args(TemplateSettings::default())
+    };
+    templates::set(&ctx, args).unwrap();
+    let t = ctx.store().get_template("main").unwrap().unwrap();
+    assert!(!t.paused);
+    assert_eq!(t.last_attempt_at, None);
+    assert_eq!(t.last_error.as_deref(), Some("boom"));
+}
+
+#[tokio::test]
 async fn auto_migrate_requires_migrations_and_migrate() {
     let (tmp, ctx) = bare_ctx();
     fake_template(&ctx);

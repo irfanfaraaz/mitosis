@@ -528,9 +528,29 @@ fn log_files(root: &Path, text: &mut String) {
     }
 }
 
+/// `redact_url`, and every `SCRAM-SHA-256$...` password hash (pg_upgrade logs print role
+/// statements) cut to its prefix.
+fn redact(text: &str) -> String {
+    const HASH: &str = "SCRAM-SHA-256$";
+    let text = redact_url(text);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find(HASH) {
+        let (head, tail) = rest.split_at(i + HASH.len());
+        out.push_str(head);
+        out.push_str("***");
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn append_log(log: &Path, text: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log) {
-        let _ = writeln!(f, "{}", redact_url(text));
+        let _ = writeln!(f, "{}", redact(text));
     }
 }
 
@@ -559,7 +579,7 @@ async fn fail(
     e: MitosisError,
 ) -> MitosisError {
     append_log(&work.log, &format!("mitosis: {step} failed: {e}"));
-    let tail = redact_url(&log_tail(&work.log, 20));
+    let tail = redact(&log_tail(&work.log, 20));
     let (o, t, timeout) = (old.clone(), target.clone(), ctx.config().stop_timeout);
     let (a, b, tmp, sock) = (
         work.a.clone(),
@@ -629,6 +649,17 @@ mod tests {
             .unwrap();
         assert_eq!(s, settings("c", None, false));
         assert!(parse_settings("garbage").is_err());
+    }
+
+    #[test]
+    fn password_hashes_are_cut_from_logs() {
+        let hash = format!("SCRAM-SHA-256${}", "4096:abc$def:ghi");
+        let text = format!("ALTER ROLE app WITH PASSWORD '{hash}'; next");
+        assert_eq!(
+            redact(&text),
+            "ALTER ROLE app WITH PASSWORD 'SCRAM-SHA-256$***'; next"
+        );
+        assert_eq!(redact("plain line"), "plain line");
     }
 
     #[test]

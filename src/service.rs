@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 pub const SERVICE_LABEL: &str = "io.github.irfanfaraaz.mitosis";
 
@@ -115,6 +116,25 @@ fn launchctl_failed(what: &str, o: &std::process::Output) -> MitosisError {
     )
 }
 
+/// Calls `cond` up to `tries` times, `pause` apart; true as soon as it holds.
+fn wait_until(tries: u32, pause: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    for i in 0..tries {
+        if cond() {
+            return true;
+        }
+        if i + 1 < tries {
+            std::thread::sleep(pause);
+        }
+    }
+    false
+}
+
+/// True when `a` and `b` are the same folder, also through symlinks (`/tmp` and `/private/tmp`).
+fn same_folder(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    a == b || canon(a) == canon(b)
+}
+
 /// The text of the first `<string>` after `<key>key</key>`.
 fn string_after(text: &str, key: &str) -> Option<String> {
     let rest = &text[text.find(&format!("<key>{key}</key>"))?..];
@@ -136,6 +156,11 @@ pub fn install() -> Result<()> {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
     // Reloading an already-loaded service would fail; "not loaded" on this first call is fine.
     let _ = launchctl(&["bootout", &target()])?;
+    // bootout returns before launchd has dropped the job; a bootstrap in that gap fails with an
+    // I/O error, so wait (bounded) until it is gone.
+    wait_until(50, Duration::from_millis(100), || {
+        !launchctl(&["print", &target()]).is_ok_and(|o| o.status.success())
+    });
     let o = launchctl(&["bootstrap", &domain(), &file.to_string_lossy()])?;
     if !o.status.success() {
         return Err(launchctl_failed("bootstrap", &o));
@@ -176,7 +201,7 @@ pub fn manages(home: &Home) -> bool {
     // A service without MITOSIS_HOME serves the default home, i.e. a caller with the variable unset.
     let theirs = string_after(&text, "MITOSIS_HOME");
     let same = match theirs {
-        Some(h) => Path::new(&h) == home.root,
+        Some(h) => same_folder(Path::new(&h), &home.root),
         None => std::env::var_os("MITOSIS_HOME").is_none_or(|h| h.is_empty()),
     };
     same && launchctl(&["print", &target()]).is_ok_and(|o| o.status.success())
@@ -214,6 +239,17 @@ mod tests {
             assert!(p.contains(want), "missing {want}:\n{p}");
         }
         assert!(!plist(Path::new("/b"), None, "/p").contains("MITOSIS_HOME"));
+        // Markup characters in the binary and PATH are escaped and read back.
+        let odd = plist(Path::new("/a<b>/m&m"), None, "/x<y>:/z");
+        assert!(
+            odd.contains("<string>/a&lt;b&gt;/m&amp;m</string>"),
+            "{odd}"
+        );
+        assert!(odd.contains("<string>/x&lt;y&gt;:/z</string>"), "{odd}");
+        assert_eq!(
+            string_after(&odd, "ProgramArguments").as_deref(),
+            Some("/a<b>/m&m")
+        );
         assert_eq!(
             string_after(&p, "ProgramArguments").as_deref(),
             Some("/opt/bin/mitosis")
@@ -230,5 +266,34 @@ mod tests {
         if let Ok(o) = Command::new("plutil").arg("-lint").arg(&file).output() {
             assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
         }
+    }
+
+    #[test]
+    fn wait_until_stops_early_and_gives_up() {
+        let mut calls = 0;
+        let ok = wait_until(5, Duration::ZERO, || {
+            calls += 1;
+            calls == 3
+        });
+        assert!(ok);
+        assert_eq!(calls, 3);
+        let mut calls = 0;
+        assert!(!wait_until(4, Duration::ZERO, || {
+            calls += 1;
+            false
+        }));
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn homes_match_through_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_folder(&real, &link));
+        assert!(same_folder(&real, &real));
+        assert!(!same_folder(&real, &tmp.path().join("other")));
     }
 }

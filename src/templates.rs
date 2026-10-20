@@ -5,6 +5,7 @@ use crate::error::{ErrorCode, MitosisError, Result};
 use crate::events;
 use crate::mask::{mask_statements, subset_statements, ColumnInfo, ForeignKey, MaskFile};
 use crate::names::{random_hex, validate_name};
+use crate::paths::Home;
 use crate::pg::{
     disable_preload_libraries, ensure_postgres_superuser, initdb, is_missing_library,
     make_standalone, psql, read_pg_version, start, stop, wait_ready, PgInstall, RunningPg,
@@ -232,6 +233,10 @@ fn refresh_args(ctx: &Ctx, name: &str, path: Option<String>) -> Result<TemplateI
 /// Changes the settings of `name`; `resume` clears `paused`.
 pub fn set(ctx: &Ctx, args: TemplateSetArgs) -> Result<TemplateInfo> {
     validate_name("template", &args.name)?;
+    if args.max_age_secs.is_none() && !args.resume && args.settings == TemplateSettings::default() {
+        return Err(invalid("template set needs a setting to change")
+            .with_hint("for example: mitosis template set <name> --keep 5"));
+    }
     check_mask_file(&args.settings)?;
     {
         let store = ctx.store();
@@ -241,6 +246,8 @@ pub fn set(ctx: &Ctx, args: TemplateSetArgs) -> Result<TemplateInfo> {
         apply_settings(&mut t, args.max_age_secs, &args.settings)?;
         if args.resume {
             t.paused = false;
+            // The last failure stays visible, but it no longer holds the next automatic build back.
+            t.last_attempt_at = None;
         }
         store.update_template_settings(&t)?;
     }
@@ -273,6 +280,12 @@ fn apply_settings(
         .is_some_and(|m| m.command.trim().is_empty())
     {
         return Err(invalid("--migrate needs a command, or off"));
+    }
+    if let Some(m) = s.migrate.as_ref().filter(|m| !m.cwd.is_dir()) {
+        return Err(invalid(format!(
+            "--migrate would run in {}, which is not a folder",
+            m.cwd.display()
+        )));
     }
     if let Some(v) = max_age_secs {
         t.max_age_secs = v;
@@ -525,6 +538,28 @@ pub fn redact_url(text: &str) -> String {
             .unwrap_or(after.len());
         out.push_str(&mask_query_password(&after[..url_end]));
         rest = &after[url_end..];
+    }
+    out.push_str(rest);
+    mask_env_passwords(&out)
+}
+
+/// Masks the value of every `NAME_PASSWORD=<value>` assignment (`PGPASSWORD=secret psql ...`),
+/// quoted or not, as `***`.
+fn mask_env_passwords(text: &str) -> String {
+    const KEY: &str = "PASSWORD=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(KEY) {
+        let (head, tail) = rest.split_at(i + KEY.len());
+        out.push_str(head);
+        let value_len = match tail.chars().next() {
+            Some(q @ ('\'' | '"')) => tail[1..].find(q).map_or(tail.len(), |e| e + 2),
+            _ => tail.find(char::is_whitespace).unwrap_or(tail.len()),
+        };
+        if value_len > 0 {
+            out.push_str("***");
+        }
+        rest = &tail[value_len..];
     }
     out.push_str(rest);
     out
@@ -1123,6 +1158,13 @@ pub(crate) fn build_dir_name(name: &str, ts: i64) -> String {
 
 fn old_dir_name(name: &str, ts: i64) -> String {
     format!(".{}.old-{ts}", folder_stem(name))
+}
+
+/// The build log of template `name`; a branch template's name has `/`-bearing parts, so the
+/// file is named by its folder stem.
+pub(crate) fn build_log_path(home: &Home, name: &str) -> PathBuf {
+    home.logs_dir()
+        .join(format!("template-{}.log", folder_stem(name)))
 }
 
 /// The folder of generation `gen` of template `name`, in `templates/`.
@@ -2189,10 +2231,7 @@ fn build_port(ctx: &Ctx, skip: &HashSet<u16>) -> Result<u16> {
 /// Options for a private build server of `name` on a free port. Truncates the build log, so an
 /// error tail belongs to this build.
 fn build_start_options(ctx: &Ctx, name: &str) -> Result<StartOptions> {
-    let log = ctx
-        .home
-        .logs_dir()
-        .join(format!("template-{}.log", folder_stem(name)));
+    let log = build_log_path(&ctx.home, name);
     std::fs::File::create(&log)?;
     let port = build_port(ctx, &HashSet::new())?;
     Ok(StartOptions {
@@ -2781,6 +2820,49 @@ mod tests {
             "psql 'postgres://a:***@h/db' && psql postgresql://b:***@h2:1/x"
         );
         assert_eq!(redact_url("postgres://u@h/db"), "postgres://u@h/db");
+    }
+
+    #[test]
+    fn redacts_password_env_assignments() {
+        assert_eq!(
+            redact_url("PGPASSWORD=s3cret psql -c 'select 1'"),
+            "PGPASSWORD=*** psql -c 'select 1'"
+        );
+        assert_eq!(
+            redact_url("DB_PASSWORD='a b' PGPASSWORD=\"x y\" run"),
+            "DB_PASSWORD=*** PGPASSWORD=*** run"
+        );
+        assert_eq!(redact_url("echo PASSWORD= done"), "echo PASSWORD= done");
+    }
+
+    #[test]
+    fn migrate_cwd_must_be_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let migrate = |cwd: PathBuf| TemplateSettings {
+            migrate: Some(crate::protocol::MigrateCmd {
+                command: "make".into(),
+                cwd,
+                path: None,
+            }),
+            ..Default::default()
+        };
+        let mut t = TemplateRow::new("m", "app", TemplateSource::Url { url: "x".into() }, None, 1);
+        apply_settings(&mut t, None, &migrate(tmp.path().to_path_buf())).unwrap();
+        let e = apply_settings(&mut t, None, &migrate(tmp.path().join("gone"))).unwrap_err();
+        assert!(e.message.contains("not a folder"), "{}", e.message);
+    }
+
+    #[test]
+    fn build_log_name_is_safe_for_branch_templates() {
+        let home = Home::at(PathBuf::from("/h"));
+        assert_eq!(
+            build_log_path(&home, "main"),
+            home.logs_dir().join("template-main.log")
+        );
+        let log = build_log_path(&home, &branch_template_name("main", "feature/x y"));
+        let file = log.file_name().unwrap().to_str().unwrap();
+        assert_eq!(log.parent().unwrap(), home.logs_dir());
+        assert!(file.starts_with("template-main~feature-x-y-"), "{file}");
     }
 
     #[test]
