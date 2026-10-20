@@ -524,6 +524,9 @@ pub struct DaemonStatus {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct RouterStatus {
     pub listening: bool,
+    /// The address the router binds (`router_listen`); empty before the first bind attempt.
+    #[serde(default)]
+    pub listen: String,
     pub port: u16,
     /// Why the router is not listening (a taken port, say); it retries every minute.
     #[serde(default, skip_serializing_if = "Option::is_none")]

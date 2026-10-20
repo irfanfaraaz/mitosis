@@ -30,6 +30,9 @@ pub struct CloneUsage {
     pub expires_at: i64,
     pub protected: bool,
     pub disk_warn: bool,
+    /// `ready`, `sleeping` or `starting`.
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -124,6 +127,12 @@ fn collect(ctx: &Ctx, want_ram: bool, want_disk: bool) -> Result<(Usage, u64)> {
             expires_at: r.expires_at,
             protected: r.protected,
             disk_warn: own.is_some_and(|b| b > cfg.clone_disk_warn),
+            status: match r.status {
+                CloneStatus::Ready => "ready",
+                CloneStatus::Sleeping => "sleeping",
+                _ => "starting",
+            }
+            .into(),
         });
     }
     let running: Vec<u64> = clones.iter().filter_map(|c| c.rss_bytes).collect();
@@ -403,6 +412,7 @@ mod tests {
             expires_at: 0,
             protected: false,
             disk_warn: false,
+            status: "ready".into(),
         }
     }
 

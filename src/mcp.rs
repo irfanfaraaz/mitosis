@@ -82,7 +82,7 @@ fn unexpected() -> MitosisError {
 #[tool_router]
 impl Mitosis {
     #[tool(
-        description = "Create a private, throwaway Postgres database cloned from a template in about a second. Use it for migrations, seeds and destructive tests. It is deleted when this session ends or the TTL passes."
+        description = "Create a private, throwaway Postgres database cloned from a template in about a second. Use it for migrations, seeds and destructive tests. It is deleted when this session ends or the TTL passes. Returns `url`, a stable router URL (postgres://postgres:<password>@127.0.0.1:<router_port>/<clone name or id>) that keeps working when the clone sleeps: an idle clone is stopped to save memory and the next connection to `url` wakes it. `direct_url` is the clone's own port and refuses connections while it sleeps. `branch` clones a template built for a git branch, so the database has that branch's schema. Use clone_diff afterwards to see what you changed."
     )]
     async fn clone_create(
         &self,
@@ -91,7 +91,9 @@ impl Mitosis {
         text(self.create(p).await)
     }
 
-    #[tool(description = "List the clones this session created, as JSON.")]
+    #[tool(
+        description = "List the clones this session created, as JSON. `status` is `ready` or `sleeping`; connecting to a sleeping clone's `url` wakes it."
+    )]
     async fn clone_list(&self) -> Result<String, String> {
         text(
             async {
@@ -107,7 +109,9 @@ impl Mitosis {
         )
     }
 
-    #[tool(description = "Destroy a clone this session created, by id or name.")]
+    #[tool(
+        description = "Destroy a clone this session created, by id or name. Works on a sleeping clone too."
+    )]
     async fn clone_destroy(
         &self,
         Parameters(p): Parameters<CloneDestroyParams>,
@@ -276,7 +280,7 @@ impl Mitosis {
 
 #[tool_handler(
     name = "mitosis",
-    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL; clone_list shows the clones this session made; clone_destroy deletes one of them; clone_diff shows what you changed in one. Clones are deleted when this session ends or their TTL passes."
+    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL (a router URL on 127.0.0.1 that stays valid while the clone sleeps; the next connection wakes it); clone_list shows the clones this session made; clone_destroy deletes one of them; clone_diff shows what you changed in one. Pass `branch` to clone_create to get the schema of a git branch. Clones are deleted when this session ends or their TTL passes."
 )]
 impl ServerHandler for Mitosis {}
 

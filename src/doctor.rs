@@ -7,12 +7,13 @@ use crate::client;
 use crate::clone_backend::{free_space, same_volume, ApfsBackend, CloneBackend};
 use crate::config::Config;
 use crate::envfile;
-use crate::names::is_clone_id;
+use crate::mask::MaskFile;
+use crate::names::{format_duration, is_clone_id};
 use crate::paths::Home;
 use crate::pg::cluster::{check_socket_path, log_tail};
 use crate::pg::{check_extensions, discover_with, find_major, initdb, start, stop, wait_ready};
-use crate::pg::{PgInstall, StartOptions};
-use crate::protocol::{MigrateCmd, Request, Response, TemplateSource};
+use crate::pg::{managed, parse_version, PgInstall, StartOptions};
+use crate::protocol::{DaemonStatus, MigrateCmd, Request, Response, TemplateSource};
 use crate::service;
 use crate::state::SCHEMA_VERSION;
 use crate::templates::{
@@ -21,6 +22,7 @@ use crate::templates::{
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -131,6 +133,22 @@ struct EnvRef {
     file: PathBuf,
 }
 
+/// v1.0 template columns, read apart so a store that lacks one still gets its other checks.
+struct TplExtra {
+    name: String,
+    mask_path: Option<PathBuf>,
+    /// A branch template: its base template and git branch.
+    base: Option<String>,
+    branch: Option<String>,
+}
+
+/// Size of the event log.
+struct EventStats {
+    rows: u64,
+    oldest: Option<i64>,
+    bytes: u64,
+}
+
 #[derive(Default)]
 struct Snapshot {
     templates: Vec<TplRow>,
@@ -138,6 +156,10 @@ struct Snapshot {
     clones: Vec<CloneRow>,
     pending: usize,
     env_files: Vec<EnvRef>,
+    tpl_extra: Vec<TplExtra>,
+    /// `(template, gen, mask_hash)` of every generation.
+    mask_hashes: Vec<(String, u32, Option<String>)>,
+    events: Option<EventStats>,
 }
 
 enum StoreView {
@@ -243,12 +265,47 @@ fn read_snapshot(path: &Path) -> rusqlite::Result<StoreView> {
     let pending_n = pending.len();
     let mut env_files = pending;
     env_files.extend(records);
+    let tpl_extra = rows(
+        &conn,
+        "SELECT name, mask_path, base, branch FROM templates",
+        |r| {
+            Ok(TplExtra {
+                name: r.get(0)?,
+                mask_path: r.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                base: r.get(2)?,
+                branch: r.get(3)?,
+            })
+        },
+    )
+    .unwrap_or_default();
+    let mask_hashes = rows(
+        &conn,
+        "SELECT template, gen, mask_hash FROM generations",
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap_or_default();
+    let events = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(ts), COALESCE(SUM(length(detail)), 0) FROM events",
+            [],
+            |r| {
+                Ok(EventStats {
+                    rows: r.get::<_, i64>(0)?.max(0) as u64,
+                    oldest: r.get(1)?,
+                    bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            },
+        )
+        .ok();
     Ok(StoreView::Ready(Snapshot {
         templates,
         gens,
         clones,
         pending: pending_n,
         env_files,
+        tpl_extra,
+        mask_hashes,
+        events,
     }))
 }
 
@@ -490,36 +547,33 @@ fn check_socket_len(home: &Home, cfg: &Config) -> Check {
     }
 }
 
-async fn check_daemon(home: &Home) -> (Check, bool) {
+async fn check_daemon(home: &Home) -> (Check, bool, Option<DaemonStatus>) {
     let ask = client::request_if_running(home, Request::Status);
     match tokio::time::timeout(Duration::from_secs(5), ask).await {
         Err(_) => (
             Check::new("daemon", Level::Warn, "did not answer within 5 s")
                 .fix("restart it: mitosis daemon stop"),
             true,
+            None,
         ),
         Ok(Ok(None)) => (
             Check::new("daemon", Level::Ok, "not running (starts on demand)"),
             false,
+            None,
         ),
         Ok(Ok(Some(Response::Status(s)))) => {
             let mine = env!("CARGO_PKG_VERSION");
-            if s.version == mine {
-                (
-                    Check::new("daemon", Level::Ok, format!("running, version {mine}")),
-                    true,
-                )
+            let check = if s.version == mine {
+                Check::new("daemon", Level::Ok, format!("running, version {mine}"))
             } else {
-                (
-                    Check::new(
-                        "daemon",
-                        Level::Warn,
-                        format!("running version {}, this binary is {mine}", s.version),
-                    )
-                    .fix("mitosis daemon stop (the next command starts the new one)"),
-                    true,
+                Check::new(
+                    "daemon",
+                    Level::Warn,
+                    format!("running version {}, this binary is {mine}", s.version),
                 )
-            }
+                .fix("mitosis daemon stop (the next command starts the new one)")
+            };
+            (check, true, Some(s))
         }
         Ok(Ok(Some(_))) => (
             Check::new(
@@ -528,10 +582,11 @@ async fn check_daemon(home: &Home) -> (Check, bool) {
                 "unexpected reply to a status request",
             ),
             true,
+            None,
         ),
         Ok(Err(e)) => {
             let c = Check::new("daemon", Level::Warn, e.message);
-            (e.hint.map_or(c.clone(), |h| c.fix(h)), true)
+            (e.hint.map_or(c.clone(), |h| c.fix(h)), true, None)
         }
     }
 }
@@ -555,6 +610,322 @@ fn check_service(st: &Option<service::ServiceStatus>) -> Check {
             .fix("mitosis service install"),
         Some(_) => Check::new("service", Level::Ok, "installed and loaded"),
     }
+}
+
+/// `name (pid N)` of the process listening on TCP `port`, from `lsof`; none when lsof is missing
+/// or finds nothing.
+async fn port_holder(port: u16) -> Option<String> {
+    let run = tokio::process::Command::new("lsof")
+        .args(["-nP", "-Fpc", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .ok()?
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut pid, mut found) = (None, Vec::new());
+    for line in text.lines() {
+        match line.split_at_checked(1) {
+            Some(("p", p)) => pid = Some(p.to_string()),
+            Some(("c", c)) => {
+                let who = format!("{c} (pid {})", pid.take().unwrap_or_default());
+                if !found.contains(&who) {
+                    found.push(who);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!found.is_empty()).then(|| found.join(", "))
+}
+
+/// The router is listening, or its port is free for the daemon to bind. `daemon` is the running
+/// daemon's answer (none when it is down, or up but silent).
+async fn check_router(cfg: &Config, daemon_up: bool, daemon: Option<&DaemonStatus>) -> Check {
+    let name = "router";
+    if !cfg.router {
+        return Check::new(
+            name,
+            Level::Ok,
+            "off (router = off): clone URLs are the direct URLs",
+        );
+    }
+    let addr = SocketAddr::new(cfg.router_listen, cfg.router_port);
+    let taken = |what: String, holder: Option<String>| {
+        let who = holder.map_or(
+            format!(
+                "could not tell which process (try: lsof -nP -iTCP:{} -sTCP:LISTEN)",
+                addr.port()
+            ),
+            |h| format!("held by {h}"),
+        );
+        Check::new(name, Level::Fail, format!("{what}; {who}")).fix(format!(
+            "stop that process, or move the router: mitosis config set router_port <port> and mitosis daemon stop. Clones answer on their direct_url meanwhile (mitosis env <clone> --direct)"
+        ))
+    };
+    if daemon_up {
+        return match daemon.map(|d| &d.router) {
+            None => Check::new(name, Level::Warn, "the daemon did not report its router"),
+            Some(None) => Check::new(
+                name,
+                Level::Warn,
+                "the config has the router on but the running daemon has it off",
+            )
+            .fix("mitosis daemon stop (the next command starts it with the router)"),
+            Some(Some(r)) if r.listening => Check::new(
+                name,
+                Level::Ok,
+                format!("listening on {}:{}", r.listen, r.port),
+            ),
+            Some(Some(r)) => taken(
+                format!(
+                    "the daemon is not listening: {}",
+                    r.error.as_deref().unwrap_or("no reason given")
+                ),
+                port_holder(r.port).await,
+            ),
+        };
+    }
+    match std::net::TcpListener::bind(addr) {
+        Ok(_) => Check::new(
+            name,
+            Level::Ok,
+            format!("{addr} is free; the daemon binds it when it starts"),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => taken(
+            format!("router port {} is taken", addr.port()),
+            port_holder(addr.port()).await,
+        ),
+        Err(e) => Check::new(name, Level::Fail, format!("cannot listen on {addr}: {e}"))
+            .fix("check router_listen and router_port: mitosis config"),
+    }
+}
+
+/// A router that listens beyond loopback is reachable from the network.
+fn check_router_listen(cfg: &Config) -> Option<Check> {
+    cfg.router.then(|| {
+        let ip: IpAddr = cfg.router_listen;
+        if ip.is_loopback() {
+            return Check::new(
+                "router_listen",
+                Level::Ok,
+                format!("{ip}: this Mac only (Docker Desktop containers reach it as host.docker.internal)"),
+            );
+        }
+        Check::new(
+            "router_listen",
+            Level::Warn,
+            format!("{ip}: the router is reachable from the network (each clone's password still protects it)"),
+        )
+        .fix("mitosis config set router_listen 127.0.0.1")
+    })
+}
+
+/// Managed builds under `<home>/pg/`: each one must run. Blocking.
+fn check_managed(home: &Home) -> Check {
+    let name = "managed_postgres";
+    let installs = match managed::list(home) {
+        Ok(v) => v,
+        Err(e) => return Check::new(name, Level::Warn, e.message),
+    };
+    if installs.is_empty() {
+        return Check::new(
+            name,
+            Level::Ok,
+            "none installed (mitosis pg install <major>)",
+        );
+    }
+    let mut f = Vec::new();
+    for i in &installs {
+        let bin = i.dir.join("bin/postgres");
+        let out = std::process::Command::new(&bin)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output();
+        let problem = match out {
+            Err(e) => Some(e.to_string()),
+            Ok(o) if !o.status.success() => Some(format!("exited with {}", o.status)),
+            Ok(o) => match parse_version(&String::from_utf8_lossy(&o.stdout)) {
+                Some((major, _)) if major == i.major => None,
+                _ => Some("its version output is not Postgres ".to_string() + &i.major.to_string()),
+            },
+        };
+        if let Some(p) = problem {
+            f.push((
+                Level::Warn,
+                format!(
+                    "managed Postgres {} does not run ({}): {p}",
+                    i.version,
+                    bin.display()
+                ),
+            ));
+        }
+    }
+    let c = summarize(
+        name,
+        f,
+        &format!(
+            "{} build(s), all run: {}",
+            installs.len(),
+            installs
+                .iter()
+                .map(|i| i.version.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+    if c.level == Level::Ok {
+        c
+    } else {
+        c.fix("mitosis pg remove <version>, then mitosis pg install <major>")
+    }
+}
+
+/// Masked templates: the masking file is still there and is the one the current generation was
+/// built with.
+fn check_masks(snap: &Snapshot) -> Check {
+    let mut f = Vec::new();
+    let mut masked = 0;
+    for x in &snap.tpl_extra {
+        let Some(path) = &x.mask_path else { continue };
+        masked += 1;
+        let Some(t) = snap.templates.iter().find(|t| t.name == x.name) else {
+            continue;
+        };
+        if snap.current(t).is_none() {
+            continue; // nothing built yet
+        }
+        if !path.is_file() {
+            f.push((
+                Level::Fail,
+                format!(
+                    "template {}: mask file {} is missing",
+                    x.name,
+                    path.display()
+                ),
+            ));
+            continue;
+        }
+        let built = snap
+            .mask_hashes
+            .iter()
+            .find(|(n, g, _)| *n == x.name && *g == t.current_gen)
+            .and_then(|(_, _, h)| h.as_deref());
+        if MaskFile::hash(path).ok().as_deref() != built {
+            f.push((
+                Level::Warn,
+                format!(
+                    "template {}: mask file {} changed since it was built; run: mitosis template refresh {}",
+                    x.name,
+                    path.display(),
+                    x.name
+                ),
+            ));
+        }
+    }
+    if masked == 0 {
+        return Check::new("masking", Level::Ok, "no masked templates");
+    }
+    summarize("masking", f, "mask files present and unchanged")
+}
+
+/// True when git says `branch` is not in the repository at `dir` (`rev-parse --verify` exits 1),
+/// the test gc applies (`lifecycle::branch_deleted`, private there). Blocking.
+fn branch_gone(dir: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.code() == Some(1))
+}
+
+/// Branch templates whose branch no longer exists in the base's repository: gc drops them.
+async fn check_branches(snap: &Snapshot) -> Check {
+    let name = "branch_templates";
+    let mut jobs = Vec::new();
+    let mut n = 0;
+    for x in &snap.tpl_extra {
+        let (Some(base), Some(branch)) = (&x.base, &x.branch) else {
+            continue;
+        };
+        n += 1;
+        // The same repository gc looks in: the base's migrate folder.
+        let dir = snap
+            .templates
+            .iter()
+            .find(|t| &t.name == base)
+            .and_then(|t| t.migrate.as_ref())
+            .map(|m| m.cwd.clone())
+            .filter(|d| d.is_dir());
+        if let Some(dir) = dir {
+            jobs.push((x.name.clone(), dir, branch.clone()));
+        }
+    }
+    if n == 0 {
+        return Check::new(name, Level::Ok, "no branch templates");
+    }
+    let gone = tokio::task::spawn_blocking(move || {
+        jobs.into_iter()
+            .filter(|(_, dir, branch)| branch_gone(dir, branch))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let f = gone
+        .into_iter()
+        .map(|(t, dir, branch)| {
+            (
+                Level::Warn,
+                format!(
+                    "template {t}: branch {branch} no longer exists in {}; gc drops it",
+                    dir.display()
+                ),
+            )
+        })
+        .collect();
+    let c = summarize(name, f, "every branch still exists");
+    if c.level == Level::Ok {
+        c
+    } else {
+        c.fix("mitosis gc (a template a clone still uses is kept)")
+    }
+}
+
+/// The scheduler keeps 30 days and 50,000 rows of events.
+const EVENT_KEEP_ROWS: u64 = 50_000;
+const EVENT_KEEP_SECS: i64 = 30 * 86_400;
+
+fn check_events(snap: &Snapshot) -> Check {
+    let name = "events";
+    let Some(e) = &snap.events else {
+        return Check::new(name, Level::Ok, "no event log yet");
+    };
+    let age = e.oldest.map_or(0, |ts| now().saturating_sub(ts).max(0));
+    let size = format!(
+        "{} event(s), about {} kB, oldest {} ago",
+        e.rows,
+        e.bytes / 1000,
+        format_duration(Duration::from_secs(age as u64))
+    );
+    // A day of slack: the scheduler prunes on its own timer.
+    if e.rows > EVENT_KEEP_ROWS || age > EVENT_KEEP_SECS + 86_400 {
+        return Check::new(
+            name,
+            Level::Warn,
+            format!(
+                "{size}; past the 30 day / 50000 row retention, the daemon prunes it while it runs"
+            ),
+        )
+        .fix("run any mitosis command so the daemon starts and prunes");
+    }
+    Check::new(name, Level::Ok, size)
 }
 
 fn check_postgres(installs: &[PgInstall]) -> Check {
@@ -878,8 +1249,10 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     };
     out.push(check_socket_len(home, &cfg));
 
-    let (daemon, daemon_up) = check_daemon(home).await;
+    let (daemon, daemon_up, status) = check_daemon(home).await;
     out.push(daemon);
+    out.push(check_router(&cfg, daemon_up, status.as_ref()).await);
+    out.extend(check_router_listen(&cfg));
     let svc = service_status().await;
     out.push(check_service(&svc));
 
@@ -888,6 +1261,12 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
         .await
         .unwrap_or_default();
     out.push(check_postgres(&installs));
+    let h = home.clone();
+    out.push(
+        tokio::task::spawn_blocking(move || check_managed(&h))
+            .await
+            .unwrap_or_else(|e| Check::new("managed_postgres", Level::Warn, e.to_string())),
+    );
 
     let view = read_store(home);
     match &view {
@@ -915,6 +1294,9 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
         out.push(check_gc(home, snap, daemon_up));
         out.push(check_env(snap));
         out.push(check_privacy(snap, &svc));
+        out.push(check_masks(snap));
+        out.push(check_branches(snap).await);
+        out.push(check_events(snap));
     }
     out
 }

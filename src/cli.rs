@@ -787,17 +787,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "uptime    {}",
                     format_duration(Duration::from_secs(s.uptime_secs))
                 );
-                match &s.router {
-                    None => println!("router    off"),
-                    Some(r) if r.listening => println!("router    listening on port {}", r.port),
-                    Some(r) => {
-                        println!("router    not listening on port {}", r.port);
-                        if let Some(e) = &r.error {
-                            eprintln!(
-                                "warning: router: {e}; it retries every minute (direct URLs still work: mitosis env <clone> --direct)"
-                            );
-                        }
-                    }
+                println!("router    {}", router_state(&s.router));
+                if s.router.as_ref().is_some_and(|r| !r.listening) {
+                    eprintln!(
+                        "warning: the router is not listening; it retries every minute (direct URLs still work: mitosis env <clone> --direct)"
+                    );
                 }
             }
             Some(other) => return Err(unexpected(other)),
@@ -1248,7 +1242,26 @@ fn quit_key() -> bool {
     matches!(std::io::stdin().read(&mut b), Ok(1) if matches!(b[0], b'q' | b'Q' | 3))
 }
 
-fn draw_top(u: &budget::Usage) {
+/// `off`, `listening on 127.0.0.1:54300`, or why the router is not listening.
+pub fn router_state(r: &Option<crate::protocol::RouterStatus>) -> String {
+    match r {
+        None => "off".into(),
+        Some(r) => {
+            let host = if r.listen.is_empty() {
+                "127.0.0.1"
+            } else {
+                &r.listen
+            };
+            match &r.error {
+                None if r.listening => format!("listening on {host}:{}", r.port),
+                None => format!("not listening on {host}:{}", r.port),
+                Some(e) => format!("not listening: {e}"),
+            }
+        }
+    }
+}
+
+fn draw_top(u: &budget::Usage, router: &Option<crate::protocol::RouterStatus>) {
     let now = now();
     let secs = |s: i64| format_duration(Duration::from_secs(u64::try_from(s).unwrap_or(0)));
     let opt_bytes = |b: Option<u64>| b.map_or("-".to_string(), human_bytes);
@@ -1263,6 +1276,7 @@ fn draw_top(u: &budget::Usage) {
             "ID",
             "NAME",
             "TEMPLATE",
+            "STATUS",
             "TTL LEFT",
             "RAM",
             "EXTRA DISK",
@@ -1275,12 +1289,18 @@ fn draw_top(u: &budget::Usage) {
                     c.id.clone(),
                     c.name.clone().unwrap_or_else(|| "-".into()),
                     c.template.clone(),
+                    c.status.clone(),
                     if c.protected {
                         "never".into()
                     } else {
                         secs(c.expires_at - now)
                     },
-                    opt_bytes(c.rss_bytes),
+                    // A sleeping clone has no server: it uses no memory.
+                    if c.status == "sleeping" {
+                        human_bytes(0)
+                    } else {
+                        opt_bytes(c.rss_bytes)
+                    },
                     opt_bytes(c.own_disk_bytes),
                     [(c.disk_warn, "!"), (c.protected, "protected")]
                         .iter()
@@ -1293,13 +1313,14 @@ fn draw_top(u: &budget::Usage) {
             .collect(),
     );
     println!(
-        "\nclones  {} / {}\nram     {}\ndisk    {}\nfree    {}\nqueued  {}",
+        "\nclones  {} / {}\nram     {}\ndisk    {}\nfree    {}\nqueued  {}\nrouter  {}",
         u.clones.len(),
         u.max_clones,
         of(human_bytes(u.ram_bytes), u.ram_budget),
         of(human_bytes(u.disk_bytes), u.disk_budget),
         human_bytes(u.free_disk_bytes),
-        u.queued
+        u.queued,
+        router_state(router)
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
@@ -1307,8 +1328,12 @@ fn draw_top(u: &budget::Usage) {
 async fn top(home: &Home) -> Result<()> {
     let _terminal = RawTerminal::enter()?;
     loop {
+        let router = match client::request(home, Request::Status).await? {
+            Response::Status(s) => s.router,
+            other => return Err(unexpected(other)),
+        };
         match client::request(home, Request::Usage).await? {
-            Response::Usage(u) => draw_top(&u),
+            Response::Usage(u) => draw_top(&u, &router),
             other => return Err(unexpected(other)),
         }
         let quit = tokio::task::spawn_blocking(quit_key)

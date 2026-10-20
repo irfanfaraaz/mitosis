@@ -53,6 +53,7 @@ impl RouterState {
             cancel: HashMap::new(),
             status: RouterStatus {
                 listening: false,
+                listen: String::new(),
                 port,
                 error: None,
             },
@@ -119,6 +120,7 @@ pub fn spawn(ctx: Arc<Ctx>) -> JoinHandle<()> {
                         let first = r.status.error.as_deref() != Some(error.as_str());
                         r.status = RouterStatus {
                             listening: false,
+                            listen: addr.ip().to_string(),
                             port: addr.port(),
                             error: Some(error.clone()),
                         };
@@ -143,6 +145,7 @@ pub fn spawn(ctx: Arc<Ctx>) -> JoinHandle<()> {
         };
         ctx.router().status = RouterStatus {
             listening: true,
+            listen: addr.ip().to_string(),
             port: addr.port(),
             error: None,
         };
