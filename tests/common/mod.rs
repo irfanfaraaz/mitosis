@@ -137,7 +137,8 @@ pub async fn start_router(env: &TestEnv) {
         router: true,
         ..env.ctx.config()
     });
-    mitosis::router::spawn(env.ctx.clone());
+    let listener = mitosis::router::bind(&env.ctx).await;
+    mitosis::router::spawn(env.ctx.clone(), listener);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !env.ctx.router().status.listening {
         assert!(

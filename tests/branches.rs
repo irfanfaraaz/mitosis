@@ -283,11 +283,17 @@ async fn base_skips_auto_migrate_on_other_branch() {
         assert_eq!(store.list_generations("main").unwrap().len(), 1);
     }
 
-    // The next tick skips again (the skipped build released its slot at once) without another
-    // event.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The next tick skips again (the skipped build released its slot) without another event.
+    // `tick` claims the slot before it returns, so a free slot afterwards means that run ended.
+    wait_for(30, "the first skip to release its slot", || {
+        !templates::is_building(&env.ctx, "main")
+    })
+    .await;
     scheduler::tick(&env.ctx, now()).await;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    wait_for(30, "the second skip to release its slot", || {
+        !templates::is_building(&env.ctx, "main")
+    })
+    .await;
     assert_eq!(skipped().len(), 1);
     assert_eq!(env.ctx.store().list_generations("main").unwrap().len(), 1);
 }
@@ -423,7 +429,35 @@ async fn gc_drops_deleted_branch_template() {
         t.last_used = Some(now() - 15 * 86_400);
         store.update_template_settings(&t).unwrap();
     }
+    let build_log = |branch: &str| {
+        env.ctx.home.logs_dir().join(format!(
+            "template-{}.log",
+            branch_folder_slug("main", branch)
+        ))
+    };
+    std::fs::write(build_log("gone"), "build output\n").unwrap();
     reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert!(
+        !build_log("gone").exists(),
+        "the dropped template's log is left"
+    );
+    let pruned = env
+        .ctx
+        .store()
+        .list_events(&EventFilter {
+            kind: Some("template.pruned".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let cause = |name: &str| {
+        pruned
+            .iter()
+            .find(|e| e.template.as_deref() == Some(name))
+            .map(|e| e.detail["cause"].clone())
+    };
+    assert_eq!(cause("main~gone"), Some("branch deleted".into()));
+    assert_eq!(cause("main~old"), Some("unused".into()));
+    assert_eq!(cause("main~kept"), None);
     let store = env.ctx.store();
     assert!(store.get_template("main~gone").unwrap().is_none());
     assert!(store.get_template("main~old").unwrap().is_none());

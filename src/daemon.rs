@@ -96,6 +96,13 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
             home.root.display()
         ),
     );
+    // Bound before the startup gc, which keeps clones asleep only when the router can wake
+    // them; it starts accepting after the gc.
+    let router_listener = if ctx.config().router {
+        Some(crate::router::bind(&ctx).await)
+    } else {
+        None
+    };
     match lifecycle::reconcile(ctx.clone(), now()).await {
         Ok(r) => log(
             &home,
@@ -127,10 +134,7 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     };
     tokio::spawn(reaper(shared.clone(), shutdown_rx.clone()));
     scheduler::run(ctx.clone(), shutdown_rx.clone());
-    let router = ctx
-        .config()
-        .router
-        .then(|| crate::router::spawn(ctx.clone()));
+    let router = router_listener.map(|l| crate::router::spawn(ctx.clone(), l));
 
     let mut last_accept_log: Option<std::time::Instant> = None;
     loop {
@@ -153,7 +157,8 @@ pub async fn run(home: Home, config: Config) -> Result<()> {
     }
 
     drop(listener);
-    // Stops accepting; open router connections keep going, like the clones they reach.
+    // Stops accepting. Open router connections end when this process exits (the clones keep
+    // running); clients reconnect.
     if let Some(r) = &router {
         r.abort();
     }

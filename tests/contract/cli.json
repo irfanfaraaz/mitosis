@@ -172,6 +172,9 @@
       "subcommands": {
         "install": {
           "args": {
+            "--version": {
+              "takes_value": true
+            },
             "<major>": {
               "index": 1,
               "required": true,

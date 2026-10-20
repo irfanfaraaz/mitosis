@@ -177,10 +177,24 @@ impl MaskFile {
     pub fn hash(path: &Path) -> Result<String> {
         let data = std::fs::read(path)
             .map_err(|e| invalid(format!("masking file {}: {e}", path.display())))?;
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        crate::templates::fnv1a(&mut h, &data);
-        Ok(format!("{h:016x}"))
+        Ok(hash_bytes(&data))
     }
+
+    /// `load` and `hash` from one read, so the parsed file is the one the hash names.
+    pub fn load_hashed(path: &Path) -> Result<(MaskFile, String)> {
+        let named = |msg: String| invalid(format!("masking file {}: {msg}", path.display()));
+        let data = std::fs::read(path).map_err(|e| named(e.to_string()))?;
+        let hash = hash_bytes(&data);
+        let text = String::from_utf8(data).map_err(|e| named(e.to_string()))?;
+        let file = MaskFile::parse(&text).map_err(|e| named(e.message))?;
+        Ok((file, hash))
+    }
+}
+
+fn hash_bytes(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    crate::templates::fnv1a(&mut h, data);
+    format!("{h:016x}")
 }
 
 fn quote_ident(s: &str) -> String {

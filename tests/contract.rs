@@ -661,7 +661,14 @@ fn cli_tree(cmd: &clap::Command) -> Value {
     let mut args = Map::new();
     for a in cmd.get_arguments() {
         let id = a.get_id().as_str();
-        if id == "help" || id == "version" {
+        // Only clap's generated flags: a user-defined `--version` (as on `pg install`) is pinned.
+        if matches!(
+            a.get_action(),
+            clap::ArgAction::Help
+                | clap::ArgAction::HelpShort
+                | clap::ArgAction::HelpLong
+                | clap::ArgAction::Version
+        ) {
             continue;
         }
         let key = match a.get_long() {

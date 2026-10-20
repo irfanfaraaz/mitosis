@@ -9,7 +9,7 @@ use common::*;
 use mitosis::client;
 use mitosis::ctx::Config;
 use mitosis::daemon::run;
-use mitosis::envfile::{create_clone, get_var};
+use mitosis::envfile::{create_clone, env_url, get_var};
 use mitosis::error::Result;
 use mitosis::paths::Home;
 use mitosis::pg::newest;
@@ -47,9 +47,19 @@ impl Fixture {
 
     async fn start(serial: MutexGuard<'static, ()>, env: TestEnv, listening: bool) -> Fixture {
         template(&env, "main", SEED).await;
+        Fixture::launch(serial, env, true, listening).await
+    }
+
+    /// A daemon on `env`'s home (its template already built), with the router on or off.
+    async fn launch(
+        serial: MutexGuard<'static, ()>,
+        env: TestEnv,
+        router: bool,
+        listening: bool,
+    ) -> Fixture {
         let root = env.tmp.path().to_path_buf();
         let config = Config {
-            router: true,
+            router,
             ..env.ctx.config()
         };
         let port = config.router_port;
@@ -107,6 +117,19 @@ impl Fixture {
         {
             Response::CloneCreated(info) => info,
             other => panic!("not created: {other:?}"),
+        }
+    }
+
+    async fn status(&self, name: &str) -> CloneInfo {
+        match client::request(&self.home, Request::CloneList)
+            .await
+            .unwrap()
+        {
+            Response::Clones { clones } => clones
+                .into_iter()
+                .find(|c| c.name.as_deref() == Some(name))
+                .expect("clone listed"),
+            other => panic!("not clones: {other:?}"),
         }
     }
 
@@ -378,5 +401,59 @@ async fn env_file_gets_router_url() {
     let written = get_var(&text, "DATABASE_URL").unwrap();
     assert_eq!(written, info.url);
     assert_eq!(psql_url(&fx.env, &written, "select count(*) from t"), "1");
+    fx.stop().await;
+}
+
+/// A named clone put to sleep by an in-process ctx, before any daemon runs on the home.
+async fn sleeping_clone(env: &TestEnv, name: &str) -> CloneInfo {
+    let c = mitosis::clones::create(&env.ctx, args(Some(name)))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match mitosis::clones::sleep(&env.ctx, name, "idle").await {
+            Ok(()) => return c,
+            Err(e) if Instant::now() < deadline && e.message.contains("open connections") => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(e) => panic!("sleep {name}: {e}"),
+        }
+    }
+}
+
+/// A sleeping clone's direct URL refuses connections, so `mitosis env --direct` wakes it first.
+#[tokio::test(flavor = "multi_thread")]
+async fn env_direct_wakes_sleeping_clone() {
+    let serial = serial();
+    let Some(env) = TestEnv::new() else {
+        return;
+    };
+    template(&env, "main", SEED).await;
+    sleeping_clone(&env, "a").await;
+    let fx = Fixture::launch(serial, env, true, true).await;
+    // The router listens, so the startup gc leaves it asleep.
+    assert_eq!(fx.status("a").await.status, "sleeping");
+    let (url, _) = env_url(&fx.home, "a", true).await.unwrap();
+    let info = fx.status("a").await;
+    assert_eq!(info.status, "ready");
+    assert_eq!(url, info.direct_url);
+    assert_eq!(psql_url(&fx.env, &url, "select count(*) from t"), "1");
+    fx.stop().await;
+}
+
+/// With the router off nothing wakes a clone on connect: the daemon starts sleeping clones again.
+#[tokio::test(flavor = "multi_thread")]
+async fn router_off_at_daemon_start_wakes_sleeping_clones() {
+    let serial = serial();
+    let Some(env) = TestEnv::new() else {
+        return;
+    };
+    template(&env, "main", SEED).await;
+    sleeping_clone(&env, "a").await;
+    let fx = Fixture::launch(serial, env, false, false).await;
+    let info = fx.status("a").await;
+    assert_eq!(info.status, "ready");
+    assert_eq!(info.url, info.direct_url);
+    assert_eq!(psql_url(&fx.env, &info.url, "select count(*) from t"), "1");
     fx.stop().await;
 }

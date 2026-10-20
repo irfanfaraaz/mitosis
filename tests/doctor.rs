@@ -157,11 +157,21 @@ async fn doctor_fix_finishes_pending_restore() {
     daemon.abort();
 }
 
+/// A free port this test holds, outside the default `port_range`, where `router_port` is refused.
+fn held_port() -> std::net::TcpListener {
+    loop {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        if !(54_320..=54_999).contains(&l.local_addr().unwrap().port()) {
+            return l;
+        }
+    }
+}
+
 #[tokio::test]
 async fn doctor_flags_router_port_taken() {
     let (_tmp, home) = fresh_home();
     // A port this test holds itself: never the default 54300, which a real daemon may use.
-    let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let blocker = held_port();
     let port = blocker.local_addr().unwrap().port();
     std::fs::write(home.config_file(), format!("router_port = {port}\n")).unwrap();
     let checks = run(&home, false).await;
@@ -187,7 +197,7 @@ async fn doctor_flags_router_port_taken() {
 #[tokio::test]
 async fn doctor_warns_router_listen_public() {
     let (_tmp, home) = fresh_home();
-    let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let free = held_port();
     let port = free.local_addr().unwrap().port();
     drop(free);
     std::fs::write(

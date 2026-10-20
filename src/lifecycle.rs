@@ -179,11 +179,11 @@ pub(crate) async fn idle_clones(ctx: &Ctx, now: i64) -> Result<Vec<(CloneRow, i6
 }
 
 /// The reaper's idle pass: destroys unnamed, unprotected clones idle for `idle_reap` (reason
-/// `idle`), then puts Ready clones idle for `idle_sleep` to sleep. Sleeping needs the router (it
-/// is what wakes them). Returns `(slept, destroyed)` ids.
+/// `idle`), then puts Ready clones idle for `idle_sleep` to sleep. Sleeping needs the router
+/// listening (it is what wakes them). Returns `(slept, destroyed)` ids.
 pub async fn idle_pass(ctx: &Ctx, now: i64) -> Result<(Vec<String>, Vec<String>)> {
     let cfg = ctx.config();
-    let sleep_after = cfg.idle_sleep.filter(|_| cfg.router);
+    let sleep_after = cfg.idle_sleep.filter(|_| crate::router::listening(ctx));
     let (mut slept, mut reaped) = (Vec::new(), Vec::new());
     if sleep_after.is_none() && cfg.idle_reap.is_none() {
         return Ok((slept, reaped));
@@ -483,6 +483,22 @@ async fn drop_branch_templates(ctx: &Ctx, now: i64, report: &mut GcReport) {
         {
             continue;
         }
+        // Re-read under the guard: a `clone --branch` may have used it since the first read.
+        let fresh = match ctx.store().get_template(&t.name) {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) => {
+                log(ctx, &format!("gc: drop template {}: {e}", t.name));
+                failed(report, t.name.clone(), &e);
+                continue;
+            }
+        };
+        let unused = fresh
+            .last_used
+            .is_none_or(|u| now.saturating_sub(u) >= BRANCH_UNUSED_SECS);
+        if !unused && !gone {
+            continue;
+        }
         let res = {
             let store = ctx.store();
             match store.list_clones() {
@@ -495,6 +511,19 @@ async fn drop_branch_templates(ctx: &Ctx, now: i64, report: &mut GcReport) {
             Ok(()) => {
                 let why = if gone { "branch deleted" } else { "unused" };
                 log(ctx, &format!("gc: dropped template {} ({why})", t.name));
+                let build_log = crate::templates::build_log_path(&ctx.home, &t.name);
+                if let Err(e) = std::fs::remove_file(&build_log) {
+                    if e.kind() != ErrorKind::NotFound {
+                        log(ctx, &format!("gc: remove {}: {e}", build_log.display()));
+                    }
+                }
+                events::emit(
+                    ctx,
+                    events::TEMPLATE_PRUNED,
+                    None,
+                    Some(&t.name),
+                    serde_json::json!({ "dropped": true, "cause": why }),
+                );
                 report.records_dropped.push(format!("template {}", t.name));
             }
             Err(e) => {
@@ -570,6 +599,8 @@ async fn reconcile_clone(
 
 /// A sleeping clone keeps sleeping under the TTL and parent rules of a running one. A server
 /// left running by a wake or sleep that crashed half-way is stopped, so Sleeping means stopped.
+/// While the router is not listening (off, or its port taken) nothing would wake it on connect,
+/// so it is started again instead.
 async fn reconcile_sleeping(
     ctx: &Arc<Ctx>,
     row: &CloneRow,
@@ -608,6 +639,14 @@ async fn reconcile_sleeping(
         let mut row = row.clone();
         (row.pg_pid, row.pg_start_time) = (None, None);
         ctx.store().update_clone(&row)?;
+    }
+    if !crate::router::listening(ctx) {
+        let (woken, warnings) = crate::clones::wake(ctx, &row.id).await?;
+        let suspect = woken.suspect.then(|| suspect_warning(&woken));
+        for w in warnings.into_iter().chain(suspect) {
+            log(ctx, &format!("gc: clone {}: {w}", row.id));
+            report.warnings.push(w);
+        }
     }
     report.adopted.push(row.id.clone());
     if let Some(pid) = row.parent_pid {
@@ -659,10 +698,10 @@ async fn drop_clone(ctx: &Ctx, row: &CloneRow, report: &mut GcReport) -> Result<
 }
 
 /// A named, protected or parentless Ready clone whose server is gone (a reboot or a crash). With
-/// the router on it is marked Sleeping (the router or `clone --name` wakes it), else restarted
-/// as in v0.2; a non-durable one that did not shut down cleanly is suspect (fsync was off), and a
-/// suspect clone without a name is destroyed instead, as is an expired one or one whose parent
-/// exited.
+/// the router listening it is marked Sleeping (the router or `clone --name` wakes it), else
+/// restarted as in v0.2; a non-durable one that did not shut down cleanly is suspect (fsync was
+/// off), and a suspect clone without a name is destroyed instead, as is an expired one or one
+/// whose parent exited.
 async fn recover_dead(
     ctx: &Arc<Ctx>,
     row: &CloneRow,
@@ -693,7 +732,7 @@ async fn recover_dead(
         }
         mark_suspect(ctx, &mut row)?;
     }
-    if ctx.config().router {
+    if crate::router::listening(ctx) {
         // Not started now: the first router connection (or `clone --name`) wakes it.
         row.status = CloneStatus::Sleeping;
         (row.pg_pid, row.pg_start_time) = (None, None);

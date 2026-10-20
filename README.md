@@ -111,9 +111,13 @@ This exposes the router to the network. Each clone's password still protects it,
 
 ### Router off, or its port taken
 
-`mitosis config set router off` turns the router off. Then `url` is the `direct_url`, and clones never sleep, because only the router can wake them.
+`mitosis config set router off` turns the router off. Then `url` is the `direct_url`, and clones never sleep, because only the router can wake them. Clones that were asleep are started again when the daemon starts.
 
-If another process holds the router port, `mitosis doctor` fails and names the process. The daemon tries again every minute, so the router comes back by itself when the port frees up. Until then, clones still answer on their `direct_url`, and `mitosis env <clone> --direct` prints it. Pick another port with `mitosis config set router_port <port>` and `mitosis daemon stop`.
+If another process holds the router port, `mitosis doctor` fails and names the process. The daemon tries again every minute, so the router comes back by itself when the port frees up. Until then, clones do not go to sleep and still answer on their `direct_url`, and `mitosis env <clone> --direct` prints it (waking the clone first if it sleeps; `mitosis wake <clone>` does that too). Pick another port with `mitosis config set router_port <port>` and `mitosis daemon stop`. A new port changes every router URL, and `.env` files written with the old one keep it: re-run `mitosis clone --name <x> --env-file <file>` (with the clone's own `--template`, `--durable` and `--protect` flags) to write the new URL.
+
+`router_listen` takes `127.0.0.1` (the default), `::1`, `0.0.0.0` or `::`; any other address would not answer on the `127.0.0.1` URL. `router_port` must be outside the clone ports (54320-54999).
+
+`mitosis daemon stop`, and the daemon restart that a binary upgrade brings, end every open router connection; the clones keep running. Clients reconnect, or use a pool that does. Direct connections are not affected.
 
 ## Sleep and wake
 
@@ -122,10 +126,10 @@ An idle clone is stopped to save memory. A clone is idle when it has no router c
 A sleeping clone wakes in these ways:
 
 - **A router connection.** The first connection to the router URL starts the clone and waits for it. The client sees one slow connect, not an error.
-- **`mitosis wake <clone>`.**
+- **`mitosis wake <clone>`**, or `mitosis env <clone> --direct`, which wakes it before it prints the direct URL.
 - **`mitosis clone --name <clone>`**, which returns the clone with `existing: true`.
 
-**Direct URLs refuse connections while the clone sleeps.** Use the router URL for anything that outlives a few minutes. A clone with an open direct connection counts as active and is not put to sleep.
+**Direct URLs refuse connections while the clone sleeps.** Use the router URL for anything that outlives a few minutes. A clone with an open direct connection counts as active and is not put to sleep. Clones only go to sleep while the router is listening, since it is what wakes them.
 
 Sleeping clones count toward `max_clones` and the disk budget, but not toward the RAM budget. When a new clone does not fit the RAM budget, Mitosis first puts idle clones to sleep, least recently used first (protected clones can sleep too; clones with open connections never do). Only if that does not make room does the request wait in the queue.
 
@@ -363,6 +367,12 @@ mitosis template upgrade main --to 18 --as main18   # keep the original as it is
 
 You need the target major installed next to the current one. Mitosis runs `pg_upgrade --clone` and falls back to `--copy` if clone mode is refused. Without `--as`, the result is a new generation, so `template rollback` returns to the old major. Later builds use the current generation's major.
 
+What the upgrade carries over:
+
+- **Carried over:** every database and role (with its password hash), schema and data, through `pg_upgrade`. The new cluster gets the old one's encoding, locale provider, collation and data checksums setting. The new generation keeps the migrations hash and masking hash of the one it came from. Without `--as`, the template keeps all its settings. With `--as`, the new template copies the database, source, migrations folder, `--keep`, `--every-mode`, `--migrate`, `--auto-migrate`, `--on-stale`, the masking file and salt, and the base branch; its schedule (`--every`) is off.
+- **Not carried over:** `postgresql.conf`, `postgresql.auto.conf` (`ALTER SYSTEM` settings) and `pg_hba.conf`; the new cluster has fresh `initdb` files. When the target is older than Postgres 18, planner statistics are not carried over either, so run `ANALYZE` in a clone if query plans matter.
+- **Extensions** the template uses must be installed for the target major, or the upgrade refuses before it starts.
+
 Tested on Postgres 18 so far. Upgrading across majors has not been verified yet.
 
 ## Managed Postgres builds
@@ -495,7 +505,7 @@ A daemon started by launchd does not get your terminal's access to `~/Documents`
 
 ## Reboot recovery and suspect clones
 
-After a reboot, or when a clone's server dies (a full disk, a manual stop), Mitosis looks at named clones, protected clones and parentless CLI clones that are still inside their TTL, on the same folder, port and password. With the router on, it marks them `sleeping` and the first router connection (or `clone --name`) starts them, so a reboot does not start every clone at once. With the router off, it starts them again at once. Clones whose session is gone are destroyed.
+After a reboot, or when a clone's server dies (a full disk, a manual stop), Mitosis looks at named clones, protected clones and parentless CLI clones that are still inside their TTL, on the same folder, port and password. With the router listening, it marks them `sleeping` and the first router connection (or `clone --name`) starts them, so a reboot does not start every clone at once. With the router off, or its port taken, it starts them again at once. Clones whose session is gone are destroyed.
 
 Before restarting, it reads the cluster's control state. A clone that did not shut down cleanly and ran with `fsync=off` is *suspect*. An unnamed suspect clone is destroyed. A named one is started and marked `suspect` in `list --json`, in the clone reply and in `doctor`. Reset it with `mitosis clone --name <x> --fresh`. Durable clones use normal Postgres crash recovery and are not suspect.
 
@@ -531,8 +541,9 @@ Most of it is automatic.
 
 - **Protocol 3.** The first 1.0 command replaces a running 0.2 daemon. Your clones keep running. A `mitosis mcp` server started by 0.2 keeps the old code: its tool calls fail with `protocol_mismatch` until you restart the agent session. Its clones survive.
 - **The store migrates by itself** on first use, in one transaction. 1.0 migrates the store, and 0.2 cannot read it afterwards. There is no downgrade.
-- **New clones return router URLs.** `clone`, `list`, MCP and `.env` injection now give `postgres://postgres:<password>@127.0.0.1:54300/<clone>`. A `.env` file written by 0.2 keeps its direct URL, which still works while the clone is awake. It keeps working until the clone is created again with `--env-file` (`mitosis clone --name <x> --env-file <file>`), which writes the router URL. Idle clones now sleep after 10 minutes, and a sleeping clone refuses its direct URL; so either re-create the `.env` entry, or keep the old behaviour with `mitosis config set idle_sleep off`.
-- **After a reboot,** named and protected clones come back `sleeping` and wake on first use.
+- **New clones return router URLs.** `clone`, `list`, MCP and `.env` injection now give `postgres://postgres:<password>@127.0.0.1:54300/<clone>`. A `.env` file written by 0.2 keeps its direct URL, which works only while the clone is awake. To switch it to the router URL, re-run `mitosis clone --name <x> --env-file <file>` with the clone's own `--template`, `--durable` and `--protect` flags. With other flags it is refused (the hint suggests `--fresh`, which throws the clone's data away). Idle clones now sleep after 10 minutes, and a sleeping clone refuses its direct URL; so either switch the `.env` entry, or keep the old behaviour with `mitosis config set idle_sleep off`.
+- **After a reboot,** named and protected clones come back `sleeping` and wake on first use (with the router off or its port taken, they are started at once).
+- **Clone names that look like a clone id** (`c` plus 6 hex digits, such as `cafe123`) are refused by `clone --name`, because the router would take them for that id. A 0.2 clone with such a name keeps running and can still be listed, used and destroyed; `clone --name` on it is refused.
 
 The CLI, `--json` and MCP names were made consistent before the freeze. Scripts written for 0.2 need these changes (the CHANGELOG `### Changed` list has the rest):
 

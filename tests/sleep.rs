@@ -358,3 +358,25 @@ async fn sleep_rechecks_direct_backends() {
     assert!(e.message.contains("open connections"), "{}", e.message);
     assert_eq!(status(&env, &a.id), "ready");
 }
+
+/// With the router on but its port taken, nothing would wake a sleeping clone on connect: idle
+/// clones keep running and answer on their direct URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn router_port_taken_clones_do_not_sleep() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", SEED).await;
+    let port = env.ctx.config().router_port;
+    let _blocker = TcpListener::bind(("127.0.0.1", port)).expect("occupy the router port");
+    env.ctx.set_config(Config {
+        router: true,
+        idle_sleep: Some(Duration::from_secs(1)),
+        ..env.ctx.config()
+    });
+    assert!(mitosis::router::bind(&env.ctx).await.is_none());
+    assert!(env.ctx.router().status.error.is_some());
+    let a = create(&env.ctx, args(Some("a"))).await.unwrap();
+    let (slept, _) = idle_pass(&env.ctx, now() + 100).await.unwrap();
+    assert!(slept.is_empty(), "{slept:?}");
+    assert_eq!(status(&env, &a.id), "ready");
+    assert_eq!(psql_url(&env, &a.direct_url, "select count(*) from t"), "1");
+}

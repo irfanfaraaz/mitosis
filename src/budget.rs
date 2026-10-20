@@ -347,10 +347,10 @@ pub async fn admit(ctx: &Arc<Ctx>, wait: Duration) -> Result<Admission> {
 }
 
 /// Puts the idle clone with the oldest activity to sleep (reason `evicted`); false when no clone
-/// can be slept. A clone with an open connection is never chosen. Needs the router, which is
-/// what wakes a sleeping clone.
+/// can be slept. A clone with an open connection is never chosen. Needs the router listening,
+/// which is what wakes a sleeping clone.
 async fn sleep_least_recent_idle(ctx: &Arc<Ctx>) -> bool {
-    if !ctx.config().router {
+    if !crate::router::listening(ctx) {
         return false;
     }
     let mut idle = match crate::lifecycle::idle_clones(ctx, crate::templates::now()).await {

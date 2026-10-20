@@ -351,13 +351,7 @@ pub async fn create_clone(
     let env = args.env.clone();
     let mut info = match client::request(home, Request::CloneCreate(args)).await? {
         Response::CloneCreated(info) => info,
-        // Not the reply itself: it holds a password-bearing URL.
-        _ => {
-            return Err(
-                MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
-                    .with_hint("restart the daemon: mitosis daemon stop"),
-            )
-        }
+        _ => return Err(unexpected_reply()),
     };
     if let Some(t) = env {
         let written = read_file(&t.file).and_then(|text| {
@@ -384,6 +378,54 @@ pub async fn create_clone(
     pending.append(&mut info.warnings);
     info.warnings = pending;
     Ok(info)
+}
+
+// Not the reply itself: it can hold a password-bearing URL.
+fn unexpected_reply() -> MitosisError {
+    MitosisError::new(ErrorCode::ProtocolMismatch, "unexpected daemon reply")
+        .with_hint("restart the daemon: mitosis daemon stop")
+}
+
+/// The URL `mitosis env` prints for clone `id_or_name`: its `url`, or with `direct` its
+/// `direct_url`. A direct URL refuses connections while the clone sleeps, so when the printed URL
+/// is the direct one (`direct`, or the router off) a sleeping clone is woken first; its port may
+/// move on the wake. Returns the URL and the wake's warnings.
+pub async fn env_url(home: &Home, id_or_name: &str, direct: bool) -> Result<(String, Vec<String>)> {
+    let clones = match client::request(home, Request::CloneList).await? {
+        Response::Clones { clones } => clones,
+        _ => return Err(unexpected_reply()),
+    };
+    let c = clones
+        .into_iter()
+        .find(|c| c.id == id_or_name || c.name.as_deref() == Some(id_or_name))
+        .ok_or_else(|| {
+            MitosisError::new(
+                ErrorCode::CloneNotFound,
+                format!("clone {id_or_name} not found"),
+            )
+            .with_hint("see running clones with `mitosis list`")
+        })?;
+    let not_usable = match c.status.as_str() {
+        "starting" => Some("is still starting; try again in a moment"),
+        "stopping" => Some("is being destroyed"),
+        _ => None,
+    };
+    if let Some(why) = not_usable {
+        return Err(invalid(format!("clone {id_or_name} {why}")));
+    }
+    let direct = direct || c.url == c.direct_url;
+    if !direct {
+        // The router URL works while the clone sleeps: the router wakes it.
+        return Ok((c.url, Vec::new()));
+    }
+    if c.status != "sleeping" {
+        return Ok((c.direct_url, Vec::new()));
+    }
+    // By id, so a name reused meanwhile cannot redirect the wake.
+    match client::request(home, Request::CloneWake { id_or_name: c.id }).await? {
+        Response::Clone(info) => Ok((info.direct_url, info.warnings)),
+        _ => Err(unexpected_reply()),
+    }
 }
 
 /// Finishes the `.env` restores the daemon could not do, starting the daemon if none runs.

@@ -849,8 +849,8 @@ pub(crate) fn claim_build(ctx: &Ctx, name: &str) -> bool {
         .insert(name.to_string())
 }
 
-/// True while a build of `name` runs.
-pub(crate) fn is_building(ctx: &Ctx, name: &str) -> bool {
+/// True while a build of `name` runs (holds its build slot).
+pub fn is_building(ctx: &Ctx, name: &str) -> bool {
     ctx.building
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1705,7 +1705,10 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         (None, false) => ctx.store().get_template(&name)?.and_then(|t| t.mask_path),
     };
     let mask_file = match mask_path.as_deref() {
-        Some(p) => Some((MaskFile::load(p)?, MaskFile::hash(p)?)),
+        Some(p) => {
+            let path = p.to_path_buf();
+            Some(blocking(move || MaskFile::load_hashed(&path)).await?)
+        }
         None => None,
     };
     // The commit expects the pointer read here; a new template starts at 0 (no generation).
@@ -1916,7 +1919,8 @@ async fn build_layer(ctx: &Ctx, l: Layer<'_>) -> Result<u32> {
     // masked with this very file, or raw values of newly masked columns would stay in them.
     let masking = match t.mask_path.as_deref() {
         Some(p) => {
-            let hash = MaskFile::hash(p)?;
+            let path = p.to_path_buf();
+            let (file, hash) = blocking(move || MaskFile::load_hashed(&path)).await?;
             if cur.mask_hash.as_deref() != Some(hash.as_str()) {
                 return Err(invalid(format!(
                     "the current generation of template {} was not built with the masking \
@@ -1931,7 +1935,7 @@ async fn build_layer(ctx: &Ctx, l: Layer<'_>) -> Result<u32> {
             }
             // The source's salt, so a branch template masks values as its base does.
             Some(Masking {
-                file: MaskFile::load(p)?,
+                file,
                 hash,
                 salt: ctx.store().ensure_mask_salt(&t.name, &random_hex(32))?,
             })
@@ -1939,9 +1943,9 @@ async fn build_layer(ctx: &Ctx, l: Layer<'_>) -> Result<u32> {
         None => None,
     };
     let install = ctx.install_major(cur.pg_major).await?;
-    let migrations_hash = match l.migrations.as_deref() {
-        Some(m) if m.is_dir() => Some(hash_dir(m)?),
-        _ => None,
+    let migrations_hash = match l.migrations.clone() {
+        Some(m) => blocking(move || m.is_dir().then(|| hash_dir(&m)).transpose()).await?,
+        None => None,
     };
     let gen = ctx.store().alloc_gen(name)?;
 
@@ -2489,10 +2493,13 @@ async fn apply_mask(
         return Ok(());
     }
     // Only the `SET LOCAL` of the salt holds it. Nothing may echo statement text: no statement
-    // logging (whatever the cluster's settings say), no failing statement in the server log, no
-    // `LINE` excerpt from psql, no utility tracking by pg_stat_statements.
+    // logging (whatever the cluster's settings say), no sampled statement or transaction logging
+    // (PG 12+/13+ settings, so set only where they exist), no failing statement in the server log,
+    // no `LINE` excerpt from psql, no utility tracking by pg_stat_statements.
     let sql = format!(
         "\\set VERBOSITY terse\nSET log_statement = 'none';\nSET log_min_duration_statement = -1;\n\
+         SELECT set_config(name, CASE name WHEN 'log_transaction_sample_rate' THEN '0' ELSE '-1' END, \
+         false) FROM pg_settings WHERE name IN ('log_transaction_sample_rate', 'log_min_duration_sample');\n\
          SET log_min_error_statement = panic;\nSET pg_stat_statements.track_utility = off;\n\
          BEGIN;\nSET LOCAL session_replication_role = replica;\n{};\nCOMMIT;\n",
         statements.join(";\n")

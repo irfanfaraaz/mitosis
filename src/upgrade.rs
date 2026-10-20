@@ -134,6 +134,12 @@ fn reserve(
     t.migrate = row.migrate.clone();
     t.auto_migrate = row.auto_migrate;
     t.on_stale = row.on_stale;
+    // A later full refresh of the copy must mask as the original does, with the same salt.
+    t.mask_path = row.mask_path.clone();
+    t.mask_salt = row.mask_salt.clone();
+    t.base_branch = row.base_branch.clone();
+    t.repo_rel_cwd = row.repo_rel_cwd.clone();
+    t.repo_rel_migrations = row.repo_rel_migrations.clone();
     store.insert_template(&t)?;
     match store.alloc_gen(new_name) {
         Ok(gen) => Ok((true, 0, gen)),

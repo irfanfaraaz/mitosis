@@ -81,6 +81,12 @@ impl RouterState {
     }
 }
 
+/// True while the router is on and listening: only then can a sleeping clone be woken by a
+/// connection, so only then may clones be put to sleep.
+pub fn listening(ctx: &Ctx) -> bool {
+    ctx.config().router && ctx.router().status.listening
+}
+
 /// The warning `clone` responses carry while the router is on but not listening.
 pub fn warning(ctx: &Ctx) -> Option<String> {
     if !ctx.config().router {
@@ -89,7 +95,8 @@ pub fn warning(ctx: &Ctx) -> Option<String> {
     let error = ctx.router().status.error.clone()?;
     Some(format!(
         "the router is not listening ({error}); it retries every minute. Until then use the \
-         direct URL (mitosis env <clone> --direct, or direct_url)"
+         direct URL (mitosis env <clone> --direct, or direct_url); clones do not sleep \
+         meanwhile, and mitosis wake <clone> starts one that already sleeps"
     ))
 }
 
@@ -102,61 +109,76 @@ fn retry_interval() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Binds `router_listen:router_port` and serves connections. While the bind fails the status
-/// holds the error, `router.failed` is recorded once, and the bind is retried every minute.
-/// Abort the handle to stop accepting; open connections keep going.
-pub fn spawn(ctx: Arc<Ctx>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let cfg = ctx.config();
-        let addr = SocketAddr::new(cfg.router_listen, cfg.router_port);
-        let retry = retry_interval();
-        let listener = loop {
-            match TcpListener::bind(addr).await {
-                Ok(l) => break l,
-                Err(e) => {
-                    let error = format!("cannot listen on {addr}: {e}");
-                    let first = {
-                        let mut r = ctx.router();
-                        let first = r.status.error.as_deref() != Some(error.as_str());
-                        r.status = RouterStatus {
-                            listening: false,
-                            listen: addr.ip().to_string(),
-                            port: addr.port(),
-                            error: Some(error.clone()),
-                        };
-                        first
-                    };
-                    if first {
-                        log(
-                            &ctx,
-                            &format!("router: {error}; retrying every {}", format_duration(retry)),
-                        );
-                        events::emit(
-                            &ctx,
-                            events::ROUTER_FAILED,
-                            None,
-                            None,
-                            json!({ "listen": addr.to_string(), "error": e.to_string() }),
-                        );
-                    }
-                    tokio::time::sleep(retry).await;
-                }
+/// Binds `router_listen:router_port` once and records the outcome in the status. On failure the
+/// status holds the error and `router.failed` is recorded (once per distinct error). The daemon
+/// binds before its startup gc, so recovery knows whether the router can wake clones.
+pub async fn bind(ctx: &Ctx) -> Option<TcpListener> {
+    let cfg = ctx.config();
+    let addr = SocketAddr::new(cfg.router_listen, cfg.router_port);
+    match TcpListener::bind(addr).await {
+        Ok(l) => {
+            ctx.router().status = RouterStatus {
+                listening: true,
+                listen: addr.ip().to_string(),
+                port: addr.port(),
+                error: None,
+            };
+            log(ctx, &format!("router listening on {addr}"));
+            events::emit(
+                ctx,
+                events::ROUTER_STARTED,
+                None,
+                None,
+                json!({ "listen": addr.to_string() }),
+            );
+            Some(l)
+        }
+        Err(e) => {
+            let error = format!("cannot listen on {addr}: {e}");
+            let first = {
+                let mut r = ctx.router();
+                let first = r.status.error.as_deref() != Some(error.as_str());
+                r.status = RouterStatus {
+                    listening: false,
+                    listen: addr.ip().to_string(),
+                    port: addr.port(),
+                    error: Some(error.clone()),
+                };
+                first
+            };
+            if first {
+                log(
+                    ctx,
+                    &format!(
+                        "router: {error}; retrying every {}",
+                        format_duration(retry_interval())
+                    ),
+                );
+                events::emit(
+                    ctx,
+                    events::ROUTER_FAILED,
+                    None,
+                    None,
+                    json!({ "listen": addr.to_string(), "error": e.to_string() }),
+                );
             }
+            None
+        }
+    }
+}
+
+/// Serves connections on `listener` (from `bind`); without one, retries the bind every minute
+/// first. Abort the handle to stop accepting. Open connections end when the process exits.
+pub fn spawn(ctx: Arc<Ctx>, listener: Option<TcpListener>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut listener = listener;
+        let listener = loop {
+            if let Some(l) = listener.take() {
+                break l;
+            }
+            tokio::time::sleep(retry_interval()).await;
+            listener = bind(&ctx).await;
         };
-        ctx.router().status = RouterStatus {
-            listening: true,
-            listen: addr.ip().to_string(),
-            port: addr.port(),
-            error: None,
-        };
-        log(&ctx, &format!("router listening on {addr}"));
-        events::emit(
-            &ctx,
-            events::ROUTER_STARTED,
-            None,
-            None,
-            json!({ "listen": addr.to_string() }),
-        );
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {

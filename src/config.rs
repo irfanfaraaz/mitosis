@@ -144,13 +144,13 @@ const KEYS: [KeySpec; 11] = [
     KeySpec {
         key: "router_port",
         env: "MITOSIS_ROUTER_PORT",
-        want: "a port number from 1 to 65535",
+        want: "a port number from 1 to 65535, outside the clone ports 54320-54999",
         example: "54300",
     },
     KeySpec {
         key: "router_listen",
         env: "MITOSIS_ROUTER_LISTEN",
-        want: "an IP address like 127.0.0.1 or 0.0.0.0",
+        want: "127.0.0.1, ::1, 0.0.0.0 or ::",
         example: "127.0.0.1",
     },
     KeySpec {
@@ -271,6 +271,17 @@ fn parse_idle(v: &str) -> Option<Option<Duration>> {
     }
 }
 
+/// Loopback or every interface only: `url` always names `127.0.0.1`, which any other single
+/// address would not answer on.
+fn parse_listen(v: &str) -> Option<IpAddr> {
+    let ip: IpAddr = v.parse().ok()?;
+    let ok = match ip {
+        IpAddr::V4(a) => a == Ipv4Addr::LOCALHOST || a.is_unspecified(),
+        IpAddr::V6(a) => a.is_loopback() || a.is_unspecified(),
+    };
+    ok.then_some(ip)
+}
+
 fn parse_wait(v: &str) -> Option<Duration> {
     crate::names::parse_wait(v).ok()
 }
@@ -387,8 +398,14 @@ impl Config {
             "queue_wait" => self.queue_wait = parse_wait(v)?,
             "clone_disk_warn" => self.clone_disk_warn = parse_size(v).ok()?,
             "router" => self.router = parse_switch(v)?,
-            "router_port" => self.router_port = v.parse::<u16>().ok().filter(|p| *p >= 1)?,
-            "router_listen" => self.router_listen = v.parse().ok()?,
+            "router_port" => {
+                // Inside `port_range` a clone could take it while the router waits to bind.
+                self.router_port = v
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p >= 1 && !self.port_range.contains(p))?
+            }
+            "router_listen" => self.router_listen = parse_listen(v)?,
             "idle_sleep" => self.idle_sleep = parse_idle(v)?,
             "idle_reap" => self.idle_reap = parse_idle(v)?,
             _ => return None,
@@ -576,11 +593,23 @@ mod tests {
             ("MITOSIS_ROUTER_PORT", "0"),
             ("MITOSIS_ROUTER_PORT", "70000"),
             ("MITOSIS_ROUTER_LISTEN", "localhost"),
+            ("MITOSIS_ROUTER_LISTEN", "192.168.1.5"),
+            ("MITOSIS_ROUTER_LISTEN", "127.0.0.2"),
+            ("MITOSIS_ROUTER_LISTEN", "fe80::1"),
+            ("MITOSIS_ROUTER_PORT", "54320"),
+            ("MITOSIS_ROUTER_PORT", "54999"),
         ] {
             let env = |n: &str| (n == k).then(|| v.to_string());
             let e = Config::default().layered(&home, &env).unwrap_err();
             assert!(e.message.starts_with(k), "{e}");
         }
+        for ok in ["127.0.0.1", "::1", "0.0.0.0", "::"] {
+            let env = |n: &str| (n == "MITOSIS_ROUTER_LISTEN").then(|| ok.to_string());
+            let (c, _) = Config::default().layered(&home, &env).unwrap();
+            assert_eq!(c.router_listen.to_string(), ok);
+        }
+        assert!(Config::set_in_file(&home, "router_port", "54400").is_err());
+        assert!(Config::set_in_file(&home, "router_listen", "10.0.0.1").is_err());
         Config::set_in_file(&home, "router_port", "6001").unwrap();
         Config::set_in_file(&home, "router", "off").unwrap();
         let (c, _) = Config::default().layered(&home, &no_env).unwrap();

@@ -719,7 +719,7 @@ async fn check_router(cfg: &Config, daemon_up: bool, daemon: Option<&DaemonStatu
             |h| format!("held by {h}"),
         );
         Check::new(name, Level::Fail, format!("{what}; {who}")).fix(
-            "stop that process, or move the router: mitosis config set router_port <port> and mitosis daemon stop. Clones answer on their direct_url meanwhile (mitosis env <clone> --direct)"
+            "stop that process, or move the router: mitosis config set router_port <port> and mitosis daemon stop. Clones answer on their direct_url meanwhile (mitosis env <clone> --direct, which wakes a sleeping clone; or mitosis wake <clone>)"
             .to_string(),
         )
     };

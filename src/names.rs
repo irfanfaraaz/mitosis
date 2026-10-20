@@ -2,12 +2,21 @@ use crate::error::{ErrorCode, MitosisError, Result};
 use std::io::Read;
 use std::time::Duration;
 
-/// Template and clone names: `^[a-z0-9][a-z0-9_-]{0,62}$`.
+/// Template and clone names: `^[a-z0-9][a-z0-9_-]{0,62}$`. A clone name may not look like a
+/// clone id (`c` plus 6 hex digits): the router picks a name before an id, so it would shadow
+/// the clone with that id.
 pub fn validate_name(kind: &str, name: &str) -> Result<()> {
     let mut chars = name.chars();
     let ok = name.len() <= 63
         && matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if ok && kind == "clone" && is_clone_id(name) {
+        return Err(MitosisError::new(
+            ErrorCode::InvalidRequest,
+            format!("invalid clone name {name:?}: it looks like a clone id"),
+        )
+        .with_hint("clone ids are 'c' plus 6 hex digits; pick a name that is not, like my-clone"));
+    }
     if ok {
         return Ok(());
     }
@@ -99,6 +108,11 @@ mod tests {
     fn names() {
         assert!(validate_name("template", "main").is_ok());
         assert!(validate_name("clone", "feature-x_2").is_ok());
+        assert!(validate_name("clone", "cafe123").is_err());
+        assert!(validate_name("clone", "c0ffee1").is_err());
+        assert!(validate_name("template", "cafe123").is_ok());
+        assert!(validate_name("clone", "cafe1234").is_ok());
+        assert!(validate_name("clone", "cafe12g").is_ok());
         assert!(validate_name("clone", &"a".repeat(63)).is_ok());
         for bad in ["", "../x", "a/b", "Main", "-x", &"a".repeat(64)] {
             assert_eq!(

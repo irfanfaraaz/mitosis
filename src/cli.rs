@@ -76,7 +76,8 @@ enum Cmd {
         id_or_name: String,
         #[arg(long, default_value = "DATABASE_URL")]
         var: String,
-        /// Print the URL straight to the clone's port instead of the router URL.
+        /// Print the URL straight to the clone's port instead of the router URL (wakes a
+        /// sleeping clone first).
         #[arg(long)]
         direct: bool,
     },
@@ -599,33 +600,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             // The printed line goes into a .env file: the same names `--env-var` accepts.
             envfile::check_var(&var)?;
-            let clones = match client::request(&home, Request::CloneList).await? {
-                Response::Clones { clones } => clones,
-                other => return Err(unexpected(other)),
-            };
-            let c = clones
-                .iter()
-                .find(|c| c.id == id_or_name || c.name.as_deref() == Some(id_or_name.as_str()))
-                .ok_or_else(|| {
-                    MitosisError::new(
-                        ErrorCode::CloneNotFound,
-                        format!("clone {id_or_name} not found"),
-                    )
-                    .with_hint("see running clones with `mitosis list`")
-                })?;
-            // A sleeping clone's URL works (the router wakes it); these two do not.
-            let not_usable = match c.status.as_str() {
-                "starting" => Some("is still starting; try again in a moment"),
-                "stopping" => Some("is being destroyed"),
-                _ => None,
-            };
-            if let Some(why) = not_usable {
-                return Err(MitosisError::new(
-                    ErrorCode::InvalidRequest,
-                    format!("clone {id_or_name} {why}"),
-                ));
+            let (url, warnings) = envfile::env_url(&home, &id_or_name, direct).await?;
+            for w in &warnings {
+                eprintln!("warning: {w}");
             }
-            println!("{var}={}", if direct { &c.direct_url } else { &c.url });
+            println!("{var}={url}");
         }
         Cmd::List { json } => {
             let clones = match client::request(&home, Request::CloneList).await? {
@@ -827,7 +806,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("router    {}", router_state(&s.router));
                 if s.router.as_ref().is_some_and(|r| !r.listening) {
                     eprintln!(
-                        "warning: the router is not listening; it retries every minute (direct URLs still work: mitosis env <clone> --direct)"
+                        "warning: the router is not listening; it retries every minute (direct URLs still work: mitosis env <clone> --direct, which wakes a sleeping clone; or mitosis wake <clone>)"
                     );
                 }
             }
