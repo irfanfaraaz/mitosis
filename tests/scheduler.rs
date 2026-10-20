@@ -368,14 +368,12 @@ async fn auto_migrate_fires_on_folder_change() {
         row(&env.ctx).last_attempt_at.is_some()
     })
     .await;
-    let store = env.ctx.store();
-    let g2 = store.get_generation("main", 2).unwrap().unwrap();
+    let g2 = env.ctx.store().get_generation("main", 2).unwrap().unwrap();
     assert_eq!(g2.kind, GenKind::Layered);
     assert_eq!(
         g2.migrations_hash,
         Some(templates::hash_dir(&folder).unwrap())
     );
-    drop(store);
     // The new generation matches the folder, so no further build starts.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(row(&env.ctx).next_gen, 3);

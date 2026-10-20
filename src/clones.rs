@@ -498,8 +498,9 @@ fn reserve<'a>(
 /// Test hook, called with (home root, port) right before each Postgres start in `bring_up`, so a
 /// test can occupy the port after `pick_port`'s pre-bind check. Always `None` outside tests.
 #[doc(hidden)]
-pub static PRE_START_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&Path, u16) + Send + Sync>>> =
-    std::sync::Mutex::new(None);
+pub type PreStartHook = Box<dyn Fn(&Path, u16) + Send + Sync>;
+#[doc(hidden)]
+pub static PRE_START_HOOK: std::sync::Mutex<Option<PreStartHook>> = std::sync::Mutex::new(None);
 
 fn set_status(ctx: &Ctx, row: &mut CloneRow, status: CloneStatus) -> Result<()> {
     row.status = status;
@@ -560,6 +561,16 @@ async fn bring_up(
         }
     };
 
+    set_password(install, row).await?;
+
+    row.pg_pid = Some(pg.pid);
+    row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
+    set_status(ctx, row, CloneStatus::Ready)?;
+    Ok(to_info(row, age_secs(gen.built_at, now())))
+}
+
+/// Sets the clone's `postgres` password over its private socket.
+async fn set_password(install: &PgInstall, row: &CloneRow) -> Result<()> {
     // PG 12/13 default to md5; initdb set host auth to scram-sha-256, so store a SCRAM hash.
     // log_min_error_statement=panic keeps a failing statement (with the password) out of the log.
     let sql = format!(
@@ -574,11 +585,7 @@ async fn bring_up(
             e.message = e.message.replace(&row.password, "***");
             e
         })?;
-
-    row.pg_pid = Some(pg.pid);
-    row.pg_start_time = Some(process_start_time(pg.pid).unwrap_or(pg.start_time));
-    set_status(ctx, row, CloneStatus::Ready)?;
-    Ok(to_info(row, age_secs(gen.built_at, now())))
+    Ok(())
 }
 
 /// Starts Postgres again on a clone whose server is gone (after a reboot): same folder, port,
@@ -637,6 +644,8 @@ pub async fn restart(ctx: &Ctx, row: &mut CloneRow) -> Result<Vec<String>> {
             Err(e) => return Err(e),
         }
     }
+    // With synchronous_commit off, an unclean stop can lose the create's ALTER ROLE; set it again.
+    set_password(&install, row).await?;
     if let Some(pid) = row.pg_pid {
         row.pg_start_time = process_start_time(pid).or(row.pg_start_time);
     }

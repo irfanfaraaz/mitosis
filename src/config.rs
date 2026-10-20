@@ -174,7 +174,7 @@ fn format_size(n: u64) -> String {
         (1_000_000, "MB"),
         (1_000, "KB"),
     ] {
-        if n != 0 && n % unit == 0 {
+        if n != 0 && n.is_multiple_of(unit) {
             return format!("{}{name}", n / unit);
         }
     }

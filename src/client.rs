@@ -46,13 +46,13 @@ pub async fn request(home: &Home, req: Request) -> Result<Response> {
         }
     };
     match exchange(stream, &req).await? {
-        Reply::Done(r) => Ok(r),
+        Reply::Done(r) => Ok(*r),
         Reply::Older(v) => {
             // A daemon from an older release: stop it (clones keep running), start ours, retry once.
             replace_old(home, v).await?;
             ensure_daemon(home).await?;
             match exchange(connect_started(home).await?, &req).await? {
-                Reply::Done(r) => Ok(r),
+                Reply::Done(r) => Ok(*r),
                 Reply::Older(v) => Err(mismatch(v)),
             }
         }
@@ -132,7 +132,7 @@ async fn replace_old(home: &Home, v: u64) -> Result<()> {
 pub async fn request_if_running(home: &Home, req: Request) -> Result<Option<Response>> {
     match UnixStream::connect(home.daemon_sock()).await {
         Ok(s) => match exchange(s, &req).await? {
-            Reply::Done(r) => Ok(Some(r)),
+            Reply::Done(r) => Ok(Some(*r)),
             Reply::Older(v) => Err(mismatch(v)),
         },
         Err(e) if not_listening(&e) => Ok(None),
@@ -145,7 +145,7 @@ pub async fn request_if_running(home: &Home, req: Request) -> Result<Option<Resp
 
 /// A daemon's answer: the response, or the lower protocol version it speaks.
 enum Reply {
-    Done(Response),
+    Done(Box<Response>),
     Older(u64),
 }
 
@@ -197,7 +197,7 @@ async fn exchange(stream: UnixStream, req: &Request) -> Result<Reply> {
             format!("unreadable daemon reply: {e}"),
         )
     })?;
-    env.result.map(Reply::Done)
+    env.result.map(|r| Reply::Done(Box::new(r)))
 }
 
 /// Starts `current_exe() daemon` in its own session and waits until its socket accepts connections.
