@@ -95,6 +95,18 @@ enum Cmd {
     },
     /// Start a sleeping clone now instead of on its first connection.
     Wake { id_or_name: String },
+    /// Show what a clone changed against the template generation it came from.
+    Diff {
+        id_or_name: String,
+        /// Compare one table row by row (needs a primary key).
+        #[arg(long)]
+        table: Option<String>,
+        /// Rows shown per kind with --table.
+        #[arg(long, requires = "table")]
+        limit: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Make a running clone the newest generation of its template (or of --template).
     Promote {
         clone: String,
@@ -606,6 +618,24 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     println!("{}", info.name.as_deref().unwrap_or(&info.id));
                 }
+                other => return Err(unexpected(other)),
+            }
+        }
+        Cmd::Diff {
+            id_or_name,
+            table,
+            limit,
+            json,
+        } => {
+            let req = Request::CloneDiff {
+                id_or_name,
+                table,
+                limit,
+                parent_pid: None,
+            };
+            match client::request(&home, req).await? {
+                Response::Diff(report) if json => print_json(&report)?,
+                Response::Diff(report) => print!("{}", crate::diff::render(&report)),
                 other => return Err(unexpected(other)),
             }
         }

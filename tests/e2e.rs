@@ -205,14 +205,14 @@ fn result_text(r: &CallToolResult) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mcp_lists_three_tools() {
+async fn mcp_lists_tools() {
     let (_serial, tmp) = serial_home();
     let home = tmp.path();
     let _cleanup = Cleanup(home);
     let client = mcp_client(home).await;
     assert_eq!(
         tool_names(&client).await,
-        ["clone_create", "clone_destroy", "clone_list"]
+        ["clone_create", "clone_destroy", "clone_diff", "clone_list"]
     );
     client.cancel().await.expect("stop mcp client");
 }
@@ -248,7 +248,7 @@ async fn mcp_tools_roundtrip() {
     let client = mcp_client(home).await;
     assert_eq!(
         tool_names(&client).await,
-        ["clone_create", "clone_destroy", "clone_list"]
+        ["clone_create", "clone_destroy", "clone_diff", "clone_list"]
     );
 
     let r = call(&client, "clone_create", json!({})).await;

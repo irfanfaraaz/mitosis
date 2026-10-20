@@ -1,0 +1,353 @@
+// The serial_home guard only orders whole tests, each on its own runtime thread; no task in the
+// same runtime ever waits on it.
+#![allow(clippy::await_holding_lock)]
+
+mod common;
+
+use common::*;
+use mitosis::clones::{create, sleep};
+use mitosis::diff::{diff, render};
+use mitosis::error::ErrorCode;
+use mitosis::pg::discover;
+use mitosis::protocol::{CloneCreateArgs, CloneInfo, DiffReport, TemplateSource};
+use mitosis::state::CloneStatus;
+use rmcp::model::{CallToolRequestParams, CallToolResult};
+use rmcp::service::RunningService;
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::{RoleClient, ServiceExt};
+use serde_json::json;
+use std::path::Path;
+use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
+
+fn args() -> CloneCreateArgs {
+    CloneCreateArgs {
+        template: "main".into(),
+        name: None,
+        ttl_secs: 7200,
+        durable: false,
+        parent_pid: None,
+        fresh: false,
+        protect: false,
+        env: None,
+        wait_secs: Some(0),
+    }
+}
+
+async fn clone_of(env: &TestEnv) -> CloneInfo {
+    create(&env.ctx, args()).await.expect("create clone")
+}
+
+async fn run_diff(env: &TestEnv, id: &str, table: Option<&str>) -> DiffReport {
+    diff(&env.ctx, id, table, 20).await.expect("diff")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_shows_schema_changes() {
+    let Some(env) = TestEnv::new() else { return };
+    template(
+        &env,
+        "main",
+        "create table t(id int primary key, a int, b int); create index t_a on t(a); \
+         create function f() returns int language sql as 'select 1'",
+    )
+    .await;
+    let c = clone_of(&env).await;
+    psql_url(
+        &env,
+        &c.url,
+        "create table n(x int); alter table t drop column b; drop index t_a; \
+         create index t_a on t(id, a); \
+         create function g() returns int language sql as 'select 2'",
+    );
+
+    let report = run_diff(&env, &c.id, None).await;
+    let got: Vec<(&str, &str, &str)> = report
+        .schema
+        .iter()
+        .map(|s| (s.kind.as_str(), s.name.as_str(), s.change.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("table", "n", "added"),
+            ("column", "t.b", "removed"),
+            ("index", "t_a", "changed"),
+            ("function", "g()", "added"),
+        ],
+        "{report:?}"
+    );
+    let idx = &report.schema[2];
+    assert!(idx.before.as_deref().unwrap().contains("(a)"), "{idx:?}");
+    assert!(idx.after.as_deref().unwrap().contains("(id, a)"), "{idx:?}");
+    assert_eq!(report.template, "main");
+    assert_eq!(report.generation, 1);
+    assert!(render(&report).contains("+ table n"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_row_counts() {
+    let Some(env) = TestEnv::new() else { return };
+    template(
+        &env,
+        "main",
+        "create table t(id int); insert into t values (1)",
+    )
+    .await;
+    let c = clone_of(&env).await;
+    psql_url(&env, &c.url, "insert into t values (2), (3), (4)");
+
+    let report = run_diff(&env, &c.id, None).await;
+    assert!(report.schema.is_empty(), "{:?}", report.schema);
+    let t = report.tables.iter().find(|t| t.table == "t").expect("t");
+    assert_eq!((t.before.n, t.before.estimate), (1, false));
+    assert_eq!((t.after.n, t.after.estimate), (4, false));
+    assert!(report.rows.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_table_rows() {
+    let Some(env) = TestEnv::new() else { return };
+    template(
+        &env,
+        "main",
+        "create table t(id int primary key, v text); \
+         insert into t values (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    let c = clone_of(&env).await;
+    psql_url(
+        &env,
+        &c.url,
+        "insert into t values (4, 'd'); delete from t where id = 1; \
+         update t set v = 'bb' where id = 2",
+    );
+
+    let report = run_diff(&env, &c.id, Some("t")).await;
+    let rows = report.rows.expect("rows");
+    assert_eq!(rows.table, "t");
+    assert_eq!(
+        (rows.inserted_total, rows.deleted_total, rows.updated_total),
+        (1, 1, 1)
+    );
+    assert_eq!(rows.inserted[0]["id"], 4);
+    assert_eq!(rows.deleted[0]["id"], 1);
+    assert_eq!(rows.updated[0].pk, json!(2));
+    assert_eq!(rows.updated[0].columns, ["v"]);
+
+    // The limit caps the rows shown, not the totals.
+    psql_url(
+        &env,
+        &c.url,
+        "insert into t select g, 'x' from generate_series(10, 14) g",
+    );
+    let limited = diff(&env.ctx, &c.id, Some("t"), 2).await.expect("diff");
+    let rows = limited.rows.expect("rows");
+    assert_eq!((rows.inserted.len(), rows.inserted_total), (2, 6));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_table_without_pk_is_refused() {
+    let Some(env) = TestEnv::new() else { return };
+    template(
+        &env,
+        "main",
+        "create table t(id int); insert into t values (1)",
+    )
+    .await;
+    let c = clone_of(&env).await;
+    let e = diff(&env.ctx, &c.id, Some("t"), 20).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.message.contains("primary key"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_pruned_generation_errors() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(id int)").await;
+    let c = clone_of(&env).await;
+    let gen = env
+        .ctx
+        .store()
+        .get_generation("main", c.generation)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_dir_all(&gen.dir).unwrap();
+
+    let e = diff(&env.ctx, &c.id, None, 20).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidRequest);
+    assert!(e.message.contains("pruned"), "{e}");
+    assert!(e.hint.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_of_sleeping_clone_wakes_it() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(id int)").await;
+    let c = clone_of(&env).await;
+    psql_url(&env, &c.url, "insert into t values (1)");
+    sleep(&env.ctx, &c.id, "test").await.expect("sleep");
+    let status = |env: &TestEnv| env.ctx.store().get_clone(&c.id).unwrap().unwrap().status;
+    assert_eq!(status(&env), CloneStatus::Sleeping);
+
+    let report = run_diff(&env, &c.id, None).await;
+    assert_eq!(status(&env), CloneStatus::Ready);
+    let t = report.tables.iter().find(|t| t.table == "t").expect("t");
+    assert_eq!((t.before.n, t.after.n), (0, 1));
+}
+
+fn base_leftovers(env: &TestEnv) -> Vec<String> {
+    let home = &env.ctx.home;
+    let mut left = Vec::new();
+    for dir in [home.templates_dir(), home.sockets_dir(), home.logs_dir()] {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.contains("diff") || (n.starts_with('d') && n.len() == 9 && n != "daemon.log") {
+                left.push(n);
+            }
+        }
+    }
+    let ps = Command::new("ps")
+        .args(["-axo", "command"])
+        .output()
+        .unwrap();
+    let ps = String::from_utf8_lossy(&ps.stdout);
+    let root = env.ctx.home.root.to_string_lossy().into_owned();
+    left.extend(
+        ps.lines()
+            .filter(|l| l.contains(".diff-") && l.contains(&root))
+            .map(String::from),
+    );
+    left
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_leaves_no_base_folder() {
+    let Some(env) = TestEnv::new() else { return };
+    template(&env, "main", "create table t(id int)").await;
+    let c = clone_of(&env).await;
+
+    run_diff(&env, &c.id, None).await;
+    assert_eq!(base_leftovers(&env), Vec::<String>::new(), "after success");
+
+    // Fails after the base server is up: the table has no primary key.
+    diff(&env.ctx, &c.id, Some("t"), 20).await.unwrap_err();
+    assert_eq!(base_leftovers(&env), Vec::<String>::new(), "after an error");
+}
+
+// ---- MCP, through a real daemon -------------------------------------------------------------
+
+const SEED: &str = "create table t(id int primary key); insert into t values (1)";
+
+/// Each test here runs a real daemon on the default port range, so they run one at a time.
+fn serial_home() -> (MutexGuard<'static, ()>, tempfile::TempDir) {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    (guard, tmp_home())
+}
+
+/// Not the default 54300, which a real daemon on this Mac may hold.
+fn router_port() -> String {
+    static PORT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PORT.get_or_init(|| {
+        let r = u16::from_str_radix(&mitosis::names::random_hex(2), 16).unwrap();
+        (60_950 + r % 500).to_string()
+    })
+    .clone()
+}
+
+fn mitosis(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_mitosis"))
+        .args(args)
+        .env("MITOSIS_HOME", home)
+        .env("MITOSIS_ROUTER_PORT", router_port())
+        .output()
+        .expect("run mitosis")
+}
+
+fn ok(home: &Path, args: &[&str]) -> String {
+    let o = mitosis(home, args);
+    assert!(
+        o.status.success(),
+        "mitosis {args:?} failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// Destroys every clone and stops the daemon, even when the test panics.
+struct Cleanup<'a>(&'a Path);
+
+impl Drop for Cleanup<'_> {
+    fn drop(&mut self) {
+        if self.0.join("daemon.sock").exists() {
+            let out = mitosis(self.0, &["list", "--json"]);
+            for c in serde_json::from_slice::<Vec<CloneInfo>>(&out.stdout).unwrap_or_default() {
+                let _ = mitosis(self.0, &["destroy", &c.id]);
+            }
+        }
+        let _ = mitosis(self.0, &["daemon", "stop"]);
+    }
+}
+
+type McpClient = RunningService<RoleClient, ()>;
+
+async fn mcp_client(home: &Path) -> McpClient {
+    let cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_mitosis")).configure(|c| {
+        c.arg("mcp")
+            .env("MITOSIS_HOME", home)
+            .env("MITOSIS_ROUTER_PORT", router_port());
+    });
+    ().serve(TokioChildProcess::new(cmd).expect("spawn mitosis mcp"))
+        .await
+        .expect("mcp handshake")
+}
+
+async fn call(client: &McpClient, tool: &'static str, args: serde_json::Value) -> CallToolResult {
+    let args = args.as_object().cloned().unwrap_or_default();
+    client
+        .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+        .await
+        .expect("call tool")
+}
+
+fn result_text(r: &CallToolResult) -> String {
+    r.content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_clone_diff_refuses_other_session() {
+    if discover().is_empty() {
+        println!("skipping: no Postgres installed");
+        return;
+    }
+    let (_serial, tmp) = serial_home();
+    let home = tmp.path();
+    let _cleanup = Cleanup(home);
+    let TemplateSource::Seed { command, .. } = seed(SEED) else {
+        unreachable!()
+    };
+    ok(home, &["template", "init", "--seed", &command]);
+
+    // Made by the CLI: no MCP session owns it.
+    let other: CloneInfo = serde_json::from_str(&ok(home, &["clone", "--json"])).unwrap();
+    let client = mcp_client(home).await;
+    let r = call(&client, "clone_diff", json!({"id_or_name": other.id})).await;
+    let text = result_text(&r);
+    assert_eq!(r.is_error, Some(true), "{text}");
+    assert!(text.contains("not created by this session"), "{text}");
+
+    // Its own clone works.
+    let r = call(&client, "clone_create", json!({})).await;
+    let mine: CloneInfo = serde_json::from_str(&result_text(&r)).expect("clone_create text");
+    let r = call(&client, "clone_diff", json!({"id_or_name": mine.id})).await;
+    let text = result_text(&r);
+    assert_ne!(r.is_error, Some(true), "{text}");
+    let report: DiffReport = serde_json::from_str(&text).expect("clone_diff text parses");
+    assert_eq!(report.clone, mine.id);
+    client.cancel().await.expect("stop mcp client");
+}

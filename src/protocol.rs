@@ -229,6 +229,19 @@ pub enum Request {
     CloneWake {
         id_or_name: String,
     },
+    /// What a clone changed against the template generation it came from; answered with
+    /// `Response::Diff`. A `parent_pid` limits it to a clone of that MCP session.
+    CloneDiff {
+        id_or_name: String,
+        /// A table (`name` or `schema.name`) to compare row by row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
+        /// Rows shown per kind with `table`; default 20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_pid: Option<i32>,
+    },
     /// `.env` restores the daemon could not finish.
     PendingRestores,
     PendingRestoreDone {
@@ -372,6 +385,67 @@ pub struct CloneInfo {
     pub status: String,
 }
 
+/// What a clone changed against the template generation it was made from.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DiffReport {
+    pub clone: String,
+    pub template: String,
+    pub generation: u32,
+    pub schema: Vec<SchemaChange>,
+    /// Every table of either side; `public.` is left off names.
+    pub tables: Vec<TableCount>,
+    /// Only with `--table`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<RowDiff>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SchemaChange {
+    /// table, column, index, constraint, view, function, sequence or extension.
+    pub kind: String,
+    pub name: String,
+    /// added, removed or changed.
+    pub change: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TableCount {
+    pub table: String,
+    pub before: Count,
+    pub after: Count,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Count {
+    pub n: u64,
+    /// `n` is the planner's estimate: the exact count timed out.
+    #[serde(default)]
+    pub estimate: bool,
+}
+
+/// Row-level changes of one table. `pk` is the key value, or an array for a composite key.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RowDiff {
+    pub table: String,
+    pub inserted: Vec<serde_json::Value>,
+    pub deleted: Vec<serde_json::Value>,
+    pub updated: Vec<RowChange>,
+    pub inserted_total: u64,
+    pub deleted_total: u64,
+    pub updated_total: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RowChange {
+    pub pk: serde_json::Value,
+    /// Columns whose values differ.
+    pub columns: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct GcReport {
     pub adopted: Vec<String>,
@@ -454,6 +528,7 @@ pub enum Response {
     },
     /// One new event on a following `Request::Events` connection.
     Event(EventRow),
+    Diff(DiffReport),
     Ok,
 }
 

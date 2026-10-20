@@ -46,6 +46,18 @@ pub struct CloneDestroyParams {
     pub id: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct CloneDiffParams {
+    /// Clone id or name.
+    pub id_or_name: String,
+    /// A table (`name` or `schema.name`) to compare row by row; it needs a primary key. Omit for
+    /// the schema changes and row counts of every table.
+    pub table: Option<String>,
+    /// With `table`: rows shown per kind (inserted, deleted, updated). Default 20.
+    pub limit: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct Mitosis {
     home: Home,
@@ -97,6 +109,16 @@ impl Mitosis {
         Parameters(p): Parameters<CloneDestroyParams>,
     ) -> Result<String, String> {
         text(self.destroy(p.id).await)
+    }
+
+    #[tool(
+        description = "Show what you changed in one of your clones, compared with the template generation it was made from, as JSON: schema changes (tables, columns, indexes, constraints, views, functions, sequences, extensions), row counts per table before and after, and with `table` the inserted, deleted and updated rows by primary key."
+    )]
+    async fn clone_diff(
+        &self,
+        Parameters(p): Parameters<CloneDiffParams>,
+    ) -> Result<String, String> {
+        text(self.diff(p).await)
     }
 }
 
@@ -158,6 +180,40 @@ impl Mitosis {
         }
     }
 
+    /// Diffs a clone of this session; another session's clone (or a CLI one) is refused.
+    async fn diff(&self, p: CloneDiffParams) -> error::Result<String> {
+        let clones = self.all_clones().await?;
+        let c = find(&clones, &p.id_or_name).ok_or_else(|| {
+            MitosisError::new(
+                ErrorCode::CloneNotFound,
+                format!("clone {} not found", p.id_or_name),
+            )
+            .with_hint("see this session's clones with the clone_list tool")
+        })?;
+        if !is_mine(c) {
+            return Err(MitosisError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "clone {} was not created by this session; it may be another agent's database",
+                    c.id
+                ),
+            )
+            .with_hint("this tool only reads clones from clone_create in this session"));
+        }
+        // By id, so a name reused meanwhile cannot redirect the diff; the daemon checks the
+        // session again.
+        let req = Request::CloneDiff {
+            id_or_name: c.id.clone(),
+            table: p.table,
+            limit: p.limit,
+            parent_pid: Some(std::process::id() as i32),
+        };
+        match client::request(&self.home, req).await? {
+            Response::Diff(report) => Ok(serde_json::to_string_pretty(&report)?),
+            _ => Err(unexpected()),
+        }
+    }
+
     async fn create(&self, p: CloneCreateParams) -> error::Result<String> {
         let template = p.template.unwrap_or_else(|| "main".into());
         validate_name("template", &template)?;
@@ -207,7 +263,7 @@ impl Mitosis {
 
 #[tool_handler(
     name = "mitosis",
-    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL; clone_list shows the clones this session made; clone_destroy deletes one of them. Clones are deleted when this session ends or their TTL passes."
+    instructions = "Mitosis gives this session private, throwaway Postgres databases, cloned copy-on-write from a template in about a second. clone_create makes one and returns its connection URL; clone_list shows the clones this session made; clone_destroy deletes one of them; clone_diff shows what you changed in one. Clones are deleted when this session ends or their TTL passes."
 )]
 impl ServerHandler for Mitosis {}
 

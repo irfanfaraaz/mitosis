@@ -519,6 +519,25 @@ pub async fn serve_one(ctx: Arc<Ctx>, req: Request) -> Result<Response> {
         Request::CloneWake { id_or_name } => {
             Response::Clone(clones::wake_info(&ctx, &id_or_name).await?)
         }
+        Request::CloneDiff {
+            id_or_name,
+            table,
+            limit,
+            parent_pid,
+        } => {
+            if let Some(pid) = parent_pid {
+                crate::diff::check_session(&ctx, &id_or_name, pid)?;
+            }
+            Response::Diff(
+                crate::diff::diff(
+                    &ctx,
+                    &id_or_name,
+                    table.as_deref(),
+                    limit.unwrap_or(crate::diff::DEFAULT_LIMIT),
+                )
+                .await?,
+            )
+        }
         Request::PendingRestores => Response::PendingRestores {
             items: ctx.store().list_pending_restores()?,
         },

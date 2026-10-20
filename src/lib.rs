@@ -6,6 +6,7 @@ pub mod clones;
 pub mod config;
 pub mod ctx;
 pub mod daemon;
+pub mod diff;
 pub mod doctor;
 pub mod envfile;
 pub mod error;
