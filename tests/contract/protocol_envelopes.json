@@ -1,0 +1,26 @@
+{
+  "err": {
+    "result": {
+      "Err": {
+        "code": "string",
+        "hint": "string",
+        "message": "string"
+      }
+    },
+    "v": "number"
+  },
+  "ok": {
+    "result": {
+      "Ok": {
+        "type": "string"
+      }
+    },
+    "v": "number"
+  },
+  "request": {
+    "request": {
+      "type": "string"
+    },
+    "v": "number"
+  }
+}

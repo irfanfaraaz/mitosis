@@ -1,0 +1,8 @@
+[
+  {
+    "env_var": "string",
+    "key": "string",
+    "source": "string",
+    "value": "string"
+  }
+]

@@ -452,7 +452,7 @@ pub fn list(home: &Home) -> Result<Vec<ManagedInstall>> {
             existing(&e.path(), major, &name)
         })
         .collect();
-    out.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
+    out.sort_by_key(|p| std::cmp::Reverse(version_key(&p.version)));
     let found = discover_with(Some(home));
     for i in &mut out {
         i.used = found

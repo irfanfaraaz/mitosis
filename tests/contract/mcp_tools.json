@@ -1,0 +1,109 @@
+{
+  "clone_create": {
+    "input": {
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "env_file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env_var": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fresh": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ttl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wait": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "clone_destroy": {
+    "input": {
+      "properties": {
+        "id_or_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id_or_name"
+      ],
+      "type": "object"
+    }
+  },
+  "clone_diff": {
+    "input": {
+      "properties": {
+        "id_or_name": {
+          "type": "string"
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "table": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id_or_name"
+      ],
+      "type": "object"
+    }
+  },
+  "clone_list": {
+    "input": {
+      "properties": {},
+      "type": "object"
+    }
+  }
+}

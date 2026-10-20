@@ -1,0 +1,155 @@
+{
+  "clone_create": {
+    "branch": {
+      "name": "string",
+      "path": "string",
+      "repo_root": "string"
+    },
+    "durable": "boolean",
+    "env": {
+      "file": "string",
+      "previous": "string",
+      "var": "string"
+    },
+    "fresh": "boolean",
+    "name": "string",
+    "parent_pid": "number",
+    "protect": "boolean",
+    "template": "string",
+    "ttl_secs": "number",
+    "type": "string",
+    "wait_secs": "number"
+  },
+  "clone_destroy": {
+    "force": "boolean",
+    "forget": "boolean",
+    "id_or_name": "string",
+    "type": "string"
+  },
+  "clone_diff": {
+    "id_or_name": "string",
+    "limit": "number",
+    "parent_pid": "number",
+    "table": "string",
+    "type": "string"
+  },
+  "clone_list": {
+    "type": "string"
+  },
+  "clone_promote": {
+    "id_or_name": "string",
+    "template": "string",
+    "type": "string"
+  },
+  "clone_wake": {
+    "id_or_name": "string",
+    "type": "string"
+  },
+  "config_reload": {
+    "type": "string"
+  },
+  "events": {
+    "filter": {
+      "clone": "string",
+      "kind": "string",
+      "limit": "number",
+      "since": "number",
+      "template": "string"
+    },
+    "follow": "boolean",
+    "type": "string"
+  },
+  "gc": {
+    "type": "string"
+  },
+  "pending_restore_done": {
+    "id": "number",
+    "type": "string"
+  },
+  "pending_restores": {
+    "type": "string"
+  },
+  "shutdown": {
+    "type": "string"
+  },
+  "status": {
+    "type": "string"
+  },
+  "template_history": {
+    "name": "string",
+    "type": "string"
+  },
+  "template_init": {
+    "auto_migrate": "boolean",
+    "base_branch": "string",
+    "base_branch_off": "boolean",
+    "database": "string",
+    "every_mode": "string",
+    "every_off": "boolean",
+    "every_secs": "number",
+    "keep": "number",
+    "mask": "string",
+    "mask_off": "boolean",
+    "max_age_secs": "number",
+    "migrate": {
+      "command": "string",
+      "cwd": "string",
+      "path": "string"
+    },
+    "migrate_off": "boolean",
+    "migrations": "string",
+    "name": "string",
+    "on_stale": "string",
+    "pg_major": "number",
+    "source": {
+      "kind": "string",
+      "url": "string"
+    },
+    "type": "string"
+  },
+  "template_list": {
+    "type": "string"
+  },
+  "template_refresh": {
+    "layered": "boolean",
+    "name": "string",
+    "path": "string",
+    "type": "string"
+  },
+  "template_rollback": {
+    "name": "string",
+    "to": "number",
+    "type": "string"
+  },
+  "template_set": {
+    "auto_migrate": "boolean",
+    "base_branch": "string",
+    "base_branch_off": "boolean",
+    "every_mode": "string",
+    "every_off": "boolean",
+    "every_secs": "number",
+    "keep": "number",
+    "mask": "string",
+    "mask_off": "boolean",
+    "max_age_secs": "number",
+    "migrate": {
+      "command": "string",
+      "cwd": "string",
+      "path": "string"
+    },
+    "migrate_off": "boolean",
+    "name": "string",
+    "on_stale": "string",
+    "resume": "boolean",
+    "type": "string"
+  },
+  "template_upgrade": {
+    "as_name": "string",
+    "name": "string",
+    "to": "number",
+    "type": "string"
+  },
+  "usage": {
+    "type": "string"
+  }
+}

@@ -264,9 +264,7 @@ fn make_standalone_turns_off_archive_and_ssl() {
     // The values that now apply: the last line of each setting.
     let last = |name: &str| {
         conf.lines()
-            .filter(|l| !l.starts_with('#'))
-            .filter(|l| l.split(" =").next() == Some(name))
-            .last()
+            .rfind(|l| !l.starts_with('#') && l.split(" =").next() == Some(name))
             .map(String::from)
     };
     assert_eq!(last("archive_mode").as_deref(), Some("archive_mode = off"));
@@ -292,7 +290,7 @@ fn make_standalone_turns_off_archive_and_ssl() {
         Some("synchronous_standby_names = ''")
     );
     assert_eq!(last("hba_file"), None);
-    assert!(conf.contains("\nshared_buffers = 1GB\n"));
+    assert!(conf.lines().any(|l| l == "shared_buffers = 1GB"));
     // Warnings name the settings and never show a value (it can hold a password or keys).
     let all = warnings.join("\n");
     for name in ["archive_mode", "archive_command", "primary_conninfo", "ssl"] {

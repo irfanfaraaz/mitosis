@@ -1,0 +1,426 @@
+{
+  "subcommands": {
+    "clone": {
+      "args": {
+        "--branch": {
+          "takes_value": true,
+          "value_optional": true
+        },
+        "--durable": {
+          "takes_value": false
+        },
+        "--env-file": {
+          "takes_value": true
+        },
+        "--env-var": {
+          "takes_value": true
+        },
+        "--fresh": {
+          "takes_value": false
+        },
+        "--json": {
+          "takes_value": false
+        },
+        "--name": {
+          "takes_value": true
+        },
+        "--protect": {
+          "takes_value": false
+        },
+        "--template": {
+          "default": [
+            "main"
+          ],
+          "takes_value": true
+        },
+        "--ttl": {
+          "default": [
+            "2h"
+          ],
+          "takes_value": true
+        },
+        "--wait": {
+          "takes_value": true
+        }
+      }
+    },
+    "config": {
+      "args": {
+        "--json": {
+          "takes_value": false
+        }
+      },
+      "subcommands": {
+        "set": {
+          "args": {
+            "<key>": {
+              "index": 1,
+              "required": true,
+              "takes_value": true
+            },
+            "<value>": {
+              "index": 2,
+              "required": true,
+              "takes_value": true
+            }
+          }
+        }
+      }
+    },
+    "daemon": {
+      "subcommands": {
+        "status": {},
+        "stop": {}
+      }
+    },
+    "destroy": {
+      "args": {
+        "--force": {
+          "takes_value": false
+        },
+        "--forget": {
+          "takes_value": false
+        },
+        "<id_or_name>": {
+          "index": 1,
+          "required": true,
+          "takes_value": true
+        }
+      }
+    },
+    "diff": {
+      "args": {
+        "--json": {
+          "takes_value": false
+        },
+        "--limit": {
+          "takes_value": true
+        },
+        "--table": {
+          "takes_value": true
+        },
+        "<id_or_name>": {
+          "index": 1,
+          "required": true,
+          "takes_value": true
+        }
+      }
+    },
+    "doctor": {
+      "args": {
+        "--fix": {
+          "takes_value": false
+        },
+        "--json": {
+          "takes_value": false
+        }
+      }
+    },
+    "env": {
+      "args": {
+        "--direct": {
+          "takes_value": false
+        },
+        "--var": {
+          "default": [
+            "DATABASE_URL"
+          ],
+          "takes_value": true
+        },
+        "<id_or_name>": {
+          "index": 1,
+          "required": true,
+          "takes_value": true
+        }
+      }
+    },
+    "events": {
+      "args": {
+        "--clone": {
+          "takes_value": true
+        },
+        "--follow": {
+          "takes_value": false
+        },
+        "--json": {
+          "takes_value": false
+        },
+        "--kind": {
+          "takes_value": true
+        },
+        "--limit": {
+          "takes_value": true
+        },
+        "--since": {
+          "takes_value": true
+        },
+        "--template": {
+          "takes_value": true
+        }
+      }
+    },
+    "gc": {},
+    "list": {
+      "args": {
+        "--json": {
+          "takes_value": false
+        }
+      }
+    },
+    "mcp": {},
+    "pg": {
+      "subcommands": {
+        "install": {
+          "args": {
+            "<major>": {
+              "index": 1,
+              "required": true,
+              "takes_value": true
+            }
+          }
+        },
+        "list": {
+          "args": {
+            "--json": {
+              "takes_value": false
+            }
+          }
+        },
+        "remove": {
+          "args": {
+            "<spec>": {
+              "index": 1,
+              "required": true,
+              "takes_value": true
+            }
+          }
+        }
+      }
+    },
+    "promote": {
+      "args": {
+        "--template": {
+          "takes_value": true
+        },
+        "<id_or_name>": {
+          "index": 1,
+          "required": true,
+          "takes_value": true
+        }
+      }
+    },
+    "service": {
+      "subcommands": {
+        "install": {},
+        "status": {
+          "args": {
+            "--json": {
+              "takes_value": false
+            }
+          }
+        },
+        "uninstall": {}
+      }
+    },
+    "template": {
+      "subcommands": {
+        "history": {
+          "args": {
+            "--json": {
+              "takes_value": false
+            },
+            "<name>": {
+              "default": [
+                "main"
+              ],
+              "index": 1,
+              "takes_value": true
+            }
+          }
+        },
+        "init": {
+          "args": {
+            "--auto-migrate": {
+              "takes_value": true,
+              "values": [
+                "on",
+                "off"
+              ]
+            },
+            "--base-branch": {
+              "takes_value": true
+            },
+            "--basebackup": {
+              "takes_value": true
+            },
+            "--database": {
+              "takes_value": true
+            },
+            "--every": {
+              "takes_value": true
+            },
+            "--every-mode": {
+              "takes_value": true,
+              "values": [
+                "full",
+                "layered"
+              ]
+            },
+            "--from-url": {
+              "takes_value": true
+            },
+            "--keep": {
+              "takes_value": true
+            },
+            "--mask": {
+              "takes_value": true
+            },
+            "--max-age": {
+              "takes_value": true
+            },
+            "--migrate": {
+              "takes_value": true
+            },
+            "--migrations": {
+              "takes_value": true
+            },
+            "--on-stale": {
+              "takes_value": true,
+              "values": [
+                "warn",
+                "refresh"
+              ]
+            },
+            "--pg-major": {
+              "takes_value": true
+            },
+            "--seed": {
+              "takes_value": true
+            },
+            "<name>": {
+              "default": [
+                "main"
+              ],
+              "index": 1,
+              "takes_value": true
+            }
+          }
+        },
+        "list": {
+          "args": {
+            "--json": {
+              "takes_value": false
+            }
+          }
+        },
+        "refresh": {
+          "args": {
+            "--layered": {
+              "takes_value": false
+            },
+            "<name>": {
+              "default": [
+                "main"
+              ],
+              "index": 1,
+              "takes_value": true
+            }
+          }
+        },
+        "rollback": {
+          "args": {
+            "--to": {
+              "takes_value": true
+            },
+            "<name>": {
+              "default": [
+                "main"
+              ],
+              "index": 1,
+              "takes_value": true
+            }
+          }
+        },
+        "set": {
+          "args": {
+            "--auto-migrate": {
+              "takes_value": true,
+              "values": [
+                "on",
+                "off"
+              ]
+            },
+            "--base-branch": {
+              "takes_value": true
+            },
+            "--every": {
+              "takes_value": true
+            },
+            "--every-mode": {
+              "takes_value": true,
+              "values": [
+                "full",
+                "layered"
+              ]
+            },
+            "--keep": {
+              "takes_value": true
+            },
+            "--mask": {
+              "takes_value": true
+            },
+            "--max-age": {
+              "takes_value": true
+            },
+            "--migrate": {
+              "takes_value": true
+            },
+            "--on-stale": {
+              "takes_value": true,
+              "values": [
+                "warn",
+                "refresh"
+              ]
+            },
+            "--resume": {
+              "takes_value": false
+            },
+            "<name>": {
+              "default": [
+                "main"
+              ],
+              "index": 1,
+              "takes_value": true
+            }
+          }
+        },
+        "upgrade": {
+          "args": {
+            "--as": {
+              "takes_value": true
+            },
+            "--to": {
+              "required": true,
+              "takes_value": true
+            },
+            "<name>": {
+              "index": 1,
+              "required": true,
+              "takes_value": true
+            }
+          }
+        }
+      }
+    },
+    "top": {},
+    "wake": {
+      "args": {
+        "<id_or_name>": {
+          "index": 1,
+          "required": true,
+          "takes_value": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,340 @@
+{
+  "clone": {
+    "branch": "string",
+    "created_at": "number",
+    "direct_url": "string",
+    "disk_warn": "boolean",
+    "durable": "boolean",
+    "duration_ms": "number",
+    "existing": "boolean",
+    "expires_at": "number",
+    "gen": "number",
+    "id": "string",
+    "name": "string",
+    "own_disk_bytes": "number",
+    "parent_pid": "number",
+    "port": "number",
+    "protected": "boolean",
+    "rebuilt": "boolean",
+    "refreshing": "boolean",
+    "rss_bytes": "number",
+    "socket_dir": "string",
+    "stale": "boolean",
+    "status": "string",
+    "suspect": "boolean",
+    "template": "string",
+    "template_age_secs": "number",
+    "type": "string",
+    "url": "string",
+    "waited_ms": "number",
+    "warnings": [
+      "string"
+    ]
+  },
+  "clone_created": {
+    "branch": "string",
+    "created_at": "number",
+    "direct_url": "string",
+    "disk_warn": "boolean",
+    "durable": "boolean",
+    "duration_ms": "number",
+    "existing": "boolean",
+    "expires_at": "number",
+    "gen": "number",
+    "id": "string",
+    "name": "string",
+    "own_disk_bytes": "number",
+    "parent_pid": "number",
+    "port": "number",
+    "protected": "boolean",
+    "rebuilt": "boolean",
+    "refreshing": "boolean",
+    "rss_bytes": "number",
+    "socket_dir": "string",
+    "stale": "boolean",
+    "status": "string",
+    "suspect": "boolean",
+    "template": "string",
+    "template_age_secs": "number",
+    "type": "string",
+    "url": "string",
+    "waited_ms": "number",
+    "warnings": [
+      "string"
+    ]
+  },
+  "clones": {
+    "clones": [
+      {
+        "branch": "string",
+        "created_at": "number",
+        "direct_url": "string",
+        "disk_warn": "boolean",
+        "durable": "boolean",
+        "duration_ms": "number",
+        "existing": "boolean",
+        "expires_at": "number",
+        "gen": "number",
+        "id": "string",
+        "name": "string",
+        "own_disk_bytes": "number",
+        "parent_pid": "number",
+        "port": "number",
+        "protected": "boolean",
+        "rebuilt": "boolean",
+        "refreshing": "boolean",
+        "rss_bytes": "number",
+        "socket_dir": "string",
+        "stale": "boolean",
+        "status": "string",
+        "suspect": "boolean",
+        "template": "string",
+        "template_age_secs": "number",
+        "url": "string",
+        "waited_ms": "number",
+        "warnings": [
+          "string"
+        ]
+      }
+    ],
+    "type": "string"
+  },
+  "destroyed": {
+    "id": "string",
+    "type": "string"
+  },
+  "diff": {
+    "clone": "string",
+    "gen": "number",
+    "rows": {
+      "deleted": [
+        {
+          "id": "number"
+        }
+      ],
+      "deleted_total": "number",
+      "inserted": [
+        {
+          "id": "number"
+        }
+      ],
+      "inserted_total": "number",
+      "table": "string",
+      "updated": [
+        {
+          "columns": [
+            "string"
+          ],
+          "pk": "number"
+        }
+      ],
+      "updated_total": "number"
+    },
+    "schema": [
+      {
+        "after": "string",
+        "before": "string",
+        "change": "string",
+        "kind": "string",
+        "name": "string"
+      }
+    ],
+    "tables": [
+      {
+        "after": {
+          "estimate": "boolean",
+          "n": "number"
+        },
+        "before": {
+          "estimate": "boolean",
+          "n": "number"
+        },
+        "table": "string"
+      }
+    ],
+    "template": "string",
+    "type": "string"
+  },
+  "event": {
+    "clone": "string",
+    "detail": {},
+    "id": "number",
+    "kind": "string",
+    "template": "string",
+    "ts": "number",
+    "type": "string"
+  },
+  "events": {
+    "events": [
+      {
+        "clone": "string",
+        "detail": {},
+        "id": "number",
+        "kind": "string",
+        "template": "string",
+        "ts": "number"
+      }
+    ],
+    "type": "string"
+  },
+  "gc": {
+    "adopted": [
+      "string"
+    ],
+    "destroyed": [
+      "string"
+    ],
+    "failed": [
+      {
+        "error": "string",
+        "item": "string"
+      }
+    ],
+    "orphan_folders_removed": [
+      "string"
+    ],
+    "records_dropped": [
+      "string"
+    ],
+    "type": "string",
+    "warnings": [
+      "string"
+    ]
+  },
+  "generations": {
+    "generations": [
+      {
+        "built_at": "number",
+        "current": "boolean",
+        "from_clone": "string",
+        "from_gen": "number",
+        "gen": "number",
+        "kind": "string",
+        "pg_major": "number",
+        "size_bytes": "number"
+      }
+    ],
+    "paused": "boolean",
+    "template": "string",
+    "type": "string"
+  },
+  "ok": {
+    "type": "string"
+  },
+  "pending_restores": {
+    "items": [
+      {
+        "file": "string",
+        "id": "number",
+        "previous": "string",
+        "url": "string",
+        "var": "string"
+      }
+    ],
+    "type": "string"
+  },
+  "status": {
+    "clones": "number",
+    "home": "string",
+    "pid": "number",
+    "router": {
+      "error": "string",
+      "listen": "string",
+      "listening": "boolean",
+      "port": "number"
+    },
+    "service": "boolean",
+    "templates": "number",
+    "type": "string",
+    "uptime_secs": "number",
+    "version": "string"
+  },
+  "template_built": {
+    "age_secs": "number",
+    "auto_migrate": "boolean",
+    "base": "string",
+    "base_branch": "string",
+    "branch": "string",
+    "built_at": "number",
+    "current_gen": "number",
+    "database": "string",
+    "every_mode": "string",
+    "every_secs": "number",
+    "gen_count": "number",
+    "keep": "number",
+    "last_error": "string",
+    "mask": "string",
+    "migrate": "string",
+    "name": "string",
+    "on_stale": "string",
+    "paused": "boolean",
+    "pg_major": "number",
+    "size_bytes": "number",
+    "source": {
+      "kind": "string",
+      "url": "string"
+    },
+    "type": "string",
+    "warnings": [
+      "string"
+    ]
+  },
+  "templates": {
+    "templates": [
+      {
+        "age_secs": "number",
+        "auto_migrate": "boolean",
+        "base": "string",
+        "base_branch": "string",
+        "branch": "string",
+        "built_at": "number",
+        "current_gen": "number",
+        "database": "string",
+        "every_mode": "string",
+        "every_secs": "number",
+        "gen_count": "number",
+        "keep": "number",
+        "last_error": "string",
+        "mask": "string",
+        "migrate": "string",
+        "name": "string",
+        "on_stale": "string",
+        "paused": "boolean",
+        "pg_major": "number",
+        "size_bytes": "number",
+        "source": {
+          "kind": "string",
+          "url": "string"
+        },
+        "warnings": [
+          "string"
+        ]
+      }
+    ],
+    "type": "string"
+  },
+  "usage": {
+    "clones": [
+      {
+        "created_at": "number",
+        "disk_warn": "boolean",
+        "expires_at": "number",
+        "id": "string",
+        "name": "string",
+        "own_disk_bytes": "number",
+        "protected": "boolean",
+        "rss_bytes": "number",
+        "status": "string",
+        "template": "string"
+      }
+    ],
+    "disk_budget": "number",
+    "disk_bytes": "number",
+    "free_disk_bytes": "number",
+    "max_clones": "number",
+    "queued": "number",
+    "ram_budget": "number",
+    "ram_bytes": "number",
+    "type": "string"
+  }
+}

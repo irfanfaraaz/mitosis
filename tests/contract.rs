@@ -635,7 +635,7 @@ fn exit_codes() {
         level: Level::Warn,
         ..failed.clone()
     };
-    assert_eq!(mitosis::doctor::exit_code(&[warned.clone()]), 0);
+    assert_eq!(mitosis::doctor::exit_code(std::slice::from_ref(&warned)), 0);
     assert_eq!(mitosis::doctor::exit_code(&[warned, failed]), 1);
     let usage = mitosis::cli::command()
         .try_get_matches_from(["mitosis", "no-such-command"])

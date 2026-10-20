@@ -1,0 +1,33 @@
+[
+  {
+    "branch": "string",
+    "created_at": "number",
+    "direct_url": "string",
+    "disk_warn": "boolean",
+    "durable": "boolean",
+    "duration_ms": "number",
+    "existing": "boolean",
+    "expires_at": "number",
+    "gen": "number",
+    "id": "string",
+    "name": "string",
+    "own_disk_bytes": "number",
+    "parent_pid": "number",
+    "port": "number",
+    "protected": "boolean",
+    "rebuilt": "boolean",
+    "refreshing": "boolean",
+    "rss_bytes": "number",
+    "socket_dir": "string",
+    "stale": "boolean",
+    "status": "string",
+    "suspect": "boolean",
+    "template": "string",
+    "template_age_secs": "number",
+    "url": "string",
+    "waited_ms": "number",
+    "warnings": [
+      "string"
+    ]
+  }
+]

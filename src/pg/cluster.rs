@@ -955,7 +955,7 @@ mod tests {
         // Inside the folder, and settings that are not includes, stay.
         assert!(conf.contains("\ninclude 'local.conf'\n"));
         assert!(conf.contains(&format!("\ninclude_dir '{}/conf.d'\n", d.display())));
-        assert!(conf.contains("\nshared_buffers = 1GB\n"));
+        assert!(conf.lines().any(|l| l == "shared_buffers = 1GB"));
         assert!(conf.contains("\nshared_preload_libraries = 'x'\n"));
 
         let off = disable_preload_libraries(d).unwrap();

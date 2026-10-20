@@ -1,0 +1,21 @@
+[
+  "already_running",
+  "budget_full",
+  "cap_reached",
+  "clone_not_found",
+  "cross_volume",
+  "daemon_unavailable",
+  "foreign_home",
+  "internal",
+  "invalid_request",
+  "low_disk",
+  "missing_extension",
+  "no_matching_postgres",
+  "not_apfs",
+  "port_in_use",
+  "ports_exhausted",
+  "postgres_start_failed",
+  "protocol_mismatch",
+  "template_build_failed",
+  "template_not_found"
+]

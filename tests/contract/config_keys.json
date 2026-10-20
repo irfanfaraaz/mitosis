@@ -1,0 +1,35 @@
+{
+  "clone_disk_warn": {
+    "env": "MITOSIS_CLONE_DISK_WARN"
+  },
+  "disk_budget": {
+    "env": "MITOSIS_DISK_BUDGET"
+  },
+  "idle_reap": {
+    "env": "MITOSIS_IDLE_REAP"
+  },
+  "idle_sleep": {
+    "env": "MITOSIS_IDLE_SLEEP"
+  },
+  "max_clones": {
+    "env": "MITOSIS_MAX_CLONES"
+  },
+  "min_free_disk": {
+    "env": "MITOSIS_MIN_FREE_DISK"
+  },
+  "queue_wait": {
+    "env": "MITOSIS_QUEUE_WAIT"
+  },
+  "ram_budget": {
+    "env": "MITOSIS_RAM_BUDGET"
+  },
+  "router": {
+    "env": "MITOSIS_ROUTER"
+  },
+  "router_listen": {
+    "env": "MITOSIS_ROUTER_LISTEN"
+  },
+  "router_port": {
+    "env": "MITOSIS_ROUTER_PORT"
+  }
+}

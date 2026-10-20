@@ -277,10 +277,11 @@ async fn base_skips_auto_migrate_on_other_branch() {
     assert_eq!(ev.template.as_deref(), Some("main"));
     assert_eq!(ev.detail["branch"], "feature");
     assert_eq!(ev.detail["base_branch"], "main");
-    let store = env.ctx.store();
-    assert_eq!(store.get_template("main").unwrap().unwrap().current_gen, 1);
-    assert_eq!(store.list_generations("main").unwrap().len(), 1);
-    drop(store);
+    {
+        let store = env.ctx.store();
+        assert_eq!(store.get_template("main").unwrap().unwrap().current_gen, 1);
+        assert_eq!(store.list_generations("main").unwrap().len(), 1);
+    }
 
     // The next tick skips again (the skipped build released its slot at once) without another
     // event.

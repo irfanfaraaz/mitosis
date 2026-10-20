@@ -239,7 +239,7 @@ fn format_size(n: u64) -> String {
 fn format_setting_duration(d: Duration) -> String {
     let secs = d.as_secs();
     for (unit, size) in [('d', 86_400), ('h', 3600), ('m', 60)] {
-        if secs != 0 && secs % size == 0 {
+        if secs != 0 && secs.is_multiple_of(size) {
             return format!("{}{unit}", secs / size);
         }
     }

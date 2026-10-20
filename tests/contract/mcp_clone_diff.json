@@ -1,0 +1,51 @@
+{
+  "clone": "string",
+  "gen": "number",
+  "rows": {
+    "deleted": [
+      {
+        "id": "number"
+      }
+    ],
+    "deleted_total": "number",
+    "inserted": [
+      {
+        "id": "number"
+      }
+    ],
+    "inserted_total": "number",
+    "table": "string",
+    "updated": [
+      {
+        "columns": [
+          "string"
+        ],
+        "pk": "number"
+      }
+    ],
+    "updated_total": "number"
+  },
+  "schema": [
+    {
+      "after": "string",
+      "before": "string",
+      "change": "string",
+      "kind": "string",
+      "name": "string"
+    }
+  ],
+  "tables": [
+    {
+      "after": {
+        "estimate": "boolean",
+        "n": "number"
+      },
+      "before": {
+        "estimate": "boolean",
+        "n": "number"
+      },
+      "table": "string"
+    }
+  ],
+  "template": "string"
+}

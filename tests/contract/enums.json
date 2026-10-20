@@ -1,0 +1,93 @@
+{
+  "clone.status": [
+    "ready",
+    "sleeping",
+    "starting",
+    "stopping"
+  ],
+  "diff.schema.change": [
+    "added",
+    "removed",
+    "changed"
+  ],
+  "diff.schema.kind": [
+    "table",
+    "column",
+    "index",
+    "constraint",
+    "view",
+    "function",
+    "sequence",
+    "extension"
+  ],
+  "doctor.level": [
+    "ok",
+    "warn",
+    "fail"
+  ],
+  "event.detail.reason": [
+    "user",
+    "ttl",
+    "parent",
+    "idle",
+    "gc",
+    "recovery",
+    "fresh",
+    "failed",
+    "evicted"
+  ],
+  "event.kind": [
+    "clone.created",
+    "clone.destroyed",
+    "clone.slept",
+    "clone.woke",
+    "clone.suspect",
+    "template.built",
+    "template.failed",
+    "template.rolled_back",
+    "template.promoted",
+    "template.upgraded",
+    "template.pruned",
+    "template.skipped",
+    "queue.waited",
+    "queue.timeout",
+    "router.started",
+    "router.failed",
+    "gc",
+    "recovery"
+  ],
+  "generation.kind": [
+    "full",
+    "layered",
+    "promoted",
+    "upgraded"
+  ],
+  "template.every_mode": [
+    "full",
+    "layered"
+  ],
+  "template.on_stale": [
+    "warn",
+    "refresh"
+  ],
+  "template.source.kind": {
+    "basebackup": {
+      "kind": "string",
+      "url": "string"
+    },
+    "promoted": {
+      "clone_id": "string",
+      "kind": "string"
+    },
+    "seed": {
+      "command": "string",
+      "cwd": "string",
+      "kind": "string",
+      "path": "string"
+    },
+    "url": {
+      "kind": "string",
+      "url": "string"
+    }
+  }
+}
