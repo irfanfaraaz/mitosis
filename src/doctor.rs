@@ -531,13 +531,17 @@ fn check_fs(home: &Home, cfg: &Config) -> Check {
     let backend = match select_backend(home, cfg) {
         Ok(b) => b,
         Err(e) => {
-            return Check::new("home", Level::Fail, e.message)
-                .fix(e.hint.unwrap_or_else(|| "set backend in config.toml".into()))
+            return Check::new("home", Level::Fail, e.message).fix(
+                e.hint
+                    .unwrap_or_else(|| "set backend in config.toml".into()),
+            )
         }
     };
     if let Err(e) = backend.check_supported(&home.root) {
-        return Check::new("home", Level::Fail, e.message)
-            .fix(e.hint.unwrap_or_else(|| "use a supported file system".into()));
+        return Check::new("home", Level::Fail, e.message).fix(
+            e.hint
+                .unwrap_or_else(|| "use a supported file system".into()),
+        );
     }
     let (t, c) = (home.templates_dir(), home.clones_dir());
     if t.is_dir() && c.is_dir() {
@@ -557,7 +561,11 @@ fn check_fs(home: &Home, cfg: &Config) -> Check {
     Check::new(
         "home",
         Level::Ok,
-        format!("{} on the {} back end, one volume", home.root.display(), backend.name()),
+        format!(
+            "{} on the {} back end, one volume",
+            home.root.display(),
+            backend.name()
+        ),
     )
 }
 
@@ -1053,10 +1061,9 @@ fn check_events(snap: &Snapshot) -> Check {
 
 fn check_postgres(installs: &[PgInstall]) -> Check {
     match installs.first() {
-        None => Check::new("postgres", Level::Fail, "no Postgres found").fix(format!(
-            "brew install postgresql@{}",
-            crate::pg::binaries::LATEST_PG_MAJOR
-        )),
+        None => Check::new("postgres", Level::Fail, "no Postgres found").fix(
+            crate::pg::binaries::install_hint(crate::pg::binaries::LATEST_PG_MAJOR),
+        ),
         Some(_) => Check::new(
             "postgres",
             Level::Ok,
@@ -1398,7 +1405,10 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     }
     let loaded = Config::load(home);
     out.push(check_fs(home, &loaded.clone().unwrap_or_default()));
-    out.push(check_backend_speed(home, &loaded.clone().unwrap_or_default()));
+    out.push(check_backend_speed(
+        home,
+        &loaded.clone().unwrap_or_default(),
+    ));
     #[cfg(target_os = "linux")]
     out.extend(check_zfs(&loaded.clone().unwrap_or_default()));
     out.push(check_permissions(home));

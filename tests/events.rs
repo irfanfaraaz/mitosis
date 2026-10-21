@@ -380,7 +380,7 @@ async fn follow_reads_the_store_not_the_broadcast() {
         // No router: it would bind the real port 54300 and its events could race into the stream.
         mitosis::ctx::Config {
             router: false,
-            ..mitosis::ctx::Config::default()
+            ..test_config()
         },
     ));
     let deadline = Instant::now() + Duration::from_secs(30);

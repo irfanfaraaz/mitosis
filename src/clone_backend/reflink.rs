@@ -183,9 +183,9 @@ mod tests {
     use super::*;
     use crate::clone_backend::same_volume;
     use std::fs::Permissions;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::fs::{create_dir, metadata, read, read_link, read_to_string, symlink_metadata, write};
     use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     /// The mounted Btrfs/XFS test file system, only when `scripts/linux-test.sh` runs reflink.
@@ -194,7 +194,11 @@ mod tests {
             eprintln!("skipped: MITOSIS_BACKEND is not reflink");
             return None;
         }
-        Some(std::env::var("MITOSIS_TEST_ROOT").unwrap_or_else(|_| "/tmp".into()).into())
+        Some(
+            std::env::var("MITOSIS_TEST_ROOT")
+                .unwrap_or_else(|_| "/tmp".into())
+                .into(),
+        )
     }
 
     #[test]
@@ -218,7 +222,10 @@ mod tests {
         assert_eq!(dmd.modified().unwrap(), smd.modified().unwrap());
 
         write(dst.join("sub/a.txt"), "changed").unwrap();
-        let mut f = OpenOptions::new().write(true).open(dst.join("big")).unwrap();
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(dst.join("big"))
+            .unwrap();
         f.write_all(b"xxxx").unwrap();
         drop(f);
         assert_eq!(read_to_string(src.join("sub/a.txt")).unwrap(), "hello");
@@ -241,8 +248,14 @@ mod tests {
 
         ReflinkBackend.clone_dir(&src, &dst).unwrap();
         for link in ["pg_tblspc/16384", "pg_wal"] {
-            assert!(symlink_metadata(dst.join(link)).unwrap().file_type().is_symlink());
-            assert_eq!(read_link(dst.join(link)).unwrap(), read_link(src.join(link)).unwrap());
+            assert!(symlink_metadata(dst.join(link))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                read_link(dst.join(link)).unwrap(),
+                read_link(src.join(link)).unwrap()
+            );
         }
         assert_eq!(std::fs::read_dir(&wal_real).unwrap().count(), 1);
     }

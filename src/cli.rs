@@ -30,6 +30,8 @@ struct Cli {
     command: Cmd,
 }
 
+// Parsed once per run, so the size gap between variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Build, refresh and list templates.

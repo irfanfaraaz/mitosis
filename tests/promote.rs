@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use mitosis::clones::{create, list};
-use mitosis::ctx::{Config, Ctx};
+use mitosis::ctx::Ctx;
 use mitosis::error::ErrorCode;
 use mitosis::paths::Home;
 use mitosis::promote::promote;
@@ -184,7 +184,7 @@ async fn promoted_generation_has_no_postmaster_pid() {
 #[tokio::test]
 async fn promoted_template_refuses_a_full_schedule() {
     let tmp = tmp_home();
-    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap());
     {
         let store = ctx.store();
         let mut t = TemplateRow::new(

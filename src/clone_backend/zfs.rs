@@ -152,7 +152,11 @@ impl ZfsBackend {
             Command::new(&self.zfs)
         };
         cmd.args(args);
-        let shown = format!("{}zfs {}", if sudo { "sudo -n " } else { "" }, args.join(" "));
+        let shown = format!(
+            "{}zfs {}",
+            if sudo { "sudo -n " } else { "" },
+            args.join(" ")
+        );
         let out = match output_within(cmd, TIMEOUT) {
             Ok(Some(out)) => out,
             Ok(None) => {
@@ -163,7 +167,10 @@ impl ZfsBackend {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(if sudo {
-                    unsupported(format!("{shown}: sudo is not installed"), setup_hint(&self.root))
+                    unsupported(
+                        format!("{shown}: sudo is not installed"),
+                        setup_hint(&self.root),
+                    )
                 } else {
                     unsupported(
                         format!("{shown}: zfs is not installed"),
@@ -276,7 +283,8 @@ impl CloneBackend for ZfsBackend {
         }
         self.ensure_parents(&dst_ds)?;
         self.run_zfs(&["clone", "-o", "canmount=noauto", &snap, &dst_ds], false)?;
-        self.mount_at(&dst_ds, dst).inspect_err(|_| self.discard(&dst_ds))
+        self.mount_at(&dst_ds, dst)
+            .inspect_err(|_| self.discard(&dst_ds))
     }
 
     /// A new dataset with a full copy of the files: a generation made from another generation or
@@ -301,7 +309,8 @@ impl CloneBackend for ZfsBackend {
         self.mountpoint_arg(path)?;
         self.ensure_parents(&ds)?;
         self.run_zfs(&["create", "-o", "canmount=noauto", &ds], false)?;
-        self.mount_at(&ds, path).inspect_err(|_| self.discard(&ds))?;
+        self.mount_at(&ds, path)
+            .inspect_err(|_| self.discard(&ds))?;
         // Postgres refuses a data folder others can read; pg_basebackup keeps an existing
         // folder's mode, so it is set here.
         let _ = std::fs::set_permissions(path, Permissions::from_mode(0o700));
@@ -633,7 +642,10 @@ pub fn probes(dataset: &str) -> Vec<Probe> {
         return out;
     }
     // A user who can mount datasets as root must not be able to bring in setuid files or devices.
-    let props = b.run_zfs(&["get", "-H", "-o", "value", "setuid,devices", dataset], false);
+    let props = b.run_zfs(
+        &["get", "-H", "-o", "value", "setuid,devices", dataset],
+        false,
+    );
     let risky: Vec<&str> = match props {
         Ok(text) => ["setuid", "devices"]
             .into_iter()
@@ -644,7 +656,10 @@ pub fn probes(dataset: &str) -> Vec<Probe> {
         Err(_) => vec!["setuid", "devices"],
     };
     out.push(if risky.is_empty() {
-        Probe::ok("zfs_dataset", format!("{dataset} exists, setuid and devices off"))
+        Probe::ok(
+            "zfs_dataset",
+            format!("{dataset} exists, setuid and devices off"),
+        )
     } else {
         Probe::warn(
             "zfs_dataset",
@@ -673,7 +688,10 @@ pub fn probes(dataset: &str) -> Vec<Probe> {
         .run_zfs(&["get", "-H", "-o", "value", "mountpoint", dataset], false)
         .map(|m| m.trim().to_string())
         .unwrap_or_else(|_| format!("/{dataset}"));
-    let (x, y) = (format!("{dataset}/mitosis-check"), format!("{dataset}/mitosis-check-2"));
+    let (x, y) = (
+        format!("{dataset}/mitosis-check"),
+        format!("{dataset}/mitosis-check-2"),
+    );
     let mp = format!("mountpoint={mount_root}/mitosis-check");
     let (x, y, mp) = (x.as_str(), y.as_str(), mp.as_str());
     let forms: [Vec<&str>; 5] = [
@@ -693,7 +711,10 @@ pub fn probes(dataset: &str) -> Vec<Probe> {
         .map(|args| format!("zfs {}", args.join(" ")))
         .collect();
     out.push(if refused.is_empty() {
-        Probe::ok("zfs_sudo", "sudo -n zfs works for mount, unmount, set and rename")
+        Probe::ok(
+            "zfs_sudo",
+            "sudo -n zfs works for mount, unmount, set and rename",
+        )
     } else {
         Probe::fail(
             "zfs_sudo",
@@ -767,7 +788,12 @@ exit 1
                 std::fs::write(path, text).unwrap();
                 std::fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
             }
-            let backend = Arc::new(ZfsBackend::with_programs("tank/m", mount.clone(), zfs, sudo));
+            let backend = Arc::new(ZfsBackend::with_programs(
+                "tank/m",
+                mount.clone(),
+                zfs,
+                sudo,
+            ));
             Fake {
                 _tmp: tmp,
                 log,
@@ -805,7 +831,10 @@ exit 1
         let f = Fake::new(FAKE_SUDO);
         f.has("tank/m/templates");
         f.has("tank/m/templates/main:403");
-        let (src, dst) = (f.mount.join("templates/main@3"), f.mount.join("clones/c0ffee1"));
+        let (src, dst) = (
+            f.mount.join("templates/main@3"),
+            f.mount.join("clones/c0ffee1"),
+        );
         f.backend.clone_dir(&src, &dst).unwrap();
 
         let snap = f.pos("zfs snapshot tank/m/templates/main:403@mitosis");
@@ -822,7 +851,11 @@ exit 1
         let boot = f.pos("zfs set canmount=on tank/m/clones/c0ffee1");
         assert!(snap < parent && parent < clone && clone < mp && mp < mount && mount < boot);
         // Only the mountpoint, mount and canmount steps went through sudo.
-        let sudo: Vec<_> = f.log().into_iter().filter(|l| l.starts_with("sudo ")).collect();
+        let sudo: Vec<_> = f
+            .log()
+            .into_iter()
+            .filter(|l| l.starts_with("sudo "))
+            .collect();
         assert_eq!(sudo.len(), 3, "{sudo:?}");
         assert!(sudo.iter().all(|l| l.starts_with("sudo -n ")), "{sudo:?}");
     }
@@ -835,11 +868,19 @@ exit 1
         f.has("tank/m/clones");
         let src = f.mount.join("templates/main@3");
         for id in ["c0ffee1", "c0ffee2"] {
-            f.backend.clone_dir(&src, &f.mount.join("clones").join(id)).unwrap();
+            f.backend
+                .clone_dir(&src, &f.mount.join("clones").join(id))
+                .unwrap();
         }
-        let snaps = f.log().iter().filter(|l| l.starts_with("zfs snapshot ")).count();
+        let snaps = f
+            .log()
+            .iter()
+            .filter(|l| l.starts_with("zfs snapshot "))
+            .count();
         assert_eq!(snaps, 1, "{:#?}", f.log());
-        f.pos("zfs clone -o canmount=noauto tank/m/templates/main:403@mitosis tank/m/clones/c0ffee2");
+        f.pos(
+            "zfs clone -o canmount=noauto tank/m/templates/main:403@mitosis tank/m/clones/c0ffee2",
+        );
     }
 
     #[test]
@@ -850,17 +891,22 @@ exit 1
         f.has("tank/m/clones");
         let gen = f.mount.join("templates/main@3");
         std::fs::create_dir_all(&gen).unwrap();
-        f.backend.clone_dir(&gen, &f.mount.join("clones/c0ffee1")).unwrap();
+        f.backend
+            .clone_dir(&gen, &f.mount.join("clones/c0ffee1"))
+            .unwrap();
 
         f.backend.remove_dir(&gen).unwrap();
         f.pos("zfs destroy tank/m/templates/main:403@mitosis");
         let log = f.log();
         assert!(
-            !log.iter().any(|l| l == "zfs destroy tank/m/templates/main:403"
-                || l == "zfs unmount tank/m/templates/main:403"),
+            !log.iter()
+                .any(|l| l == "zfs destroy tank/m/templates/main:403"
+                    || l == "zfs unmount tank/m/templates/main:403"),
             "{log:#?}"
         );
-        assert!(!log.iter().any(|l| l.contains(" -R ") || l.contains("promote")));
+        assert!(!log
+            .iter()
+            .any(|l| l.contains(" -R ") || l.contains("promote")));
         assert!(gen.is_dir());
         assert_eq!(f.backend.take_kept(), vec![gen]);
         assert!(f.backend.take_kept().is_empty());
@@ -896,7 +942,10 @@ exit 1
         let report = crate::lifecycle::reconcile(Arc::new(ctx), crate::templates::now())
             .await
             .unwrap();
-        assert!(report.orphan_folders_removed.contains(&orphan), "{report:?}");
+        assert!(
+            report.orphan_folders_removed.contains(&orphan),
+            "{report:?}"
+        );
         let unmount = f.pos("zfs unmount tank/m/clones/c0ffee1");
         let destroy = f.pos("zfs destroy tank/m/clones/c0ffee1");
         assert!(unmount < destroy);
@@ -921,10 +970,19 @@ exit 1
         f.pos("zfs set canmount=on tank/m/templates/.main.building-1700000000");
         let log = f.log();
         assert!(!log.iter().any(|l| l.starts_with("zfs clone ")), "{log:#?}");
-        assert!(!log.iter().any(|l| l.starts_with("zfs snapshot ")), "{log:#?}");
-        assert_eq!(std::fs::read_to_string(dst.join("PG_VERSION")).unwrap(), "18\n");
+        assert!(
+            !log.iter().any(|l| l.starts_with("zfs snapshot ")),
+            "{log:#?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("PG_VERSION")).unwrap(),
+            "18\n"
+        );
         assert_eq!(std::fs::read_to_string(dst.join("base/1")).unwrap(), "data");
-        assert!(f.backend.copy_dir(&src, &dst).is_err(), "destination exists");
+        assert!(
+            f.backend.copy_dir(&src, &dst).is_err(),
+            "destination exists"
+        );
     }
 
     #[test]
@@ -946,8 +1004,15 @@ exit 1
         );
         // Refused before any zfs or sudo run.
         assert!(f.backend.create_dir(&m.join("clones/../../etc")).is_err());
-        assert!(f.backend.rename_dir(&m.join("clones/x"), &m.join("../etc")).is_err());
-        assert!(f.log().iter().all(|l| !l.contains("mountpoint=")), "{:#?}", f.log());
+        assert!(f
+            .backend
+            .rename_dir(&m.join("clones/x"), &m.join("../etc"))
+            .is_err());
+        assert!(
+            f.log().iter().all(|l| !l.contains("mountpoint=")),
+            "{:#?}",
+            f.log()
+        );
     }
 
     #[test]
@@ -962,7 +1027,10 @@ exit 1
         assert!(lines.contains(
             &"zfs allow -u ci create,destroy,mount,snapshot,clone,canmount,mountpoint tank/mitosis"
         ), "{text}");
-        assert!(lines.contains(&"zfs set setuid=off devices=off tank/mitosis"), "{text}");
+        assert!(
+            lines.contains(&"zfs set setuid=off devices=off tank/mitosis"),
+            "{text}"
+        );
         assert!(lines.contains(
             &"ci ALL=(root) NOPASSWD: /usr/sbin/zfs mount tank/mitosis/*, /usr/sbin/zfs unmount tank/mitosis/*, /usr/sbin/zfs set mountpoint=/tank/mitosis/* tank/mitosis/*, /usr/sbin/zfs set canmount=* tank/mitosis/*, /usr/sbin/zfs rename tank/mitosis/* tank/mitosis/*"
         ), "{text}");
@@ -970,9 +1038,15 @@ exit 1
             &"# This rule lets ci mount Mitosis datasets under /tank/mitosis as root. Only give it to a user you trust with that."
         ), "{text}");
         assert!(text.contains("/etc/sudoers.d/mitosis"));
-        assert!(!text.contains("send") && !text.contains("receive"), "{text}");
+        assert!(
+            !text.contains("send") && !text.contains("receive"),
+            "{text}"
+        );
         // Every non-comment line is one an admin runs or saves.
-        let commands = lines.iter().filter(|l| !l.is_empty() && !l.starts_with('#')).count();
+        let commands = lines
+            .iter()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .count();
         assert_eq!(commands, 3, "{text}");
     }
 
@@ -984,7 +1058,9 @@ exit 1
         assert_eq!(missing_rights(out, "ci"), vec!["snapshot", "mountpoint"]);
         assert_eq!(missing_rights(out, "nobody").len(), 7);
         assert!(check_dataset_name("tank/mitosis").is_ok());
-        for bad in ["", "/tank", "tank/", "tank//m", "tank m", "tank/m@s", "t,ank"] {
+        for bad in [
+            "", "/tank", "tank/", "tank//m", "tank m", "tank/m@s", "t,ank",
+        ] {
             assert!(check_dataset_name(bad).is_err(), "{bad:?}");
         }
     }
@@ -1011,7 +1087,10 @@ exit 0
         let b = ZfsBackend::with_programs("tank/m", tmp.path().join("mnt"), zfs, "sudo".into());
 
         let dir = b.snapshot_external("tank/pg", "mitosis-ab12").unwrap();
-        assert_eq!(dir, PathBuf::from("/src/tank/pg/.zfs/snapshot/mitosis-ab12"));
+        assert_eq!(
+            dir,
+            PathBuf::from("/src/tank/pg/.zfs/snapshot/mitosis-ab12")
+        );
         b.destroy_external("tank/pg", "mitosis-ab12").unwrap();
         let ran = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = ran.lines().collect();
@@ -1024,7 +1103,9 @@ exit 0
             ]
         );
 
-        let e = b.snapshot_external("tank/denied", "mitosis-ab12").unwrap_err();
+        let e = b
+            .snapshot_external("tank/denied", "mitosis-ab12")
+            .unwrap_err();
         assert_eq!(e.code, ErrorCode::BackendUnsupported);
         let hint = e.hint.unwrap_or_default();
         assert!(hint.contains("snapshot,destroy tank/denied"), "{hint}");

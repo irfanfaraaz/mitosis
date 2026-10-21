@@ -73,8 +73,14 @@ mod tests {
         CopyBackend.clone_dir(&src, &dst).unwrap();
         write(dst.join("a.txt"), "changed").unwrap();
         assert_eq!(read_to_string(src.join("a.txt")).unwrap(), "hello");
-        assert!(symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
-        assert_eq!(read_link(dst.join("link")).unwrap(), Path::new("/elsewhere"));
+        assert!(symlink_metadata(dst.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            read_link(dst.join("link")).unwrap(),
+            Path::new("/elsewhere")
+        );
         assert_eq!(CopyBackend.private_size(&dst), Some(1_000_005 + 2));
         assert!(CopyBackend.clone_dir(&src, &dst).is_err());
     }

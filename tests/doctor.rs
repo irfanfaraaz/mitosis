@@ -92,7 +92,7 @@ async fn doctor_reports_missing_major() {
     let c = find(&checks, "template_installs");
     assert_eq!(c.level, Level::Fail);
     assert!(c.detail.contains("99"), "{}", c.detail);
-    assert_eq!(c.fix.as_deref(), Some("brew install postgresql@99"));
+    assert_eq!(c.fix, Some(mitosis::pg::binaries::install_hint(99)));
     assert!(!home.daemon_sock().exists());
 }
 

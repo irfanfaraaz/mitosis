@@ -12,8 +12,25 @@ fn resolve(value: Option<OsString>, home_dir: Option<PathBuf>) -> Result<PathBuf
                 MitosisError::new(ErrorCode::Internal, "HOME is not set")
                     .with_hint("set MITOSIS_HOME to choose where mitosis keeps its data")
             })?;
-            Ok(home.join("Library/Application Support/mitosis"))
+            Ok(home.join(DEFAULT_DIR))
         }
+    }
+}
+
+/// The default home under `$HOME`: Application Support on macOS, the XDG data folder on Linux.
+#[cfg(target_os = "macos")]
+const DEFAULT_DIR: &str = "Library/Application Support/mitosis";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_DIR: &str = ".local/share/mitosis";
+
+/// Where unit tests make homes: `/tmp` on macOS (its `TMPDIR` is too long for socket paths), `TMPDIR`
+/// on Linux (the test harness points it at a file system that can clone).
+#[cfg(test)]
+pub(crate) fn test_tmp() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
     }
 }
 
@@ -35,7 +52,7 @@ pub struct Home {
 }
 
 impl Home {
-    /// `$MITOSIS_HOME`, else `~/Library/Application Support/mitosis`.
+    /// `$MITOSIS_HOME`, else `~/Library/Application Support/mitosis` (macOS) or `~/.local/share/mitosis` (Linux).
     pub fn from_env() -> Result<Home> {
         Ok(Home::at(resolve(
             std::env::var_os("MITOSIS_HOME"),
@@ -241,7 +258,7 @@ mod tests {
     #[test]
     fn resolve_empty_is_default_and_relative_is_absolute() {
         let home = Some(PathBuf::from("/Users/x"));
-        let default = PathBuf::from("/Users/x/Library/Application Support/mitosis");
+        let default = PathBuf::from("/Users/x").join(DEFAULT_DIR);
         assert_eq!(resolve(Some("".into()), home.clone()).unwrap(), default);
         assert_eq!(resolve(None, home.clone()).unwrap(), default);
         assert_eq!(

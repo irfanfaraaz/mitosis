@@ -773,7 +773,9 @@ fn database_for(args: &TemplateInitArgs) -> Result<String> {
             args.database.clone().unwrap_or_else(|| db_from_url(url))
         }
         // A copy of the whole cluster, like a basebackup without a URL to name a database.
-        TemplateSource::Running { .. } => args.database.clone().unwrap_or_else(|| "postgres".into()),
+        TemplateSource::Running { .. } => {
+            args.database.clone().unwrap_or_else(|| "postgres".into())
+        }
         TemplateSource::Seed { .. } | TemplateSource::Promoted { .. } => args
             .database
             .clone()
@@ -1427,7 +1429,8 @@ async fn basebackup_install(ctx: &Ctx, url: &str, pinned: Option<u32>) -> Result
             format!("the source runs Postgres {major} and pg_basebackup needs the same major; no Postgres {major} found"),
         )
         .with_hint(format!(
-            "brew install postgresql@{major}, or: mitosis pg install {major}"
+            "{}, or: mitosis pg install {major}",
+            crate::pg::binaries::install_hint(major)
         ))
     })
 }
@@ -1546,7 +1549,8 @@ async fn running_install(ctx: &Ctx, dataset: &str, pinned: Option<u32>) -> Resul
             format!("the source runs Postgres {major}; no Postgres {major} found"),
         )
         .with_hint(format!(
-            "brew install postgresql@{major}, or: mitosis pg install {major}"
+            "{}, or: mitosis pg install {major}",
+            crate::pg::binaries::install_hint(major)
         ))
     })
 }
@@ -2547,7 +2551,9 @@ async fn build_gen(
     // The build folder is made by the back end (a dataset on ZFS); initdb and pg_basebackup
     // fill an existing empty folder. A staging folder is plain scratch that initdb makes.
     let (b, d) = (ctx.backend.clone(), build_dir.clone());
-    let created = blocking(move || b.create_dir(&d)).await.map_err(at("create"));
+    let created = blocking(move || b.create_dir(&d))
+        .await
+        .map_err(at("create"));
     let result = match (created, masking, &staging) {
         (Err(e), _, _) => Err(e),
         (Ok(()), None, _) | (Ok(()), _, None) => {
@@ -2571,7 +2577,8 @@ async fn build_gen(
         Ok(ext) => Ok(ext),
         Err((step, e)) => {
             // The caller named a database the source does not have: a bad request, not a failed build.
-            let bad_request = (step == MISSING_DATABASE_STEP && e.code == ErrorCode::InvalidRequest)
+            let bad_request = (step == MISSING_DATABASE_STEP
+                && e.code == ErrorCode::InvalidRequest)
                 || (step == SNAPSHOT_STEP
                     && matches!(
                         e.code,
@@ -3040,7 +3047,7 @@ mod tests {
     fn build_port_skips_reserved_ports() {
         let tmp = tempfile::Builder::new()
             .prefix("mt")
-            .tempdir_in("/tmp")
+            .tempdir_in(crate::paths::test_tmp())
             .unwrap();
         // A random 20-port slice of 55000-59999, so parallel tests rarely meet.
         let lo = 55_000 + u16::from_str_radix(&random_hex(2), 16).unwrap() % 250 * 20;
@@ -3354,7 +3361,10 @@ mod tests {
             Ok(self.snap.clone())
         }
         fn destroy_external(&self, dataset: &str, name: &str) -> Result<()> {
-            self.destroyed.lock().unwrap().push(format!("{dataset}@{name}"));
+            self.destroyed
+                .lock()
+                .unwrap()
+                .push(format!("{dataset}@{name}"));
             Ok(())
         }
     }
@@ -3401,7 +3411,8 @@ mod tests {
         let e = check_running_dir(Path::new("/"), "tank/pg").unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidRequest);
         assert!(
-            e.message.starts_with("the source data directory is owned by ")
+            e.message
+                .starts_with("the source data directory is owned by ")
                 && e.message.ends_with("; Mitosis must run as that user"),
             "{}",
             e.message
@@ -3421,7 +3432,11 @@ mod tests {
         let dst = tmp.path().join("build");
         let e = copy_running(&b, "tank/pg", &dst).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidRequest);
-        assert!(e.message.contains("pg_wal must be on the same dataset"), "{}", e.message);
+        assert!(
+            e.message.contains("pg_wal must be on the same dataset"),
+            "{}",
+            e.message
+        );
         assert!(!dst.exists());
         // Destroyed on the error path too.
         assert_eq!(b.destroyed.lock().unwrap().len(), 1);
@@ -3434,7 +3449,11 @@ mod tests {
             std::fs::write(b.snap.join(signal), "").unwrap();
             let e = copy_running(&b, "tank/pg", &tmp.path().join("build")).unwrap_err();
             assert_eq!(e.code, ErrorCode::InvalidRequest);
-            assert!(e.message.contains("replica sources come in 1.2"), "{}", e.message);
+            assert!(
+                e.message.contains("replica sources come in 1.2"),
+                "{}",
+                e.message
+            );
             assert_eq!(b.destroyed.lock().unwrap().len(), 1);
         }
     }
@@ -3445,13 +3464,19 @@ mod tests {
         let dst = tmp.path().join("build");
         copy_running(&b, "tank/pg", &dst).unwrap();
         assert!(!dst.join("postmaster.pid").exists());
-        assert_eq!(std::fs::read_to_string(dst.join("base/1/1259")).unwrap(), "rows");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("base/1/1259")).unwrap(),
+            "rows"
+        );
         assert_eq!(read_pg_version(&dst).unwrap(), 17);
         // The source is never written.
         assert!(b.snap.join("postmaster.pid").exists());
         let destroyed = b.destroyed.lock().unwrap();
         assert_eq!(destroyed.len(), 1);
-        assert!(destroyed[0].starts_with("tank/pg@mitosis-"), "{destroyed:?}");
+        assert!(
+            destroyed[0].starts_with("tank/pg@mitosis-"),
+            "{destroyed:?}"
+        );
     }
 
     // The daemon spawns these futures on a multi-thread runtime, so they must be Send.

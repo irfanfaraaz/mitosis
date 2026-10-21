@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use mitosis::clones::{create, destroy, list};
-use mitosis::ctx::{Config, Ctx};
+use mitosis::ctx::Ctx;
 use mitosis::lifecycle::{parent_alive, reap_expired, reconcile, watch_parent};
 use mitosis::paths::Home;
 use mitosis::pg::{newest, stop};
@@ -124,7 +124,7 @@ async fn reconcile_adopts_live_clone() {
 #[tokio::test]
 async fn reconcile_removes_orphan_folder() {
     let tmp = tmp_home();
-    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap());
     let orphan = ctx.home.clones_dir().join("cdead01");
     std::fs::create_dir(&orphan).unwrap();
     std::fs::write(orphan.join("file"), "x").unwrap();
@@ -162,7 +162,7 @@ async fn reconcile_removes_orphan_folder() {
 #[tokio::test]
 async fn gc_leaves_foreign_entries_alone() {
     let tmp = tmp_home();
-    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap());
     let repo = ctx.home.clones_dir().join("my-repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::write(repo.join("README.md"), "mine").unwrap();
@@ -187,7 +187,7 @@ async fn gc_leaves_foreign_entries_alone() {
 #[tokio::test]
 async fn reconcile_restores_template_from_old_folder() {
     let tmp = tmp_home();
-    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap());
     let t = ctx.home.templates_dir();
     {
         let store = ctx.store();
@@ -346,7 +346,9 @@ fn parent_alive_checks_pid_and_start_time() {
 /// straight to the file system.
 #[tokio::test]
 async fn gc_and_destroy_use_the_backend() {
-    let Some((env, rec)) = TestEnv::recording() else { return };
+    let Some((env, rec)) = TestEnv::recording() else {
+        return;
+    };
     template(&env, "main", SEED).await;
 
     let a = create(&env.ctx, args("main")).await.unwrap();
@@ -383,7 +385,10 @@ async fn gc_and_destroy_use_the_backend() {
     let report = reconcile(env.ctx.clone(), now()).await.unwrap();
     assert!(report.failed.is_empty(), "{report:?}");
     assert!(rec.calls("remove_dir").contains(&orphan), "orphan clone");
-    assert!(rec.calls("rename_dir").contains(&rowless), "rowless generation");
+    assert!(
+        rec.calls("rename_dir").contains(&rowless),
+        "rowless generation"
+    );
     for d in [&orphan, &rowless] {
         assert!(!d.exists(), "{} still exists", d.display());
     }

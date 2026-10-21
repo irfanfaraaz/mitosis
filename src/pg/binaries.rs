@@ -172,17 +172,26 @@ pub fn find_major(installs: &[PgInstall], major: u32) -> Result<&PgInstall> {
             ErrorCode::NoMatchingPostgres,
             format!("no Postgres {major} found"),
         )
-        .with_hint(format!("brew install postgresql@{major}"))
+        .with_hint(install_hint(major))
     })
 }
 
 /// Newest Postgres major; used only for the install hint when none is found.
 pub const LATEST_PG_MAJOR: u32 = 18;
 
+/// The package-manager command that installs Postgres `major` on this OS.
+pub fn install_hint(major: u32) -> String {
+    if cfg!(target_os = "macos") {
+        format!("brew install postgresql@{major}")
+    } else {
+        format!("sudo apt install postgresql-{major}")
+    }
+}
+
 pub fn newest(installs: &[PgInstall]) -> Result<&PgInstall> {
     installs.first().ok_or_else(|| {
         MitosisError::new(ErrorCode::NoMatchingPostgres, "no Postgres found")
-            .with_hint(format!("brew install postgresql@{LATEST_PG_MAJOR}"))
+            .with_hint(install_hint(LATEST_PG_MAJOR))
     })
 }
 
@@ -282,10 +291,16 @@ mod tests {
         let e = find_major(&[], 16).unwrap_err();
         assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
         assert_eq!(e.message, "no Postgres 16 found");
-        assert_eq!(e.hint.as_deref(), Some("brew install postgresql@16"));
+        assert_eq!(e.hint, Some(install_hint(16)));
         let e = newest(&[]).unwrap_err();
         assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
-        assert_eq!(e.hint.as_deref(), Some("brew install postgresql@18"));
+        assert_eq!(e.hint, Some(install_hint(18)));
+        let want = if cfg!(target_os = "macos") {
+            "brew install postgresql@16"
+        } else {
+            "sudo apt install postgresql-16"
+        };
+        assert_eq!(install_hint(16), want);
     }
 
     #[test]

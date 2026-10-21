@@ -110,6 +110,20 @@ jobs:
               ;;
           esac
           sudo chown runner /mnt/mitosis
+          # The tests use fixed ports 55000-60249; keep outgoing ports below them.
+          sudo sysctl -q -w net.ipv4.ip_local_port_range="32768 54999"
+          # Unit tests make homes in TMPDIR with the auto back end, so TMPDIR must clone.
+          if [ "$FS" = btrfs ] || [ "$FS" = xfs ]; then
+            echo "TMPDIR=/mnt/mitosis" >> "$GITHUB_ENV"
+          else
+            sudo truncate -s 4G /var/mitosis-tmp.img
+            dev=$(sudo losetup -f --show /var/mitosis-tmp.img)
+            sudo mkfs.btrfs -q -f "$dev"
+            sudo mkdir -p /mnt/tmp
+            sudo mount "$dev" /mnt/tmp
+            sudo chown runner /mnt/tmp
+            echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
+          fi
       - name: Test
         env:
           MITOSIS_TEST_ROOT: /mnt/mitosis

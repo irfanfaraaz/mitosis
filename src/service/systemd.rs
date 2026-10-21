@@ -85,7 +85,11 @@ fn binary_from_unit(text: &str) -> Option<PathBuf> {
 fn home_from_unit(text: &str) -> Option<String> {
     text.lines()
         .filter_map(|l| l.strip_prefix("Environment="))
-        .find_map(|v| unquote(v.trim())?.strip_prefix("MITOSIS_HOME=").map(String::from))
+        .find_map(|v| {
+            unquote(v.trim())?
+                .strip_prefix("MITOSIS_HOME=")
+                .map(String::from)
+        })
 }
 
 /// What `systemctl --user show mitosis.service -p ActiveState,MainPID,FragmentPath` says.
@@ -151,7 +155,11 @@ pub fn install() -> Result<()> {
     std::fs::write(&file, unit_text(&exe, home.as_deref(), &path_env))?;
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
     // `restart` so a reinstall runs the new binary, as launchd's bootout + bootstrap does.
-    for args in [&["daemon-reload"][..], &["enable", UNIT][..], &["restart", UNIT][..]] {
+    for args in [
+        &["daemon-reload"][..],
+        &["enable", UNIT][..],
+        &["restart", UNIT][..],
+    ] {
         let o = systemctl(args)?;
         if !o.status.success() {
             return Err(systemctl_failed(args[0], &o));

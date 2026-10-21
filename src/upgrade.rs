@@ -79,7 +79,11 @@ pub async fn upgrade(
                 target.bin_dir.display()
             ),
         )
-        .with_hint(format!("brew reinstall postgresql@{to}")));
+        .with_hint(if cfg!(target_os = "macos") {
+            format!("brew reinstall postgresql@{to}")
+        } else {
+            format!("sudo apt install --reinstall postgresql-{to}")
+        }));
     }
     let (t, ext) = (target.clone(), cur.extensions.clone());
     blocking(move || check_extensions(&t, &ext)).await?;

@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use mitosis::clones::{create, destroy};
-use mitosis::ctx::{Config, Ctx};
+use mitosis::ctx::Ctx;
 use mitosis::error::ErrorCode;
 use mitosis::lifecycle::reconcile;
 use mitosis::paths::Home;
@@ -41,7 +41,7 @@ fn args(template: &str) -> CloneCreateArgs {
 /// A Ctx that needs no Postgres, for tests that must always run.
 fn bare_ctx() -> (TempDir, Arc<Ctx>) {
     let tmp = tmp_home();
-    let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap();
+    let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap();
     (tmp, Arc::new(ctx))
 }
 

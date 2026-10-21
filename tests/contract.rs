@@ -602,10 +602,10 @@ fn error_codes() {
     for c in all {
         match c {
             NotApfs | BackendUnsupported | CrossVolume | ForeignHome | NoMatchingPostgres
-            | MissingExtension
-            | TemplateNotFound | TemplateBuildFailed | CloneNotFound | CapReached | BudgetFull
-            | LowDisk | PortsExhausted | PortInUse | PostgresStartFailed | AlreadyRunning
-            | DaemonUnavailable | ProtocolMismatch | InvalidRequest | Internal => {}
+            | MissingExtension | TemplateNotFound | TemplateBuildFailed | CloneNotFound
+            | CapReached | BudgetFull | LowDisk | PortsExhausted | PortInUse
+            | PostgresStartFailed | AlreadyRunning | DaemonUnavailable | ProtocolMismatch
+            | InvalidRequest | Internal => {}
         }
     }
     let mut codes: Vec<String> = all

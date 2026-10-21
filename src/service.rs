@@ -7,7 +7,6 @@ use crate::paths::Home;
 use serde::Serialize;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]

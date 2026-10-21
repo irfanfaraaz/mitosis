@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use mitosis::clones::create;
-use mitosis::ctx::{Config, Ctx};
+use mitosis::ctx::Ctx;
 use mitosis::error::ErrorCode;
 use mitosis::paths::Home;
 use mitosis::pg::discover;
@@ -166,7 +166,7 @@ async fn upgrade_as_new_template_keeps_original() {
 #[tokio::test]
 async fn upgrade_to_missing_major_fails_fast() {
     let tmp = tmp_home();
-    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap());
     {
         let store = ctx.store();
         let mut t = TemplateRow::new(

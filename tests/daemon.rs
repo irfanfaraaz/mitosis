@@ -18,19 +18,11 @@ use tokio::task::JoinHandle;
 
 const SEED: &str = "create table t(id int); insert into t values (1)";
 
-/// A short home under /tmp with no Postgres needed.
-fn short_home() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("md")
-        .tempdir_in("/tmp")
-        .unwrap()
-}
-
 /// The defaults without the router, so these daemons never bind the real router port 54300.
 fn no_router() -> Config {
     Config {
         router: false,
-        ..Config::default()
+        ..test_config()
     }
 }
 
@@ -117,7 +109,7 @@ async fn status_clones(root: &Path) -> usize {
 
 #[tokio::test]
 async fn status_over_socket() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     let handle = start(tmp.path(), no_router()).await;
     match Conn::open(tmp.path()).await.ok(Request::Status).await {
         Response::Status(s) => {
@@ -133,7 +125,7 @@ async fn status_over_socket() {
 
 #[tokio::test]
 async fn protocol_mismatch() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     let handle = start(tmp.path(), no_router()).await;
     let reply = Conn::open(tmp.path())
         .await
@@ -151,7 +143,7 @@ async fn protocol_mismatch() {
 
 #[tokio::test]
 async fn garbage_line() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     let handle = start(tmp.path(), no_router()).await;
     let mut conn = Conn::open(tmp.path()).await;
     assert_eq!(
@@ -168,7 +160,7 @@ async fn garbage_line() {
 
 #[tokio::test]
 async fn second_daemon_refused() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     let handle = start(tmp.path(), no_router()).await;
     let second = run(Home::at(tmp.path().to_path_buf()), no_router()).await;
     assert_eq!(second.unwrap_err().code, ErrorCode::AlreadyRunning);
@@ -179,7 +171,7 @@ async fn second_daemon_refused() {
 
 #[tokio::test]
 async fn request_too_large_is_rejected() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     let handle = start(tmp.path(), no_router()).await;
     let mut conn = Conn::open(tmp.path()).await;
     // Exactly one byte over the 1 MiB limit and no newline: the daemon reads no further.
@@ -203,7 +195,7 @@ async fn request_too_large_is_rejected() {
 
 #[tokio::test]
 async fn daemon_unavailable_when_socket_missing() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     let home = Home::at(tmp.path().to_path_buf());
     // No daemon was ever started: a missing socket means "not running", and nothing is started.
     assert!(client::request_if_running(&home, Request::Status)
@@ -379,7 +371,7 @@ async fn config_reload_applies_new_cap() {
 /// A bad config.toml fails the request as invalid_request before any daemon is started.
 #[tokio::test]
 async fn ensure_daemon_refuses_an_invalid_config() {
-    let tmp = short_home();
+    let tmp = tmp_home();
     std::fs::write(tmp.path().join("config.toml"), "colour = 1\n").unwrap();
     let e = client::request(&Home::at(tmp.path().to_path_buf()), Request::Status)
         .await

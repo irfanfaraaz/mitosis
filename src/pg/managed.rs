@@ -607,6 +607,10 @@ mod tests {
         } else {
             assert!(t.ends_with("-apple-darwin"));
         }
-        assert!(t.starts_with(if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }));
+        assert!(t.starts_with(if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        }));
     }
 }

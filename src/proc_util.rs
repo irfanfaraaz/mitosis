@@ -2,6 +2,7 @@ use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -90,12 +91,15 @@ pub fn process_cwd(pid: i32) -> std::io::Result<(u64, u64, PathBuf)> {
 }
 
 /// Process start time in seconds since the Unix epoch (Linux: `/proc/<pid>/stat` field 22 plus the
-/// boot time from `/proc/stat`).
+/// boot time from `/proc/stat`). None for a zombie, as on macOS: an exited server is not running.
 #[cfg(not(target_os = "macos"))]
 pub fn process_start_time(pid: i32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) may contain spaces and parentheses: split after the last ')'.
     let rest = stat.get(stat.rfind(')')? + 1..)?;
+    if rest.split_whitespace().next()? == "Z" {
+        return None; // field 3, the state
+    }
     let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?; // field 22 = index 19 after field 2
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if hz <= 0 {
@@ -225,5 +229,30 @@ mod tests {
         }
         assert!(exited);
         assert!(!is_alive(pid)); // reaped, no zombie left
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[allow(clippy::zombie_processes)] // the zombie is the point; has_exited reaps it
+    fn zombie_has_no_start_time() {
+        let child = Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let stat = || std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // Not waited on, so it stays a zombie once it exits.
+        for _ in 0..100 {
+            if stat()
+                .rsplit(')')
+                .next()
+                .unwrap()
+                .trim_start()
+                .starts_with('Z')
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(is_alive(pid), "a zombie still counts as alive");
+        assert_eq!(process_start_time(pid), None);
+        assert!(has_exited(pid));
     }
 }

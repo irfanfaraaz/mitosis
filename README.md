@@ -818,7 +818,7 @@ Clone URL format: `postgres://postgres:<password>@127.0.0.1:54300/<clone name or
 
 See [Config](#config) for all settings. `mitosis config set` reloads a running daemon (except the router keys). Environment variables are read by the daemon when it starts, so set them where the first `mitosis` command runs, or run `mitosis daemon stop` after changing them.
 
-Everything lives in `$MITOSIS_HOME`, which defaults to `~/Library/Application Support/mitosis/` on macOS. On Linux, set `MITOSIS_HOME` to a folder on the file system you prepared (see [Linux](#linux)). Point it at a new or empty folder: Mitosis marks the folders it creates and refuses to use one that already holds other files.
+Everything lives in `$MITOSIS_HOME`, which defaults to `~/Library/Application Support/mitosis/` on macOS and `~/.local/share/mitosis/` on Linux. On Linux, set `MITOSIS_HOME` to a folder on the file system you prepared (see [Linux](#linux)). Point it at a new or empty folder: Mitosis marks the folders it creates and refuses to use one that already holds other files.
 
 ## Benchmarks
 

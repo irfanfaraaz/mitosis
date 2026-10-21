@@ -83,7 +83,10 @@ fn fs_create_dir(path: &Path) -> Result<()> {
         .mode(0o700)
         .create(path)
         .map_err(|e| {
-            MitosisError::new(ErrorCode::Internal, format!("create {}: {e}", path.display()))
+            MitosisError::new(
+                ErrorCode::Internal,
+                format!("create {}: {e}", path.display()),
+            )
         })
 }
 
@@ -372,7 +375,10 @@ fn walk_files(
 }
 
 fn io_error(what: &str, path: &Path, e: std::io::Error) -> MitosisError {
-    MitosisError::new(ErrorCode::Internal, format!("{what} {}: {e}", path.display()))
+    MitosisError::new(
+        ErrorCode::Internal,
+        format!("{what} {}: {e}", path.display()),
+    )
 }
 
 /// Makes `dst` (which must not exist) a copy of the tree at `src`; `file` copies or clones one
@@ -385,7 +391,11 @@ fn clone_tree(
     if std::fs::symlink_metadata(dst).is_ok() {
         return Err(MitosisError::new(
             ErrorCode::Internal,
-            format!("clone {} -> {}: destination exists", src.display(), dst.display()),
+            format!(
+                "clone {} -> {}: destination exists",
+                src.display(),
+                dst.display()
+            ),
         ));
     }
     clone_entry(src, dst, file).inspect_err(|_| {
@@ -597,6 +607,12 @@ mod tests {
             assert!(p < 1_000_000);
         }
     }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    use std::fs::{create_dir, write};
 
     #[test]
     fn symlinks_are_not_followed() {

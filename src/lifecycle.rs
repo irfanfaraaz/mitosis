@@ -939,7 +939,10 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
 /// still exist (ZFS snapshots with clones); gc tries each again on its next run.
 pub(crate) fn emit_kept(ctx: &Ctx) {
     for dir in ctx.backend.take_kept() {
-        log(ctx, &format!("gc: kept {}: clones still depend on it", dir.display()));
+        log(
+            ctx,
+            &format!("gc: kept {}: clones still depend on it", dir.display()),
+        );
         events::emit(
             ctx,
             events::GENERATION_KEPT,
@@ -1089,9 +1092,12 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
                 Ok(dirs) if file.as_ref().is_some_and(|f| dirs.contains(f)) => continue,
                 Ok(_) => {
                     let trash = templates_dir.join(format!("{GC_TRASH}{}", random_hex(4)));
-                    ctx.backend.rename_dir(&path, &trash).map(|()| trash).map_err(|e| {
-                        internal(format!("move {} aside: {}", path.display(), e.message))
-                    })
+                    ctx.backend
+                        .rename_dir(&path, &trash)
+                        .map(|()| trash)
+                        .map_err(|e| {
+                            internal(format!("move {} aside: {}", path.display(), e.message))
+                        })
                 }
                 Err(e) => Err(e),
             }
@@ -1258,7 +1264,7 @@ mod tests {
         // Under /tmp: short paths, on the default back end.
         let tmp = tempfile::Builder::new()
             .prefix("mt")
-            .tempdir_in("/tmp")
+            .tempdir_in(crate::paths::test_tmp())
             .unwrap();
         let ctx = Ctx::open(
             Home::at(tmp.path().to_path_buf()),

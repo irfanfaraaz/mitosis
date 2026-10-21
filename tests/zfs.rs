@@ -117,7 +117,10 @@ impl SourcePg {
         let install = newest(&installs).expect("postgres installed");
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         mitosis::pg::initdb(install, &data).expect("initdb on the source dataset");
-        let sock = tempfile::Builder::new().prefix("src").tempdir_in("/tmp").unwrap();
+        let sock = tempfile::Builder::new()
+            .prefix("src")
+            .tempdir_in("/tmp")
+            .unwrap();
         let port = 54_000 + u16::from_str_radix(&random_hex(2), 16).unwrap() % 1000;
         let out = Command::new(install.bin("pg_ctl"))
             .arg("-D")
@@ -133,7 +136,11 @@ impl SourcePg {
             .arg("start")
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let url = format!(
             "postgresql:///postgres?host={}&port={port}&user=postgres",
             sock.path().display()

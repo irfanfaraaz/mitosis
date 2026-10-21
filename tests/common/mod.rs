@@ -29,6 +29,25 @@ pub fn tmp_home() -> TempDir {
         .expect("create temp home")
 }
 
+/// The defaults with the back end this run asks for: `MITOSIS_BACKEND` and `MITOSIS_ZFS_DATASET`,
+/// which the Linux suites set (unset on macOS, where auto picks APFS).
+pub fn test_config() -> Config {
+    let mut c = Config::default();
+    if let Ok(b) = std::env::var("MITOSIS_BACKEND") {
+        c.backend = b.parse().expect("MITOSIS_BACKEND");
+    }
+    c.zfs_dataset = std::env::var("MITOSIS_ZFS_DATASET").ok();
+    c
+}
+
+/// `warnings` without the copy back end's standing "full copies" note.
+pub fn real_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| *w != mitosis::clone_backend::SLOW_WARNING)
+        .collect()
+}
+
 /// The selected back end, wrapped: every call is recorded (method and first path) and passed on.
 pub struct RecordingBackend {
     inner: Arc<dyn CloneBackend>,
@@ -37,7 +56,10 @@ pub struct RecordingBackend {
 
 impl RecordingBackend {
     fn hit(&self, method: &'static str, path: &Path) {
-        self.calls.lock().unwrap().push((method, path.to_path_buf()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method, path.to_path_buf()));
     }
 
     /// The first path of every recorded call of `method`, in call order.
@@ -126,7 +148,7 @@ impl TestEnv {
             port_range: lo..=lo + 19,
             router: false,
             router_port: 60_000 + slice,
-            ..Config::default()
+            ..test_config()
         };
         let home = Home::at(tmp.path().to_path_buf());
         let backend = select_backend(&home, &config).expect("select back end");
