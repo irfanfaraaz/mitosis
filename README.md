@@ -19,7 +19,7 @@ Let the agent drop tables, run a bad migration or fill the database with junk. I
 |---|---|---|
 | **115 ms** | **under 1 MB** | 1 GB or 10 GB: same speed |
 
-Measured on an Apple M4 with Postgres 18.6; see [Benchmarks](#benchmarks).
+Measured on an Apple M4 with Postgres 18.6; see [Benchmarks](#benchmarks). No Linux numbers have been measured yet.
 
 **Try it:**
 
@@ -36,7 +36,7 @@ export DATABASE_URL=$(mitosis clone)
 {"mcpServers": {"mitosis": {"command": "mitosis", "args": ["mcp"]}}}
 ```
 
-> **macOS on APFS only for now.** Linux (Btrfs and XFS reflinks) is planned for v2.
+> **Runs on macOS (APFS) and Linux (Btrfs, XFS, ZFS).** On other Linux file systems it can fall back to a slow full copy. See [Linux](#linux).
 
 **Why not something else?**
 
@@ -44,17 +44,17 @@ export DATABASE_URL=$(mitosis clone)
 |---|---|
 | `pg_dump` or `createdb -T` | A real copy takes seconds to minutes and doubles the disk. A clone takes 0.1 s and shares every block it does not change. |
 | A Docker container per agent | A fresh container still has to load your data. A clone starts with all of it. |
-| Neon branching | The same copy-on-write idea, but in the cloud. Mitosis runs on your Mac, offline, for free. |
+| Neon branching | The same copy-on-write idea, but in the cloud. Mitosis runs on your own machine, offline, for free. |
 
-Mitosis is a CLI and a small background daemon. It copies a template Postgres data directory with APFS `clonefile` (copy-on-write), starts a real Postgres process on the copy, and deletes it when the task ends or its TTL passes. Cloning a database takes about a tenth of a second and costs almost no extra disk, even for a 10 GB template (see [Benchmarks](#benchmarks)).
+Mitosis is a CLI and a small background daemon. It copies a template Postgres data directory with copy-on-write (APFS `clonefile` on macOS, reflinks on Btrfs and XFS, snapshots on ZFS), starts a real Postgres process on the copy, and deletes it when the task ends or its TTL passes. Cloning a database takes about a tenth of a second and costs almost no extra disk, even for a 10 GB template on a Mac (see [Benchmarks](#benchmarks)).
 
 From 1.0 on, the CLI, the `--json` output, the MCP tools, the config keys and the daemon protocol are stable until 2.0. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Contents
 
-- **Start:** [Install](#install) · [Quick start](#quick-start) · [MCP setup](#mcp-setup) · [How it works](#how-it-works)
+- **Start:** [Install](#install) · [Quick start](#quick-start) · [Linux](#linux) · [MCP setup](#mcp-setup) · [How it works](#how-it-works)
 - **Clones:** [Router and URLs](#router-and-urls) · [Sleep and wake](#sleep-and-wake) · [Named clones](#named-clones) · [`.env` injection](#env-injection) · [Diff](#diff) · [Budgets, queue and `top`](#budgets-queue-and-top) · [Events](#events)
-- **Templates:** [Generations](#generations) · [Template settings](#template-settings) · [Masking and subsets](#masking-and-subsets) · [Per-branch templates](#per-branch-templates) · [Physical copy of a server](#physical-copy-of-a-server) · [Promote](#promote) · [Upgrade to a newer Postgres](#upgrade-a-template-to-a-newer-postgres) · [Managed Postgres builds](#managed-postgres-builds)
+- **Templates:** [Generations](#generations) · [Template settings](#template-settings) · [Masking and subsets](#masking-and-subsets) · [Per-branch templates](#per-branch-templates) · [Physical copy of a server](#physical-copy-of-a-server) · [Copy of a running ZFS database](#copy-of-a-running-zfs-database) · [Promote](#promote) · [Upgrade to a newer Postgres](#upgrade-a-template-to-a-newer-postgres) · [Managed Postgres builds](#managed-postgres-builds)
 - **Running it:** [Config](#config) · [Login service](#login-service) · [Reboot recovery](#reboot-recovery-and-suspect-clones) · [Doctor](#doctor) · [Defaults](#defaults)
 - **Upgrading:** [From 0.2](#upgrading-from-02) · [From 0.1](#upgrading-from-01)
 - **Project:** [Benchmarks](#benchmarks) · [Compatibility](#compatibility) · [Platform](#platform) · [Contributing](#contributing) · [Security](#security) · [License](#license)
@@ -65,15 +65,24 @@ From 1.0 on, the CLI, the `--json` output, the MCP tools, the config keys and th
 cargo install mitosis-db
 ```
 
-Homebrew will come later.
+Or with Homebrew, on macOS and Linux:
+
+```sh
+brew install irfanfaraaz/mitosis/mitosis
+```
+
+The Homebrew tap comes with the 1.1.0 release; until then use `cargo install`.
 
 You also need a Postgres server install on the machine, for example:
 
 ```sh
-brew install postgresql@18
+brew install postgresql@18          # macOS, or Homebrew on Linux
+sudo apt install postgresql-18      # Debian, Ubuntu (PGDG)
 ```
 
-No Homebrew Postgres? `mitosis pg install 18` downloads a build for you; see [Managed Postgres builds](#managed-postgres-builds).
+On Linux, Mitosis also finds installs in `/usr/lib/postgresql/<N>/bin` (apt) and `/usr/pgsql-<N>/bin` (dnf), and the `pg_config` on your `PATH`.
+
+No system Postgres? `mitosis pg install 18` downloads a build for you; see [Managed Postgres builds](#managed-postgres-builds).
 
 ## Quick start
 
@@ -124,6 +133,117 @@ Useful flags: `mitosis clone --template main --name my-test --ttl 30m --durable 
 
 Templates older than 7 days produce a warning on `clone`; run `mitosis template refresh` to rebuild one. The daemon starts by itself on first use. `mitosis daemon status` and `mitosis daemon stop` manage it. To keep it running from login, see [Login service](#login-service).
 
+## Linux
+
+Mitosis needs a file system that can copy a file without copying its data. Put `MITOSIS_HOME` on one, and Mitosis picks the right way to clone by itself.
+
+| File system | Back end | What you do |
+|---|---|---|
+| APFS (macOS) | `apfs` | Nothing. |
+| Btrfs | `reflink` | Nothing, once `MITOSIS_HOME` is on it. |
+| XFS made with `reflink=1` | `reflink` | Make it with `mkfs.xfs -m reflink=1`. |
+| ZFS | `zfs` | Set `zfs_dataset` and install the sudo rule once (below). |
+| Anything else (ext4, tmpfs, overlayfs) | `copy` | Set `backend = copy`. Clones are slow. |
+
+The default `backend = auto` never picks `copy`. On a file system with no fast way to clone, Mitosis fails with the error code `backend_unsupported` and says how to fix it. `mitosis doctor` names the active back end in its `home` check.
+
+Set `MITOSIS_HOME` yourself on Linux, to a new or empty folder on the file system you prepared. Mitosis and its Postgres processes run as your normal user. There is no Linux speed number in this README yet: none has been measured.
+
+### Btrfs with a loop file
+
+You do not need a spare disk to try it. A file formatted as Btrfs and mounted through a loop device works:
+
+```sh
+truncate -s 50G ~/mitosis.img
+mkfs.btrfs ~/mitosis.img
+sudo mkdir -p /mnt/mitosis
+sudo mount -o loop ~/mitosis.img /mnt/mitosis
+sudo chown "$USER" /mnt/mitosis
+export MITOSIS_HOME=/mnt/mitosis/home
+```
+
+The file starts small and grows as you use it. For daily use, put `MITOSIS_HOME` on a real Btrfs volume instead, or add the mount to `/etc/fstab` so it comes back after a reboot.
+
+### XFS
+
+XFS can share blocks only when it was made with reflinks on:
+
+```sh
+mkfs.xfs -m reflink=1 /dev/sdX      # or a loop file, as above
+```
+
+A file system made without `reflink=1` fails the probe Mitosis runs, and the error tells you to make it with `mkfs.xfs -m reflink=1`.
+### ZFS
+
+ZFS clones are datasets. Each template generation is a dataset under the one you give Mitosis, and each clone is a `zfs clone` of that generation's single `@mitosis` snapshot. They are mounted at the same paths the other back ends use.
+
+Linux does not let a normal user mount ZFS datasets, even with `zfs allow`. So an admin sets things up once, and Mitosis then runs only a few `sudo -n zfs ...` commands (mount, unmount, mountpoint, canmount and rename). `-n` means sudo never waits for a password. If it would ask, Mitosis stops with `backend_unsupported` and the fix.
+
+1. An admin creates the dataset Mitosis will own. Nothing else should live in it:
+
+   ```sh
+   sudo zfs create tank/mitosis
+   ```
+
+2. As your own user, print the setup lines. This never runs sudo and never changes anything:
+
+   ```sh
+   mitosis zfs setup tank/mitosis
+   ```
+
+   It prints a `zfs allow` line, a `zfs set setuid=off devices=off` line and one sudoers line, then checks each one. Give them to an admin. The admin runs the two `zfs` lines as root, and saves the sudoers line as `/etc/sudoers.d/mitosis` (with `visudo -f /etc/sudoers.d/mitosis`).
+
+3. Point Mitosis at the dataset, and put `MITOSIS_HOME` inside its mountpoint:
+
+   ```sh
+   mitosis config set zfs_dataset tank/mitosis
+   export MITOSIS_HOME=/tank/mitosis
+   mitosis zfs setup tank/mitosis      # run again: every check should say ok
+   ```
+
+`auto` picks ZFS when `zfs_dataset` is set and its mountpoint holds `MITOSIS_HOME`. Set `backend = zfs` to require it.
+
+**The sudoers rule trusts you with root-level mounts.** It lets your user mount datasets under the Mitosis dataset as root, and the printed text says so. The rule limits the mountpoints to the dataset's own mountpoint, and the `setuid=off devices=off` line stops a setuid file or a device node on a dataset from being used. Even so, give it only to a user you trust with that.
+
+How the ZFS back end behaves:
+
+- **Dataset names.** Characters ZFS does not allow in a name become `:` and two hex digits. A folder `templates/main@3` is the dataset `<dataset>/templates/main:403`.
+- **Generations made from a generation or a clone** (layered builds, promote, upgrade) are full copies in their own dataset, so they never depend on their source.
+- **Generations that clones still use are kept.** gc leaves the folder, records a `template.generation_kept` event with `detail.reason` set to `clones_depend`, and tries again on its next run.
+- **No `zfs promote`, no `zfs destroy -R`.** Mitosis never runs either.
+- **Datasets mount again at boot** (`canmount=on`).
+
+`mitosis doctor` adds the checks `zfs_tool`, `zfs_dataset` (a warning when `setuid` or `devices` is on), `zfs_permissions` and `zfs_sudo` when the settings use ZFS.
+
+### The copy back end
+
+`backend = copy` makes a full copy of the template for every clone. It works on any file system, and it is the only choice on ext4.
+
+```sh
+mitosis config set backend copy
+```
+
+It is slow, and it uses the whole template's size in disk for every clone. A 10 GB template means 10 GB per clone and a clone time that grows with the size. `mitosis clone` and `mitosis doctor` (the `backend_speed` check) warn every time it is used. Use it to try Mitosis, or for small databases. For anything else, move `MITOSIS_HOME` to one of the file systems above.
+
+### Choosing the back end by hand
+
+| Key | Env var | Values |
+|---|---|---|
+| `backend` | `MITOSIS_BACKEND` | `auto` (default), `apfs`, `reflink`, `zfs`, `copy` |
+| `zfs_dataset` | `MITOSIS_ZFS_DATASET` | a dataset name such as `tank/mitosis`, or empty |
+
+`apfs` works only on macOS. `reflink` and `zfs` work only on Linux. The back end is not saved in the store: it is chosen again at each start. A 1.0 home on macOS opens unchanged, because `auto` still means APFS there. Do not move a store between machines.
+
+### Running as a service on Linux
+
+`mitosis service install` writes a systemd user unit, `~/.config/systemd/user/mitosis.service`. See [Login service](#login-service). A user service stops when you log out, unless lingering is on. Turn it on once:
+
+```sh
+loginctl enable-linger "$USER"
+```
+
+Mitosis never runs this for you. `mitosis service status` and `mitosis doctor` warn while lingering is off and print the command.
+
 ## Router and URLs
 
 Every clone is reached through one fixed port, `54300` by default. The database name in the URL picks the clone: its name, or its id for an unnamed clone.
@@ -137,7 +257,7 @@ This is the `url` that `mitosis clone`, `mitosis list --json`, the MCP tools and
 How the router behaves:
 
 - **Passwords stay between your client and Postgres.** The router never reads or checks them, and it never logs message bodies.
-- **No TLS.** The router answers `N` to an SSL request; it listens on this Mac only. Use `sslmode=disable` (or `prefer`).
+- **No TLS.** The router answers `N` to an SSL request; by default it listens on this machine only. Use `sslmode=disable` (or `prefer`).
 - **Query cancels work.** The router sends a cancel request on to the clone that owns the connection.
 - **An unknown clone name** gets a Postgres error, `3D000`, with a hint.
 
@@ -155,6 +275,19 @@ Other container runtimes (Colima, OrbStack, Rancher) and other machines may need
 mitosis config set router_listen 0.0.0.0
 mitosis daemon stop        # router settings take effect when the daemon starts
 ```
+
+**On Linux,** `host.docker.internal` does not exist by default, and a container reaches the host on the Docker bridge address, not on `127.0.0.1`. So do both of these:
+
+1. Set `router_listen = 0.0.0.0` as above, so the router answers on the bridge.
+2. Start the container with a name for the host:
+
+   ```sh
+   docker run --add-host=host.docker.internal:host-gateway ...
+   ```
+
+   In Docker Compose, add `extra_hosts: ["host.docker.internal:host-gateway"]` to the service.
+
+Then use the same `postgres://postgres:<password>@host.docker.internal:54300/<clone>` URL. A firewall on the host may need to allow the Docker bridge to reach port 54300.
 
 This exposes the router to the network. Each clone's password still protects it, and `mitosis doctor` warns while it is set. `url` keeps the `127.0.0.1` form; replace the host yourself.
 
@@ -334,7 +467,7 @@ The strategies are `email`, `name`, `hash`, `null`, `redact`, `const:<value>` an
 
 **Subsets and foreign keys.** Rows that fail a `[subset]` filter are deleted. Then rows that point at a deleted row through a foreign key are deleted too, again and again until nothing changes, as `ON DELETE CASCADE` would. So foreign keys stay valid: a subset can drop more rows than its filter names, but it never keeps a row whose parent is gone. `"10%"` keeps a random 10% of the table's pages (`TABLESAMPLE SYSTEM`).
 
-**How a masked template is built.** The source is built in a staging cluster, subsets and masking run there, and then the result is dumped and restored into a fresh cluster. That fresh cluster becomes the generation. So the generation's data files and WAL never held the raw values. Roles are copied without their password hashes. The staging folder did hold raw values until it was deleted; deleting a file on an SSD is not a secure erase, so treat the Mac's disk as trusted for the source data.
+**How a masked template is built.** The source is built in a staging cluster, subsets and masking run there, and then the result is dumped and restored into a fresh cluster. That fresh cluster becomes the generation. So the generation's data files and WAL never held the raw values. Roles are copied without their password hashes. The staging folder did hold raw values until it was deleted; deleting a file on an SSD is not a secure erase, so treat the machine's disk as trusted for the source data.
 
 Things to know:
 
@@ -395,6 +528,35 @@ After the copy, Mitosis turns it into a normal standalone cluster: it removes `s
 
 **An unmasked `--basebackup` template is the whole server.** It carries the source's role password hashes and every database of the cluster, not only `--database`. Add `--mask` to get a masked copy of the one database without password hashes.
 
+## Copy of a running ZFS database
+
+If your dev Postgres keeps its data directory on a ZFS dataset, Mitosis can build a template from it without touching the server (ZFS back end only):
+
+```sh
+mitosis template init dev-copy --from-running tank/pgdata
+```
+
+`tank/pgdata` is the dataset whose mountpoint is the data directory itself. It is not the dataset Mitosis owns. You do not need a connection or a password.
+
+What happens:
+
+1. Mitosis takes an atomic snapshot, `tank/pgdata@mitosis-<id>`.
+2. It copies the snapshot through the hidden `.zfs/snapshot/` folder and destroys the snapshot right away.
+3. It starts Postgres once on the copy, so Postgres replays the write-ahead log (crash recovery), with `archive_mode` off. Then it stops it cleanly.
+4. Masking and subsets run as for any other source. The result is a new generation.
+
+The source server is never stopped or written. `--database` names the database to keep (default `postgres`). `template refresh` repeats the same steps.
+
+Rules, checked before the copy:
+
+- **Same owner.** The data directory must belong to the user that runs Mitosis. Postgres refuses to start on a folder it does not own, and Mitosis cannot change the owner without root.
+- **`pg_wal` on the same dataset.** A snapshot is atomic within one dataset only. A `pg_wal` symlink to another dataset is refused.
+- **No replicas.** A data directory with `standby.signal` or `recovery.signal` is refused. Replica sources come in 1.2.
+- **A Postgres of the same major** must be installed (`brew install postgresql@<major>`, or `mitosis pg install <major>`).
+- **The permission to snapshot.** An admin runs `zfs allow -u <user> snapshot,destroy tank/pgdata` once.
+
+On any other back end, `--from-running` fails with `backend_unsupported`. `mitosis template list --json` shows this source as `kind` `running` with the `dataset`. As with `--basebackup`, an unmasked copy holds the whole server, role password hashes included, so add `--mask` if that matters.
+
 ## Promote
 
 Turn a clone's data into the newest generation of a template:
@@ -435,7 +597,7 @@ mitosis pg list [--json]               # installed builds, and which ones Mitosi
 mitosis pg remove 17                   # by major or by version; refused while in use
 ```
 
-Builds come from the [theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries) releases, one per macOS target (Apple silicon and Intel). Mitosis checks the published SHA-256 before it unpacks, refuses a mismatch, and unpacks into `<home>/pg/<version>/` in one step. Set `MITOSIS_PG_RELEASES_URL` to use another release source.
+Builds come from the [theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries) releases, one per target: macOS (Apple silicon and Intel) and Linux (glibc, `x86_64` and `aarch64`). Mitosis checks the published SHA-256 before it unpacks, refuses a mismatch, and unpacks into `<home>/pg/<version>/` in one step. Set `MITOSIS_PG_RELEASES_URL` to use another release source.
 
 Managed builds are found like system installs. When both have the same major, the system install wins, and `pg list` shows which one is used. A template that needs an extension the build does not have fails with a clear error naming it.
 
@@ -541,16 +703,18 @@ The daemon reads its own environment, and the CLI reads its own. Under the login
 ## Login service
 
 ```sh
-mitosis service install     # launchd user agent, starts at login
+mitosis service install     # launchd user agent (macOS) or systemd user unit (Linux), starts at login
 mitosis service status
 mitosis service uninstall
 ```
 
-The plist is `~/Library/LaunchAgents/io.github.irfanfaraaz.mitosis.plist`. It restarts the daemon after a crash (`KeepAlive` with `SuccessfulExit=false`, `ThrottleInterval` 30 s). `mitosis daemon stop` stays stopped. With the service installed, the CLI asks launchd to start the daemon instead of starting its own.
+On macOS the plist is `~/Library/LaunchAgents/io.github.irfanfaraaz.mitosis.plist`. It restarts the daemon after a crash (`KeepAlive` with `SuccessfulExit=false`, `ThrottleInterval` 30 s). `mitosis daemon stop` stays stopped. With the service installed, the CLI asks launchd to start the daemon instead of starting its own.
+
+On Linux the unit is `~/.config/systemd/user/mitosis.service`, managed with `systemctl --user`. It has `Restart=on-failure` and `WantedBy=default.target`, so it restarts the daemon after a crash and starts at login. `mitosis daemon stop` stays stopped. A user service stops at logout unless lingering is on, so run `loginctl enable-linger "$USER"` once. `service install` does not do that for you; `service status` and `doctor` warn and print the command. `service status --json` has the same fields as on macOS.
 
 ### macOS privacy and protected folders
 
-A daemon started by launchd does not get your terminal's access to `~/Documents`, `~/Desktop` or iCloud Drive. If a template's seed, migrations folder, masking file or `.env` file is there, background work (scheduled refreshes, migrations-hash checks, `.env` restores) can fail with a permission error. Either move the project out of those folders, or grant the `mitosis` binary access under System Settings > Privacy & Security (Full Disk Access). `mitosis doctor` warns about this case. The CLI writes `.env` files itself at clone time, with your terminal's access.
+This section is for macOS only. A daemon started by launchd does not get your terminal's access to `~/Documents`, `~/Desktop` or iCloud Drive. If a template's seed, migrations folder, masking file or `.env` file is there, background work (scheduled refreshes, migrations-hash checks, `.env` restores) can fail with a permission error. Either move the project out of those folders, or grant the `mitosis` binary access under System Settings > Privacy & Security (Full Disk Access). `mitosis doctor` warns about this case. The CLI writes `.env` files itself at clone time, with your terminal's access.
 
 ## Reboot recovery and suspect clones
 
@@ -566,11 +730,13 @@ mitosis doctor [--json] [--fix]
 
 It works even when the daemon cannot start. Each check is `ok`, `warn` or `fail`, with a one-line fix. It checks:
 
-- the home: APFS, same volume, marker, permissions (home 0700, `state.db` and socket 0600), socket path length
+- the home: the active back end (APFS, reflink, ZFS or copy), same volume, marker, permissions (home 0700, `state.db` and socket 0600), socket path length
 - the config file and environment variables
 - the daemon: reachable, same version as the binary
 - the router: listening, or the process that holds its port; a warning when `router_listen` is not loopback
-- the login service: installed, loaded, binary exists
+- the login service: installed, loaded, binary exists; on Linux, a warning while lingering is off
+- `backend_speed`: a warning while the `copy` back end is in use
+- the ZFS checks `zfs_tool`, `zfs_dataset`, `zfs_permissions` and `zfs_sudo`, when the settings use ZFS
 - Postgres installs (system and managed), and a match for every template's major version and extensions
 - a throwaway start and stop of a cluster for each installed major
 - free disk against `min_free_disk`
@@ -580,7 +746,7 @@ It works even when the daemon cannot start. Each check is `ok`, `warn` or `fail`
 - the event log size
 - suspect clones, orphan folders and stale rows (a read-only look, nothing is deleted)
 - `.env` records whose clone is gone, and pending restores
-- the macOS privacy case above
+- the macOS privacy case above (macOS only)
 
 The exit code is 1 when any check fails. `--fix` does two safe things only: it finishes pending `.env` restores and reports how many it finished, and it runs `gc`, unless `gc` would destroy clones (expired ones, or ones whose session is gone). In that case it lists them and leaves it to you to run `mitosis gc`.
 
@@ -624,7 +790,7 @@ The same steps apply, and a 0.1 install goes straight to 1.0.
 ## How it works
 
 1. **Template.** `mitosis template init` runs a real Postgres, loads your seed or the copied database, and keeps the resulting data directory as the template.
-2. **Clonefile.** `mitosis clone` copies the template with APFS `clonefile`. Blocks are shared until a clone writes to them.
+2. **Copy-on-write.** `mitosis clone` copies the template with APFS `clonefile` on macOS, a reflink per file on Btrfs and XFS, or a `zfs clone` of a snapshot on ZFS. Blocks are shared until a clone writes to them. (The `copy` back end copies everything.)
 3. **Postgres.** The daemon starts a Postgres on a free local port and returns the router URL.
 4. **Router.** The daemon's router takes connections on one port, looks the clone up by database name, wakes it if it sleeps, and passes the bytes through.
 5. **Reap.** The daemon stops and deletes a clone when you destroy it, or when its TTL passes. Clones made through MCP are also removed when the agent session exits.
@@ -652,7 +818,7 @@ Clone URL format: `postgres://postgres:<password>@127.0.0.1:54300/<clone name or
 
 See [Config](#config) for all settings. `mitosis config set` reloads a running daemon (except the router keys). Environment variables are read by the daemon when it starts, so set them where the first `mitosis` command runs, or run `mitosis daemon stop` after changing them.
 
-Everything lives in `$MITOSIS_HOME`, which defaults to `~/Library/Application Support/mitosis/`. Point it at a new or empty folder: Mitosis marks the folders it creates and refuses to use one that already holds other files.
+Everything lives in `$MITOSIS_HOME`, which defaults to `~/Library/Application Support/mitosis/` on macOS. On Linux, set `MITOSIS_HOME` to a folder on the file system you prepared (see [Linux](#linux)). Point it at a new or empty folder: Mitosis marks the folders it creates and refuses to use one that already holds other files.
 
 ## Benchmarks
 
@@ -663,7 +829,7 @@ Run `scripts/bench.sh` (needs `pgbench`, `psql`, `jq` and a release build). It p
 | ~1 GB (2.1 GB on disk) | 115 ms | 0.6 MB | 51.3 MB |
 | ~10 GB (12 GB on disk) | 114 ms | 0.7 MB | 51.4 MB |
 
-Measured on an Apple M4 with 24 GB RAM, APFS, Postgres 18.6. Clone time does not grow with database size, because `clonefile` copies no data. The router and wake numbers are not in this table yet: the script prints them on your machine.
+Measured on an Apple M4 with 24 GB RAM, APFS, Postgres 18.6. No Linux numbers have been measured yet, so none are claimed here. On APFS, clone time does not grow with database size, because `clonefile` copies no data. The router and wake numbers are not in this table yet: the script prints them on your machine.
 
 ## Compatibility
 
@@ -671,7 +837,9 @@ From 1.0.0 until 2.0.0, the CLI commands and flags, `--json` output, MCP tools, 
 
 ## Platform
 
-macOS on APFS only. On any other file system Mitosis fails with the error code `not_apfs`.
+- **macOS:** APFS. On any other file system Mitosis fails with the error code `not_apfs`.
+- **Linux (glibc 2.35 or newer, `x86_64` and `aarch64`):** Btrfs and XFS (reflinks), ZFS, and the slow `copy` back end for anything else. On a file system with no usable back end Mitosis fails with the error code `backend_unsupported`. See [Linux](#linux).
+- **Windows:** not supported.
 
 ## Contributing
 
