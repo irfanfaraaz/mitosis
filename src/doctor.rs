@@ -561,6 +561,20 @@ fn check_fs(home: &Home, cfg: &Config) -> Check {
     )
 }
 
+fn check_backend_speed(home: &Home, cfg: &Config) -> Check {
+    match select_backend(home, cfg) {
+        Ok(b) if b.name() == "copy" => Check::new(
+            "backend_speed",
+            Level::Warn,
+            "backend \"copy\" makes full copies; clones are slow and use full disk space",
+        )
+        .fix("put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS and set backend = \"auto\""),
+        Ok(b) => Check::new("backend_speed", Level::Ok, format!("{} clones share data", b.name())),
+        // `home` already reports an unusable back end.
+        Err(_) => Check::new("backend_speed", Level::Ok, "skipped: no usable back end"),
+    }
+}
+
 fn check_permissions(home: &Home) -> Check {
     if !home.root.is_dir() {
         return Check::new("permissions", Level::Ok, "skipped: no home folder");
@@ -1348,6 +1362,7 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     }
     let loaded = Config::load(home);
     out.push(check_fs(home, &loaded.clone().unwrap_or_default()));
+    out.push(check_backend_speed(home, &loaded.clone().unwrap_or_default()));
     out.push(check_permissions(home));
 
     let cfg = match loaded {

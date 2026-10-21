@@ -2,12 +2,14 @@ use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
 use std::ffi::CString;
-use std::fs::Metadata;
+use std::fs::{Metadata, OpenOptions, Permissions};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
+mod copy;
+pub use copy::{CopyBackend, SLOW_WARNING};
 #[cfg(target_os = "linux")]
 mod reflink;
 #[cfg(target_os = "linux")]
@@ -127,8 +129,9 @@ fn fs_type_name(path: &Path) -> String {
     }
 }
 
-/// Picks the clone back end for `home` from the `backend` setting. The Zfs and Copy back ends do
-/// not exist yet (tickets 08 and later), so choosing them is `backend_unsupported` for now.
+/// Picks the clone back end for `home` from the `backend` setting. The Zfs back end does not
+/// exist yet (ticket 08), so choosing it is `backend_unsupported` for now. `Copy` is never
+/// picked by `Auto`.
 pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>> {
     match cfg.backend {
         #[cfg(target_os = "macos")]
@@ -171,7 +174,8 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
             "the reflink back end only works on Linux",
             "set backend = \"auto\"",
         )),
-        BackendKind::Zfs | BackendKind::Copy => {
+        BackendKind::Copy => Ok(Arc::new(CopyBackend)),
+        BackendKind::Zfs => {
             let _ = home;
             Err(unsupported(
                 format!("the {} back end is not available in this build", cfg.backend.as_str()),
@@ -303,6 +307,113 @@ fn walk_files(
     }
 }
 
+fn io_error(what: &str, path: &Path, e: std::io::Error) -> MitosisError {
+    MitosisError::new(ErrorCode::Internal, format!("{what} {}: {e}", path.display()))
+}
+
+/// Makes `dst` (which must not exist) a copy of the tree at `src`; `file` copies or clones one
+/// regular file. A half-made tree is removed so a retry starts clean.
+fn clone_tree(
+    src: &Path,
+    dst: &Path,
+    file: &dyn Fn(&Path, &Path, &Metadata) -> Result<()>,
+) -> Result<()> {
+    if std::fs::symlink_metadata(dst).is_ok() {
+        return Err(MitosisError::new(
+            ErrorCode::Internal,
+            format!("clone {} -> {}: destination exists", src.display(), dst.display()),
+        ));
+    }
+    clone_entry(src, dst, file).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(dst).or_else(|_| std::fs::remove_file(dst));
+    })
+}
+
+/// Creates `dst` for a regular file with the source's permission bits (O_CREAT | O_EXCL).
+fn create_dst(dst: &Path, md: &Metadata) -> Result<std::fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(md.mode() & 0o777)
+        .open(dst)
+        .map_err(|e| io_error("create", dst, e))
+}
+
+/// Recreates `src` at `dst`: directories made, symlinks recreated (never followed), regular
+/// files handed to `file`; owner, mode and times kept. Sockets, fifos and devices are skipped.
+fn clone_entry(
+    src: &Path,
+    dst: &Path,
+    file: &dyn Fn(&Path, &Path, &Metadata) -> Result<()>,
+) -> Result<()> {
+    let md = std::fs::symlink_metadata(src).map_err(|e| io_error("lstat", src, e))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let target = std::fs::read_link(src).map_err(|e| io_error("readlink", src, e))?;
+        std::os::unix::fs::symlink(&target, dst).map_err(|e| io_error("symlink", dst, e))?;
+    } else if ft.is_dir() {
+        // Owner-writable while it is filled; the source mode is set after the children.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dst)
+            .map_err(|e| io_error("mkdir", dst, e))?;
+        for entry in std::fs::read_dir(src).map_err(|e| io_error("read_dir", src, e))? {
+            let entry = entry.map_err(|e| io_error("read_dir", src, e))?;
+            clone_entry(&entry.path(), &dst.join(entry.file_name()), file)?;
+        }
+    } else if ft.is_file() {
+        file(src, dst, &md)?;
+    } else {
+        return Ok(());
+    }
+    keep_owner(dst, &md)?;
+    if !ft.is_symlink() {
+        // After the chown, which clears setuid/setgid bits.
+        std::fs::set_permissions(dst, Permissions::from_mode(md.mode() & 0o7777))
+            .map_err(|e| io_error("chmod", dst, e))?;
+    }
+    keep_times(dst, &md)
+}
+
+/// Gives `path` the source's owner when it differs from ours and we are allowed to (root).
+fn keep_owner(path: &Path, md: &Metadata) -> Result<()> {
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if md.uid() == uid && md.gid() == gid {
+        return Ok(());
+    }
+    let c = cpath(path)?;
+    if unsafe { libc::lchown(c.as_ptr(), md.uid(), md.gid()) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EPERM) => Ok(()), // not allowed: the clone stays ours
+        _ => Err(io_error("chown", path, e)),
+    }
+}
+
+/// Copies access and modify times onto `path`, without following a symlink.
+fn keep_times(path: &Path, md: &Metadata) -> Result<()> {
+    let c = cpath(path)?;
+    let mut times: [libc::timespec; 2] = unsafe { std::mem::zeroed() };
+    times[0].tv_sec = md.atime() as libc::time_t;
+    times[0].tv_nsec = md.atime_nsec() as _;
+    times[1].tv_sec = md.mtime() as libc::time_t;
+    times[1].tv_nsec = md.mtime_nsec() as _;
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io_error("utimensat", path, std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 pub fn apparent_size(path: &Path) -> Result<u64> {
     let mut total = 0;
     walk_files(path, &mut |_, md| {
@@ -371,7 +482,7 @@ mod tests {
     fn unbuilt_backends_are_unsupported() {
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::at(tmp.path().to_path_buf());
-        for kind in [BackendKind::Reflink, BackendKind::Zfs, BackendKind::Copy] {
+        for kind in [BackendKind::Reflink, BackendKind::Zfs] {
             let cfg = Config {
                 backend: kind,
                 ..Config::default()
@@ -414,5 +525,24 @@ mod tests {
         create_dir(&dir).unwrap();
         std::os::unix::fs::symlink(&big, dir.join("link")).unwrap();
         assert_eq!(apparent_size(&dir).unwrap(), 0);
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod auto_tests {
+    use super::*;
+
+    #[test]
+    fn auto_never_picks_copy() {
+        let tmp = tempfile::tempdir_in(std::env::var("MITOSIS_TEST_ROOT").unwrap_or("/tmp".into()))
+            .unwrap();
+        let home = Home::at(tmp.path().to_path_buf());
+        // Skipped on a reflink file system, where auto picks reflink.
+        if let Ok(b) = select_backend(&home, &Config::default()) {
+            assert_ne!(b.name(), "copy");
+            return;
+        }
+        let e = select_backend(&home, &Config::default()).err().unwrap();
+        assert_eq!(e.code, ErrorCode::BackendUnsupported);
     }
 }

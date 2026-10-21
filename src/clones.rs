@@ -687,19 +687,22 @@ async fn create_inner(
                     let _ = store.upsert_reservation(&r);
                 }
             }
+            let slow = ctx.backend.name() == "copy";
+            if slow {
+                warnings.push(crate::clone_backend::SLOW_WARNING.to_string());
+            }
             info.warnings = warnings;
             info.waited_ms = waited_ms;
-            events::emit_clone(
-                ctx,
-                events::CLONE_CREATED,
-                &row,
-                serde_json::json!({
-                    "gen": row.generation,
-                    "durable": row.durable,
-                    "protected": row.protected,
-                    "waited_ms": waited_ms,
-                }),
-            );
+            let mut detail = serde_json::json!({
+                "gen": row.generation,
+                "durable": row.durable,
+                "protected": row.protected,
+                "waited_ms": waited_ms,
+            });
+            if slow {
+                detail["slow_backend"] = serde_json::json!(true);
+            }
+            events::emit_clone(ctx, events::CLONE_CREATED, &row, detail);
             // While `_in_flight` is held: no reaper or parent-exit destroy comes before the records.
             attach_env(ctx, &mut info, args, std::mem::take(taken)).await;
             Ok(info)
