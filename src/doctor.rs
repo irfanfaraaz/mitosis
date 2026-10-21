@@ -5,7 +5,7 @@
 //! the throwaway Postgres
 //! per installed major, which lives under `<home>/logs/doctor-*` and is always cleaned up.
 use crate::client;
-use crate::clone_backend::{free_space, same_volume, ApfsBackend, CloneBackend};
+use crate::clone_backend::{free_space, same_volume, CloneBackend, PlatformBackend};
 use crate::config::Config;
 use crate::envfile;
 use crate::mask::MaskFile;
@@ -528,7 +528,7 @@ fn check_fs(home: &Home) -> Check {
         )
         .fix("run any mitosis command to create it, or set MITOSIS_HOME");
     }
-    if let Err(e) = ApfsBackend.check_supported(&home.root) {
+    if let Err(e) = PlatformBackend.check_supported(&home.root) {
         return Check::new("home", Level::Fail, e.message)
             .fix(e.hint.unwrap_or_else(|| "use an APFS volume".into()));
     }

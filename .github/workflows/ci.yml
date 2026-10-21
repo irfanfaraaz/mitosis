@@ -43,3 +43,15 @@ jobs:
             echo "::warning::no managed Postgres 17 for this runner; the cross-major tests will skip"
           fi
       - run: cargo test
+
+  linux-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build

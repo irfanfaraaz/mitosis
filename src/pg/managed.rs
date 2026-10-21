@@ -593,6 +593,7 @@ mod tests {
             "https://x/releases/download/17.9.1/a.tar.gz"
         );
         assert!(asset_name("17.9.1").starts_with("postgresql-17.9.1-"));
+        #[cfg(target_os = "macos")]
         assert!(asset_name("17.9.1").ends_with("-apple-darwin.tar.gz"));
     }
 }

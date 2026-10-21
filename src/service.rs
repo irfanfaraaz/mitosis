@@ -2,9 +2,14 @@
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 pub const SERVICE_LABEL: &str = "io.github.irfanfaraaz.mitosis";
@@ -18,12 +23,14 @@ pub struct ServiceStatus {
     pub binary_exists: bool,
 }
 
+#[cfg(target_os = "macos")]
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
+#[cfg(target_os = "macos")]
 fn unesc(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -31,6 +38,7 @@ fn unesc(s: &str) -> String {
 }
 
 /// The launchd plist text. `home` is `$MITOSIS_HOME` when set; `path_env` is the caller's `PATH`.
+#[cfg(target_os = "macos")]
 pub fn plist(binary: &Path, home: Option<&Path>, path_env: &str) -> String {
     let log_home = home.map(Path::to_path_buf).unwrap_or_else(|| {
         let user = std::env::var_os("HOME").map_or(PathBuf::from("/tmp"), PathBuf::from);
@@ -85,20 +93,24 @@ pub fn plist(binary: &Path, home: Option<&Path>, path_env: &str) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 pub fn plist_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or(PathBuf::from("/"), PathBuf::from);
     home.join("Library/LaunchAgents")
         .join(format!("{SERVICE_LABEL}.plist"))
 }
 
+#[cfg(target_os = "macos")]
 fn target() -> String {
     format!("gui/{}/{SERVICE_LABEL}", unsafe { libc::getuid() })
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> Result<std::process::Output> {
     Command::new("launchctl")
         .args(args)
@@ -106,6 +118,7 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
         .map_err(|e| MitosisError::new(ErrorCode::Internal, format!("run launchctl: {e}")))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl_failed(what: &str, o: &std::process::Output) -> MitosisError {
     MitosisError::new(
         ErrorCode::Internal,
@@ -117,6 +130,7 @@ fn launchctl_failed(what: &str, o: &std::process::Output) -> MitosisError {
 }
 
 /// Calls `cond` up to `tries` times, `pause` apart; true as soon as it holds.
+#[cfg(target_os = "macos")]
 fn wait_until(tries: u32, pause: Duration, mut cond: impl FnMut() -> bool) -> bool {
     for i in 0..tries {
         if cond() {
@@ -130,18 +144,21 @@ fn wait_until(tries: u32, pause: Duration, mut cond: impl FnMut() -> bool) -> bo
 }
 
 /// True when `a` and `b` are the same folder, also through symlinks (`/tmp` and `/private/tmp`).
+#[cfg(target_os = "macos")]
 fn same_folder(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     a == b || canon(a) == canon(b)
 }
 
 /// The text of the first `<string>` after `<key>key</key>`.
+#[cfg(target_os = "macos")]
 fn string_after(text: &str, key: &str) -> Option<String> {
     let rest = &text[text.find(&format!("<key>{key}</key>"))?..];
     let rest = &rest[rest.find("<string>")? + "<string>".len()..];
     Some(unesc(&rest[..rest.find("</string>")?]))
 }
 
+#[cfg(target_os = "macos")]
 pub fn install() -> Result<()> {
     let exe = std::env::current_exe()?;
     let home = std::env::var_os("MITOSIS_HOME").filter(|h| !h.is_empty());
@@ -168,6 +185,7 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub fn uninstall() -> Result<()> {
     let _ = launchctl(&["bootout", &target()])?;
     match std::fs::remove_file(plist_path()) {
@@ -176,6 +194,7 @@ pub fn uninstall() -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn status() -> Result<ServiceStatus> {
     let text = std::fs::read_to_string(plist_path()).ok();
     let binary = text
@@ -194,6 +213,7 @@ pub fn status() -> Result<ServiceStatus> {
 }
 
 /// True when the installed, loaded service runs the daemon for `home`.
+#[cfg(target_os = "macos")]
 pub fn manages(home: &Home) -> bool {
     let Ok(text) = std::fs::read_to_string(plist_path()) else {
         return false;
@@ -208,11 +228,42 @@ pub fn manages(home: &Home) -> bool {
 }
 
 /// Starts the loaded service now; false when launchd refused.
+#[cfg(target_os = "macos")]
 pub fn kickstart() -> bool {
     launchctl(&["kickstart", &target()]).is_ok_and(|o| o.status.success())
 }
 
-#[cfg(test)]
+#[cfg(not(target_os = "macos"))]
+fn not_built() -> MitosisError {
+    MitosisError::new(ErrorCode::Internal, "not built yet")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install() -> Result<()> {
+    Err(not_built())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn uninstall() -> Result<()> {
+    Err(not_built())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn status() -> Result<ServiceStatus> {
+    Err(not_built())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn manages(_home: &Home) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn kickstart() -> bool {
+    false
+}
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

@@ -12,7 +12,9 @@ use crate::state::{CloneRow, CloneStatus};
 use crate::templates::{
     folder_stem, is_build_socket_name, now, parse_gen_dir, parse_leftover, Leftover,
 };
+#[cfg(target_os = "macos")]
 use nix::errno::Errno;
+#[cfg(target_os = "macos")]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -27,6 +29,7 @@ const START_SLACK: u64 = 1;
 const STARTING_WAIT: Duration = Duration::from_secs(60);
 const DESTROY_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often a parent watcher wakes to check that its clone still exists.
+#[cfg(target_os = "macos")]
 const WATCH_RECHECK: Duration = Duration::from_secs(30);
 /// gc drops a branch template no clone uses after this long without a `clone --branch` for it.
 const BRANCH_UNUSED_SECS: i64 = 14 * 86_400;
@@ -282,6 +285,7 @@ fn still_watched(ctx: &Ctx, id: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Registers a NOTE_EXIT watch on `pid`; `None` when the pid is already gone.
 fn register_exit(pid: i32) -> nix::Result<Option<Kqueue>> {
     let kq = Kqueue::new()?;
@@ -302,7 +306,23 @@ fn register_exit(pid: i32) -> nix::Result<Option<Kqueue>> {
 }
 
 /// Blocks until the parent exits (true), or until the clone no longer needs watching (false).
+/// Linux has no kqueue: this polls once a second.
+#[cfg(not(target_os = "macos"))]
+fn wait_for_parent_exit(watch: &Watch, pid: i32, start_time: Option<u64>) -> bool {
+    loop {
+        if !parent_alive(pid, start_time) {
+            return true;
+        }
+        if !still_watched(&watch.ctx, &watch.id) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Blocks until the parent exits (true), or until the clone no longer needs watching (false).
 /// Uses kqueue, waking every `WATCH_RECHECK`; polls once a second if kqueue is unavailable.
+#[cfg(target_os = "macos")]
 fn wait_for_parent_exit(watch: &Watch, pid: i32, start_time: Option<u64>) -> bool {
     let mut kq = match register_exit(pid) {
         Ok(None) => return true,

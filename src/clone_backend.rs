@@ -1,11 +1,12 @@
 use crate::error::{ErrorCode, MitosisError, Result};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::Metadata;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 // Not exported by libc; value from <sys/clonefile.h>.
+#[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
 pub trait CloneBackend: Send + Sync {
@@ -13,7 +14,26 @@ pub trait CloneBackend: Send + Sync {
     fn clone_dir(&self, src: &Path, dst: &Path) -> Result<()>;
 }
 
+#[cfg(target_os = "macos")]
 pub struct ApfsBackend;
+
+/// The back end for this platform (Task 2 replaces this with real selection).
+#[cfg(target_os = "macos")]
+pub type PlatformBackend = ApfsBackend;
+
+#[cfg(not(target_os = "macos"))]
+pub struct PlatformBackend;
+
+#[cfg(not(target_os = "macos"))]
+impl CloneBackend for PlatformBackend {
+    fn check_supported(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn clone_dir(&self, _src: &Path, _dst: &Path) -> Result<()> {
+        Err(MitosisError::new(ErrorCode::Internal, "not built yet"))
+    }
+}
 
 fn cpath(p: &Path) -> Result<CString> {
     CString::new(p.as_os_str().as_bytes()).map_err(|_| {
@@ -24,6 +44,7 @@ fn cpath(p: &Path) -> Result<CString> {
     })
 }
 
+#[cfg(target_os = "macos")]
 impl CloneBackend for ApfsBackend {
     fn check_supported(&self, path: &Path) -> Result<()> {
         let c = cpath(path)?;
@@ -35,7 +56,7 @@ impl CloneBackend for ApfsBackend {
                 format!("statfs {}: {e}", path.display()),
             ));
         }
-        let name = unsafe { CStr::from_ptr(st.f_fstypename.as_ptr()) }.to_string_lossy();
+        let name = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }.to_string_lossy();
         if name != "apfs" {
             return Err(MitosisError::new(
                 ErrorCode::NotApfs,
@@ -126,6 +147,7 @@ pub fn apparent_size(path: &Path) -> Result<u64> {
 }
 
 /// Bytes of one file not shared with any clone, via ATTR_CMNEXT_PRIVATESIZE.
+#[cfg(target_os = "macos")]
 fn file_private_size(path: &Path) -> Option<u64> {
     #[repr(C, packed)]
     struct Reply {
@@ -155,6 +177,7 @@ fn file_private_size(path: &Path) -> Option<u64> {
 
 // shortcut: any failure on any file makes the whole sum None rather than a partial number;
 // upgrade if callers need a best-effort partial total.
+#[cfg(target_os = "macos")]
 pub fn private_size(path: &Path) -> Option<u64> {
     let mut total = 0u64;
     let done = walk_files(path, &mut |p, _| {
@@ -164,7 +187,12 @@ pub fn private_size(path: &Path) -> Option<u64> {
     matches!(done, Ok(Some(()))).then_some(total)
 }
 
-#[cfg(test)]
+#[cfg(not(target_os = "macos"))]
+pub fn private_size(_path: &Path) -> Option<u64> {
+    None
+}
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::fs::{create_dir, read_to_string, write};

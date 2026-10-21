@@ -16,11 +16,13 @@ pub struct TestEnv {
     pub tmp: TempDir,
 }
 
-/// A fresh home under /tmp: short enough for the ~103-byte Unix socket path limit, and on APFS.
+/// A fresh home under /tmp (or `MITOSIS_TEST_ROOT`, the mounted test file system on Linux): short
+/// enough for the ~103-byte Unix socket path limit, and on APFS on macOS.
 pub fn tmp_home() -> TempDir {
+    let root = std::env::var("MITOSIS_TEST_ROOT").unwrap_or_else(|_| "/tmp".into());
     tempfile::Builder::new()
         .prefix("mt")
-        .tempdir_in("/tmp")
+        .tempdir_in(root)
         .expect("create temp home")
 }
 
