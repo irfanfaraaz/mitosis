@@ -332,8 +332,7 @@ async fn steps(
                 _ => Ok(()),
             };
         }
-        let lower = out.text.to_lowercase();
-        if mode == "--clone" && lower.contains("clon") && lower.contains("not supported") {
+        if mode == "--clone" && clone_refused(&out.text) {
             append_log(
                 &work.log,
                 "mitosis: file cloning not supported, retrying with --copy",
@@ -343,6 +342,14 @@ async fn steps(
         return Err(("pg_upgrade", internal("pg_upgrade failed")));
     }
     Err(("pg_upgrade", internal("pg_upgrade failed")))
+}
+
+/// True when pg_upgrade `--clone` failed only because the files cannot be cloned: the file system
+/// lacks it, or (ZFS) A and B are separate datasets ("Invalid cross-device link").
+fn clone_refused(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("could not clone file")
+        || (lower.contains("clon") && lower.contains("not supported"))
 }
 
 /// What `initdb` of the new cluster must match for `pg_upgrade` to accept it.
@@ -644,6 +651,15 @@ mod tests {
             locale: locale.map(String::from),
             checksums,
         }
+    }
+
+    #[test]
+    fn clone_refusals_fall_back_to_copy() {
+        assert!(clone_refused(
+            "could not clone file between old and new data directories: Invalid cross-device link"
+        ));
+        assert!(clone_refused("file cloning not supported on this platform"));
+        assert!(!clone_refused("old cluster does not use data checksums"));
     }
 
     #[test]

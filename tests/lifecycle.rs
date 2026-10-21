@@ -254,7 +254,8 @@ async fn reconcile_drops_record_without_folder() {
         Duration::from_secs(5),
     )
     .unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    // Through the back end: on ZFS the clone folder is a mounted dataset.
+    env.ctx.backend.remove_dir(&dir).unwrap();
     let report = reconcile(restarted(&env), now()).await.unwrap();
     assert_eq!(report.records_dropped, vec![a.id.clone()]);
     assert!(report.destroyed.is_empty() && report.adopted.is_empty());

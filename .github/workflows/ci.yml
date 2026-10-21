@@ -89,7 +89,7 @@ jobs:
               sudo mount "$dev" /mnt/mitosis
               ;;
             zfs)
-              sudo truncate -s 4G /var/mitosis-zfs.img
+              sudo truncate -s 16G /var/mitosis-zfs.img
               sudo zpool create tank /var/mitosis-zfs.img
               sudo zfs create -o mountpoint=/mnt/mitosis tank/mitosis
               sudo zfs create -o mountpoint=/mnt/src tank/src
@@ -107,7 +107,7 @@ jobs:
               sudo chmod 0440 /etc/sudoers.d/mitosis
               sudo visudo -cf /etc/sudoers.d/mitosis
               # The running-source test snapshots tank/src as the normal user.
-              sudo zfs allow -u runner snapshot,destroy tank/src
+              sudo zfs allow -u runner snapshot,destroy,mount tank/src
               ;;
           esac
           sudo chown runner /mnt/mitosis
