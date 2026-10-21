@@ -5,7 +5,7 @@
 //! the throwaway Postgres
 //! per installed major, which lives under `<home>/logs/doctor-*` and is always cleaned up.
 use crate::client;
-use crate::clone_backend::{free_space, same_volume, CloneBackend, PlatformBackend};
+use crate::clone_backend::{free_space, same_volume, select_backend};
 use crate::config::Config;
 use crate::envfile;
 use crate::mask::MaskFile;
@@ -519,7 +519,7 @@ fn mode(path: &Path) -> Option<u32> {
         .map(|m| m.permissions().mode() & 0o777)
 }
 
-fn check_fs(home: &Home) -> Check {
+fn check_fs(home: &Home, cfg: &Config) -> Check {
     if !home.root.is_dir() {
         return Check::new(
             "home",
@@ -528,9 +528,16 @@ fn check_fs(home: &Home) -> Check {
         )
         .fix("run any mitosis command to create it, or set MITOSIS_HOME");
     }
-    if let Err(e) = PlatformBackend.check_supported(&home.root) {
+    let backend = match select_backend(home, cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            return Check::new("home", Level::Fail, e.message)
+                .fix(e.hint.unwrap_or_else(|| "set backend in config.toml".into()))
+        }
+    };
+    if let Err(e) = backend.check_supported(&home.root) {
         return Check::new("home", Level::Fail, e.message)
-            .fix(e.hint.unwrap_or_else(|| "use an APFS volume".into()));
+            .fix(e.hint.unwrap_or_else(|| "use a supported file system".into()));
     }
     let (t, c) = (home.templates_dir(), home.clones_dir());
     if t.is_dir() && c.is_dir() {
@@ -542,7 +549,7 @@ fn check_fs(home: &Home) -> Check {
                     Level::Fail,
                     "templates/ and clones/ are on different volumes",
                 )
-                .fix("keep the whole home on one APFS volume");
+                .fix("keep the whole home on one volume");
             }
             Err(e) => return Check::new("home", Level::Fail, e.message),
         }
@@ -550,7 +557,7 @@ fn check_fs(home: &Home) -> Check {
     Check::new(
         "home",
         Level::Ok,
-        format!("{} on APFS, one volume", home.root.display()),
+        format!("{} on the {} back end, one volume", home.root.display(), backend.name()),
     )
 }
 
@@ -1331,10 +1338,11 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     if fix {
         out.push(apply_fix(home).await);
     }
-    out.push(check_fs(home));
+    let loaded = Config::load(home);
+    out.push(check_fs(home, &loaded.clone().unwrap_or_default()));
     out.push(check_permissions(home));
 
-    let cfg = match Config::load(home) {
+    let cfg = match loaded {
         Ok(c) => {
             out.push(Check::new(
                 "config",

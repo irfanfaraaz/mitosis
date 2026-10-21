@@ -1,15 +1,20 @@
+use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
+use crate::paths::Home;
 use std::ffi::CString;
 use std::fs::Metadata;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
 
 // Not exported by libc; value from <sys/clonefile.h>.
 #[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
 pub trait CloneBackend: Send + Sync {
+    /// `"apfs"`, `"reflink"`, `"zfs"` or `"copy"`.
+    fn name(&self) -> &'static str;
     fn check_supported(&self, path: &Path) -> Result<()>;
     fn clone_dir(&self, src: &Path, dst: &Path) -> Result<()>;
 }
@@ -17,21 +22,102 @@ pub trait CloneBackend: Send + Sync {
 #[cfg(target_os = "macos")]
 pub struct ApfsBackend;
 
-/// The back end for this platform (Task 2 replaces this with real selection).
-#[cfg(target_os = "macos")]
-pub type PlatformBackend = ApfsBackend;
+/// The `backend` setting: which way clones are made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Auto,
+    Apfs,
+    Reflink,
+    Zfs,
+    Copy,
+}
 
-#[cfg(not(target_os = "macos"))]
-pub struct PlatformBackend;
-
-#[cfg(not(target_os = "macos"))]
-impl CloneBackend for PlatformBackend {
-    fn check_supported(&self, _path: &Path) -> Result<()> {
-        Ok(())
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Auto => "auto",
+            BackendKind::Apfs => "apfs",
+            BackendKind::Reflink => "reflink",
+            BackendKind::Zfs => "zfs",
+            BackendKind::Copy => "copy",
+        }
     }
+}
 
-    fn clone_dir(&self, _src: &Path, _dst: &Path) -> Result<()> {
-        Err(MitosisError::new(ErrorCode::Internal, "not built yet"))
+impl std::str::FromStr for BackendKind {
+    type Err = MitosisError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "auto" => BackendKind::Auto,
+            "apfs" => BackendKind::Apfs,
+            "reflink" => BackendKind::Reflink,
+            "zfs" => BackendKind::Zfs,
+            "copy" => BackendKind::Copy,
+            _ => {
+                return Err(MitosisError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("unknown back end {s:?}"),
+                )
+                .with_hint("backends are: auto, apfs, reflink, zfs, copy"))
+            }
+        })
+    }
+}
+
+fn unsupported(msg: impl Into<String>, hint: impl Into<String>) -> MitosisError {
+    MitosisError::new(ErrorCode::BackendUnsupported, msg).with_hint(hint)
+}
+
+/// The file system type of `path`, for error messages (`btrfs`, `ext4`, or the hex magic).
+#[cfg(not(target_os = "macos"))]
+fn fs_type_name(path: &Path) -> String {
+    let Ok(c) = cpath(path) else {
+        return "unknown".into();
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return "unknown".into();
+    }
+    let magic = st.f_type as u64 & 0xFFFF_FFFF;
+    match magic {
+        0x9123683E => "btrfs".into(),
+        0x5846_5342 => "xfs".into(),
+        0xEF53 => "ext4".into(),
+        0x2FC1_2FC1 => "zfs".into(),
+        0x0102_1994 => "tmpfs".into(),
+        0x794C_7630 => "overlayfs".into(),
+        m => format!("filesystem 0x{m:x}"),
+    }
+}
+
+/// Picks the clone back end for `home` from the `backend` setting. The Reflink and Zfs back ends
+/// do not exist yet (tickets 04 and 08), so choosing them is `backend_unsupported` for now.
+pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>> {
+    match cfg.backend {
+        #[cfg(target_os = "macos")]
+        BackendKind::Auto | BackendKind::Apfs => Ok(Arc::new(ApfsBackend)),
+        #[cfg(not(target_os = "macos"))]
+        BackendKind::Apfs => Err(unsupported(
+            "the apfs back end only works on macOS",
+            "set backend = \"auto\", or put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS",
+        )),
+        #[cfg(not(target_os = "macos"))]
+        BackendKind::Auto => {
+            // Order: a configured ZFS dataset (ticket 08), then a FICLONE probe (ticket 04).
+            let fs = fs_type_name(&home.root);
+            Err(unsupported(
+                format!("no clone back end works on the '{fs}' file system at {}", home.root.display()),
+                "put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS, or set backend = \"copy\"",
+            ))
+        }
+        BackendKind::Reflink | BackendKind::Zfs | BackendKind::Copy => {
+            let _ = home;
+            Err(unsupported(
+                format!("the {} back end is not available in this build", cfg.backend.as_str()),
+                "set backend = \"auto\"",
+            ))
+        }
     }
 }
 
@@ -46,6 +132,10 @@ fn cpath(p: &Path) -> Result<CString> {
 
 #[cfg(target_os = "macos")]
 impl CloneBackend for ApfsBackend {
+    fn name(&self) -> &'static str {
+        "apfs"
+    }
+
     fn check_supported(&self, path: &Path) -> Result<()> {
         let c = cpath(path)?;
         let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -76,7 +166,7 @@ impl CloneBackend for ApfsBackend {
         let msg = format!("clonefile {} -> {}: {e}", src.display(), dst.display());
         Err(match e.raw_os_error() {
             Some(libc::EXDEV) => MitosisError::new(ErrorCode::CrossVolume, msg)
-                .with_hint("source and destination must be on the same APFS volume"),
+                .with_hint("source and destination must be on the same volume"),
             _ => MitosisError::new(ErrorCode::Internal, msg),
         })
     }
@@ -196,6 +286,29 @@ pub fn private_size(_path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use std::fs::{create_dir, read_to_string, write};
+
+    #[test]
+    fn auto_picks_apfs_on_apfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().to_path_buf());
+        let b = select_backend(&home, &Config::default()).unwrap();
+        assert_eq!(b.name(), "apfs");
+        b.check_supported(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn unbuilt_backends_are_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().to_path_buf());
+        for kind in [BackendKind::Reflink, BackendKind::Zfs, BackendKind::Copy] {
+            let cfg = Config {
+                backend: kind,
+                ..Config::default()
+            };
+            let e = select_backend(&home, &cfg).err().unwrap();
+            assert_eq!(e.code, ErrorCode::BackendUnsupported);
+        }
+    }
 
     #[test]
     fn clone_is_isolated_and_shares_blocks() {

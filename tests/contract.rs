@@ -573,6 +573,7 @@ fn error_codes() {
     use ErrorCode::*;
     let all = [
         NotApfs,
+        BackendUnsupported,
         CrossVolume,
         ForeignHome,
         NoMatchingPostgres,
@@ -595,7 +596,8 @@ fn error_codes() {
     // Fails to compile when a code is added: add it to the list above.
     for c in all {
         match c {
-            NotApfs | CrossVolume | ForeignHome | NoMatchingPostgres | MissingExtension
+            NotApfs | BackendUnsupported | CrossVolume | ForeignHome | NoMatchingPostgres
+            | MissingExtension
             | TemplateNotFound | TemplateBuildFailed | CloneNotFound | CapReached | BudgetFull
             | LowDisk | PortsExhausted | PortInUse | PostgresStartFailed | AlreadyRunning
             | DaemonUnavailable | ProtocolMismatch | InvalidRequest | Internal => {}

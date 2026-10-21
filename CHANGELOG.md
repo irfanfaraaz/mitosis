@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - Unreleased
+
+### Added
+
+- New config keys `backend` (`auto`, `apfs`, `reflink`, `zfs` or `copy`; default `auto`) and `zfs_dataset`, with the environment variables `MITOSIS_BACKEND` and `MITOSIS_ZFS_DATASET`. `auto` keeps choosing APFS on macOS, so 1.0 homes open unchanged.
+- New error code `backend_unsupported`: no clone back end works for the file system or the `backend` setting.
+- `mitosis doctor`'s `home` check names the active back end.
+
 ## [1.0.0] - 2026-10-20
 
 ### Added

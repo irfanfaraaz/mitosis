@@ -361,3 +361,23 @@ fn router_state_lines() {
         "{line}"
     );
 }
+
+/// Store schema 3 and the home layout are unchanged since 1.0, so a home made by the current code
+/// is a 1.0 home: it must open on the apfs back end and keep its clones.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn one_dot_oh_home_opens_unchanged() {
+    use mitosis::ctx::{Config, Ctx};
+    let (_tmp, home) = fresh_home();
+    let ctx = Ctx::open(home.clone(), Config::default()).unwrap();
+    assert_eq!(ctx.backend.name(), "apfs");
+    let before = mitosis::clones::list(&ctx).unwrap().len();
+    drop(ctx);
+    let ctx = Ctx::open(home.clone(), Config::default()).unwrap();
+    assert_eq!(ctx.backend.name(), "apfs");
+    assert_eq!(mitosis::clones::list(&ctx).unwrap().len(), before);
+    let checks = run(&home, false).await;
+    let c = find(&checks, "home");
+    assert_eq!(c.level, Level::Ok);
+    assert!(c.detail.contains("apfs"), "{}", c.detail);
+}

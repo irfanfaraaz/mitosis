@@ -1,4 +1,4 @@
-use crate::clone_backend::{same_volume, CloneBackend, PlatformBackend};
+use crate::clone_backend::{same_volume, select_backend, CloneBackend};
 pub use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
@@ -63,7 +63,7 @@ pub struct Ctx {
 impl Ctx {
     pub fn open(home: Home, config: Config) -> Result<Ctx> {
         home.ensure_dirs()?;
-        let backend: Arc<dyn CloneBackend> = Arc::new(PlatformBackend);
+        let backend: Arc<dyn CloneBackend> = select_backend(&home, &config)?;
         backend.check_supported(&home.root)?;
         if !same_volume(&home.templates_dir(), &home.clones_dir())? {
             return Err(MitosisError::new(
@@ -75,7 +75,7 @@ impl Ctx {
                 ),
             )
             .with_hint(
-                "keep templates/ and clones/ on the same APFS volume (no symlinks to other disks)",
+                "keep templates/ and clones/ on the same volume (no symlinks to other disks)",
             ));
         }
         let store = Store::open(&home.state_db())?;

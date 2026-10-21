@@ -5,6 +5,8 @@ use std::fmt;
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     NotApfs,
+    /// No clone back end works for this file system or setting.
+    BackendUnsupported,
     CrossVolume,
     /// `MITOSIS_HOME` points at an existing folder that Mitosis did not create.
     ForeignHome,
