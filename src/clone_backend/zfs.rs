@@ -371,6 +371,59 @@ impl CloneBackend for ZfsBackend {
     fn take_kept(&self) -> Vec<PathBuf> {
         std::mem::take(&mut *self.kept.lock().unwrap_or_else(|e| e.into_inner()))
     }
+
+    fn external_mountpoint(&self, dataset: &str) -> Result<PathBuf> {
+        check_dataset_name(dataset)?;
+        let out = self
+            .run_zfs(&["get", "-H", "-o", "value", "mountpoint", dataset], false)
+            .map_err(|e| {
+                if e.message.contains("does not exist") {
+                    MitosisError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("ZFS dataset {dataset} does not exist"),
+                    )
+                    .with_hint("name the dataset that holds the Postgres data directory (zfs list)")
+                } else {
+                    e
+                }
+            })?;
+        let mp = out.trim();
+        if !mp.starts_with('/') {
+            return Err(MitosisError::new(
+                ErrorCode::InvalidRequest,
+                format!("ZFS dataset {dataset} has mountpoint '{mp}', not a folder"),
+            )
+            .with_hint("the source must be a mounted dataset whose root is the data directory"));
+        }
+        Ok(PathBuf::from(mp))
+    }
+
+    /// The snapshot is read through `<mountpoint>/.zfs/snapshot/<name>`, which the kernel mounts
+    /// on first access with no root needed. Taking it needs `snapshot` (and later `destroy`)
+    /// delegated on the source dataset.
+    fn snapshot_external(&self, dataset: &str, name: &str) -> Result<PathBuf> {
+        let mp = self.external_mountpoint(dataset)?;
+        let snap = format!("{dataset}@{name}");
+        self.run_zfs(&["snapshot", &snap], false).map_err(|e| {
+            if e.message.to_ascii_lowercase().contains("permission denied") {
+                unsupported(
+                    e.message,
+                    format!(
+                        "run \"zfs allow -u {} snapshot,destroy {dataset}\" as an admin",
+                        current_user()
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
+        Ok(mp.join(".zfs/snapshot").join(name))
+    }
+
+    fn destroy_external(&self, dataset: &str, name: &str) -> Result<()> {
+        self.run_zfs(&["destroy", &format!("{dataset}@{name}")], false)
+            .map(|_| ())
+    }
 }
 
 /// True when sudo itself said no (as opposed to zfs failing under sudo): it wants a password, the
@@ -934,5 +987,50 @@ exit 1
         for bad in ["", "/tank", "tank/", "tank//m", "tank m", "tank/m@s", "t,ank"] {
             assert!(check_dataset_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// `get mountpoint` answers `/src/<dataset>`; snapshotting `tank/denied` is refused.
+    const EXTERNAL_ZFS: &str = r#"#!/bin/sh
+echo "zfs $*" >> "@LOG@"
+eval last=\${$#}
+case "$1" in
+  get) [ "$last" = "tank/gone" ] && { echo "cannot open 'tank/gone': dataset does not exist" >&2; exit 1; }
+       echo "/src/$last" ;;
+  snapshot) case "$last" in tank/denied@*)
+              echo "cannot create snapshot '$last': permission denied" >&2; exit 1 ;; esac ;;
+esac
+exit 0
+"#;
+
+    #[test]
+    fn external_snapshot_is_read_through_dot_zfs_and_destroyed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log, zfs) = (tmp.path().join("log"), tmp.path().join("zfs"));
+        std::fs::write(&zfs, EXTERNAL_ZFS.replace("@LOG@", log.to_str().unwrap())).unwrap();
+        std::fs::set_permissions(&zfs, Permissions::from_mode(0o755)).unwrap();
+        let b = ZfsBackend::with_programs("tank/m", tmp.path().join("mnt"), zfs, "sudo".into());
+
+        let dir = b.snapshot_external("tank/pg", "mitosis-ab12").unwrap();
+        assert_eq!(dir, PathBuf::from("/src/tank/pg/.zfs/snapshot/mitosis-ab12"));
+        b.destroy_external("tank/pg", "mitosis-ab12").unwrap();
+        let ran = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = ran.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "zfs get -H -o value mountpoint tank/pg",
+                "zfs snapshot tank/pg@mitosis-ab12",
+                "zfs destroy tank/pg@mitosis-ab12",
+            ]
+        );
+
+        let e = b.snapshot_external("tank/denied", "mitosis-ab12").unwrap_err();
+        assert_eq!(e.code, ErrorCode::BackendUnsupported);
+        let hint = e.hint.unwrap_or_default();
+        assert!(hint.contains("snapshot,destroy tank/denied"), "{hint}");
+        let e = b.external_mountpoint("tank/gone").unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        let e = b.external_mountpoint("tank/x@y").unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
     }
 }

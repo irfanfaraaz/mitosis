@@ -47,6 +47,31 @@ pub trait CloneBackend: Send + Sync {
     fn take_kept(&self) -> Vec<PathBuf> {
         Vec::new()
     }
+    /// ZFS only: where `dataset`, a dataset Mitosis does not own (a running source), is mounted.
+    fn external_mountpoint(&self, _dataset: &str) -> Result<PathBuf> {
+        Err(no_running_source(self.name()))
+    }
+    /// ZFS only: takes the snapshot `<dataset>@<name>` and returns the folder it is read through.
+    fn snapshot_external(&self, _dataset: &str, _name: &str) -> Result<PathBuf> {
+        Err(no_running_source(self.name()))
+    }
+    /// ZFS only: destroys the snapshot `snapshot_external` took.
+    fn destroy_external(&self, _dataset: &str, _name: &str) -> Result<()> {
+        Err(no_running_source(self.name()))
+    }
+}
+
+fn no_running_source(backend: &str) -> MitosisError {
+    unsupported(
+        format!("--from-running needs the zfs back end; this home uses {backend}"),
+        "set backend = zfs and zfs_dataset, with MITOSIS_HOME on that dataset",
+    )
+}
+
+/// Fills `dst`, an empty folder that exists, with a full copy of the tree at `src` (owner, modes
+/// and times kept, symlinks recreated, never followed).
+pub(crate) fn fill_copy(src: &Path, dst: &Path) -> Result<()> {
+    fill_tree(src, dst, &copy::copy_file)
 }
 
 /// `create_dir`, `remove_dir` and `rename_dir` as plain file system calls (APFS, reflink, copy).
@@ -370,7 +395,6 @@ fn clone_tree(
 
 /// `clone_tree` into `dst`, an empty folder that already exists (a fresh ZFS dataset): the
 /// entries of `src` are recreated in it, and it takes `src`'s owner, mode and times.
-#[cfg(target_os = "linux")]
 fn fill_tree(
     src: &Path,
     dst: &Path,

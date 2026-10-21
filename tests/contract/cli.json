@@ -269,6 +269,9 @@
                 "layered"
               ]
             },
+            "--from-running": {
+              "takes_value": true
+            },
             "--from-url": {
               "takes_value": true
             },

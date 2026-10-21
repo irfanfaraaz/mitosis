@@ -80,6 +80,10 @@
       "clone_id": "string",
       "kind": "string"
     },
+    "running": {
+      "dataset": "string",
+      "kind": "string"
+    },
     "seed": {
       "command": "string",
       "cwd": "string",

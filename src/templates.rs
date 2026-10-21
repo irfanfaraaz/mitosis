@@ -1,4 +1,4 @@
-use crate::clone_backend::{apparent_size, CloneBackend};
+use crate::clone_backend::{apparent_size, fill_copy, CloneBackend};
 use crate::clones::START_TRIES;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
@@ -25,6 +25,7 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -88,7 +89,12 @@ pub async fn init(ctx: &Ctx, mut args: TemplateInitArgs) -> Result<TemplateInfo>
     // An existing template gets a new generation from the new source, on the same database.
     let existing = ctx.store().get_template(&args.name)?;
     if let Some(t) = &existing {
-        if args.database.is_none() && matches!(args.source, TemplateSource::Seed { .. }) {
+        if args.database.is_none()
+            && matches!(
+                args.source,
+                TemplateSource::Seed { .. } | TemplateSource::Running { .. }
+            )
+        {
             args.database = Some(t.database.clone());
         }
         let db = database_for(&args)?;
@@ -428,7 +434,7 @@ pub fn info(row: &TemplateRow, cur: &GenerationRow, generations: u32, now: i64) 
             cwd: cwd.clone(),
             path: path.clone(),
         },
-        promoted @ TemplateSource::Promoted { .. } => promoted.clone(),
+        other @ (TemplateSource::Promoted { .. } | TemplateSource::Running { .. }) => other.clone(),
     };
     TemplateInfo {
         name: row.name.clone(),
@@ -766,6 +772,8 @@ fn database_for(args: &TemplateInitArgs) -> Result<String> {
         TemplateSource::Basebackup { url } => {
             args.database.clone().unwrap_or_else(|| db_from_url(url))
         }
+        // A copy of the whole cluster, like a basebackup without a URL to name a database.
+        TemplateSource::Running { .. } => args.database.clone().unwrap_or_else(|| "postgres".into()),
         TemplateSource::Seed { .. } | TemplateSource::Promoted { .. } => args
             .database
             .clone()
@@ -1297,6 +1305,12 @@ async fn run_steps(
 ) -> StepResult<Vec<String>> {
     let pg = if let TemplateSource::Basebackup { url } = source {
         basebackup_server(ctx, install, url, data_dir, opts, database).await?
+    } else if let TemplateSource::Running { dataset } = source {
+        let (b, ds, d) = (ctx.backend.clone(), dataset.clone(), data_dir.to_path_buf());
+        blocking(move || copy_running(&*b, &ds, &d))
+            .await
+            .map_err(at(SNAPSHOT_STEP))?;
+        standalone_server(ctx, install, data_dir, opts, database).await?
     } else {
         let (i, d) = (install.clone(), data_dir.to_path_buf());
         blocking(move || initdb(&i, &d))
@@ -1315,7 +1329,7 @@ async fn run_steps(
 
     match source {
         // Already in the copy.
-        TemplateSource::Basebackup { .. } => {}
+        TemplateSource::Basebackup { .. } | TemplateSource::Running { .. } => {}
         TemplateSource::Url { url } => {
             let (i, u, o, db, g) = (
                 install.clone(),
@@ -1358,6 +1372,9 @@ async fn run_steps(
 /// Step name used only for "the source has no such database"; `build_gen` turns that
 /// `invalid_request` into a plain bad request instead of a failed build.
 const MISSING_DATABASE_STEP: &str = "missing database";
+/// The copy step of a running source; its refusals (`invalid_request`, `backend_unsupported`)
+/// reach the caller as they are, like `MISSING_DATABASE_STEP`.
+const SNAPSHOT_STEP: &str = "snapshot copy";
 
 /// The major version of the server at `url`, read with `psql` of any install.
 fn source_major(install: &PgInstall, url: &str) -> Result<u32> {
@@ -1470,6 +1487,117 @@ fn run_basebackup(
     Err(internal(format!("pg_basebackup failed ({})", out.status)))
 }
 
+/// The owner's login name of uid `uid`, else `uid <n>`.
+fn user_name(uid: u32) -> String {
+    Command::new("id")
+        .args(["-nu", &uid.to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("uid {uid}"))
+}
+
+/// Refuses a running source's data directory `dir` that Mitosis cannot use: one another user owns
+/// (Postgres will not start on it and only root could chown it), or a dataset root with no
+/// `PG_VERSION`. Returns its Postgres major.
+fn check_running_dir(dir: &Path, dataset: &str) -> Result<u32> {
+    let md = std::fs::metadata(dir)
+        .map_err(|e| invalid(format!("cannot read the source {}: {e}", dir.display())))?;
+    let me = unsafe { libc::geteuid() };
+    if md.uid() != me {
+        return Err(invalid(format!(
+            "the source data directory is owned by {}; Mitosis must run as that user",
+            user_name(md.uid())
+        )));
+    }
+    if !dir.join("PG_VERSION").is_file() {
+        return Err(invalid(format!(
+            "{} (the root of ZFS dataset {dataset}) is not a Postgres data directory: it has no PG_VERSION",
+            dir.display()
+        ))
+        .with_hint("name the dataset whose mountpoint is the data directory itself"));
+    }
+    read_pg_version(dir)
+}
+
+/// The install for a running source: the major of the data directory at `dataset`'s mountpoint.
+/// Fails before any snapshot when that major is not installed.
+async fn running_install(ctx: &Ctx, dataset: &str, pinned: Option<u32>) -> Result<PgInstall> {
+    let (b, ds) = (ctx.backend.clone(), dataset.to_string());
+    let major = blocking(move || {
+        let dir = b.external_mountpoint(&ds)?;
+        check_running_dir(&dir, &ds)
+    })
+    .await?;
+    if let Some(m) = pinned.filter(|m| *m != major) {
+        return Err(invalid(format!(
+            "the source runs Postgres {major}, so its copy is Postgres {major}, not {m}"
+        ))
+        .with_hint("drop --pg-major; to move to another major, upgrade the template"));
+    }
+    ctx.install_major(major).await.map_err(|e| {
+        if e.code != ErrorCode::NoMatchingPostgres {
+            return e;
+        }
+        MitosisError::new(
+            ErrorCode::NoMatchingPostgres,
+            format!("the source runs Postgres {major}; no Postgres {major} found"),
+        )
+        .with_hint(format!(
+            "brew install postgresql@{major}, or: mitosis pg install {major}"
+        ))
+    })
+}
+
+/// Refuses a snapshot of a running source whose copy could not be made consistent or standalone:
+/// another owner, WAL on another dataset (a snapshot is atomic within one dataset only), or a
+/// replica.
+fn check_running_snapshot(snap: &Path, dataset: &str) -> Result<()> {
+    check_running_dir(snap, dataset)?;
+    if std::fs::symlink_metadata(snap.join("pg_wal")).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(invalid(format!(
+            "pg_wal of {dataset} is a symlink; pg_wal must be on the same dataset"
+        )));
+    }
+    for signal in ["standby.signal", "recovery.signal"] {
+        if snap.join(signal).exists() {
+            return Err(invalid(format!(
+                "{dataset} is a replica ({signal}); replica sources come in 1.2"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Copies a snapshot of the source in `snap` into `data_dir` (made empty first when missing)
+/// and removes the copied `postmaster.pid`. The source itself is never written.
+fn copy_snapshot(snap: &Path, dataset: &str, data_dir: &Path) -> Result<()> {
+    check_running_snapshot(snap, dataset)?;
+    if !data_dir.exists() {
+        // A masked build's staging folder; the build folder was made by the back end.
+        std::fs::DirBuilder::new().mode(0o700).create(data_dir)?;
+    }
+    fill_copy(snap, data_dir)?;
+    match std::fs::remove_file(data_dir.join("postmaster.pid")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// The copy step of a running-source template: snapshots `dataset`, copies the snapshot into
+/// `data_dir`, and destroys the snapshot right after, on every path, so nothing of Mitosis's
+/// keeps the source's owner from changing or removing the dataset.
+fn copy_running(backend: &dyn CloneBackend, dataset: &str, data_dir: &Path) -> Result<()> {
+    let name = format!("mitosis-{}", random_hex(12));
+    let snap = backend.snapshot_external(dataset, &name)?;
+    let copied = copy_snapshot(&snap, dataset, data_dir);
+    let destroyed = backend.destroy_external(dataset, &name);
+    copied?;
+    destroyed
+}
+
 /// Ensures the `postgres` superuser, then starts the copied cluster. A `shared_preload_libraries`
 /// entry this machine lacks is commented out once, with a warning in the build log.
 async fn standalone_start(
@@ -1529,6 +1657,19 @@ async fn basebackup_server(
     blocking(move || run_basebackup(&i, &u, &d, &l, &g))
         .await
         .map_err(at("basebackup"))?;
+    standalone_server(ctx, install, data_dir, opts, database).await
+}
+
+/// After the copy step of a physical copy (`pg_basebackup` or a running source's snapshot): makes
+/// `data_dir` a standalone cluster (which also turns `archive_mode` off), starts it (crash
+/// recovery replays the copied WAL), and checks that `database` is in it. The server is left running.
+async fn standalone_server(
+    ctx: &Ctx,
+    install: &PgInstall,
+    data_dir: &Path,
+    opts: &mut StartOptions,
+    database: &str,
+) -> StepResult<RunningPg> {
     let d = data_dir.to_path_buf();
     let warnings = blocking(move || make_standalone(&d))
         .await
@@ -1704,6 +1845,9 @@ async fn build_held(ctx: &Ctx, args: TemplateInitArgs, manual: bool) -> Result<T
         // A physical copy keeps the major of the server it is copied from.
         (TemplateSource::Basebackup { url }, pinned) => {
             basebackup_install(ctx, url, pinned).await?
+        }
+        (TemplateSource::Running { dataset }, pinned) => {
+            running_install(ctx, dataset, pinned).await?
         }
         (_, Some(major)) => ctx.install_major(major).await?,
         (_, None) => ctx.newest_install().await?,
@@ -2427,7 +2571,12 @@ async fn build_gen(
         Ok(ext) => Ok(ext),
         Err((step, e)) => {
             // The caller named a database the source does not have: a bad request, not a failed build.
-            let bad_request = step == MISSING_DATABASE_STEP && e.code == ErrorCode::InvalidRequest;
+            let bad_request = (step == MISSING_DATABASE_STEP && e.code == ErrorCode::InvalidRequest)
+                || (step == SNAPSHOT_STEP
+                    && matches!(
+                        e.code,
+                        ErrorCode::InvalidRequest | ErrorCode::BackendUnsupported
+                    ));
             let failed = fail(ctx, install, &build_dir, &log, &secrets, step, e.clone()).await;
             Err(if bad_request { e } else { failed })
         }
@@ -3171,6 +3320,138 @@ mod tests {
         assert!(BuildGuard::take(&ctx, "other").is_ok());
         drop(g);
         assert!(BuildGuard::take(&ctx, "main").is_ok());
+    }
+
+    /// A back end whose external snapshot is the fixture folder `snap`; records destroys.
+    struct FakeSnap {
+        snap: PathBuf,
+        destroyed: Mutex<Vec<String>>,
+    }
+
+    impl CloneBackend for FakeSnap {
+        fn name(&self) -> &'static str {
+            "zfs"
+        }
+        fn check_supported(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn clone_dir(&self, _: &Path, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+        fn create_dir(&self, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+        fn remove_dir(&self, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+        fn rename_dir(&self, _: &Path, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+        fn private_size(&self, _: &Path) -> Option<u64> {
+            None
+        }
+        fn snapshot_external(&self, _: &str, _: &str) -> Result<PathBuf> {
+            Ok(self.snap.clone())
+        }
+        fn destroy_external(&self, dataset: &str, name: &str) -> Result<()> {
+            self.destroyed.lock().unwrap().push(format!("{dataset}@{name}"));
+            Ok(())
+        }
+    }
+
+    /// A fixture data directory as a snapshot of a running server shows it.
+    fn running_fixture() -> (tempfile::TempDir, FakeSnap) {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snap");
+        std::fs::create_dir_all(snap.join("pg_wal")).unwrap();
+        std::fs::create_dir_all(snap.join("base/1")).unwrap();
+        std::fs::write(snap.join("PG_VERSION"), "17\n").unwrap();
+        std::fs::write(snap.join("base/1/1259"), "rows").unwrap();
+        std::fs::write(snap.join("postmaster.pid"), "4242\n").unwrap();
+        let b = FakeSnap {
+            snap,
+            destroyed: Mutex::new(Vec::new()),
+        };
+        (tmp, b)
+    }
+
+    #[test]
+    fn from_running_needs_zfs_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx::open_with_backend(
+            crate::paths::Home::at(tmp.path().join("m")),
+            Default::default(),
+            Arc::new(crate::clone_backend::CopyBackend),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let e = rt
+            .block_on(running_install(&ctx, "tank/pg", None))
+            .err()
+            .unwrap();
+        assert_eq!(e.code, ErrorCode::BackendUnsupported);
+        assert!(e.message.contains("--from-running"), "{}", e.message);
+    }
+
+    #[test]
+    fn foreign_owner_is_refused() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root owns "/"
+        }
+        let e = check_running_dir(Path::new("/"), "tank/pg").unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(
+            e.message.starts_with("the source data directory is owned by ")
+                && e.message.ends_with("; Mitosis must run as that user"),
+            "{}",
+            e.message
+        );
+        let (_tmp, b) = running_fixture();
+        assert_eq!(check_running_dir(&b.snap, "tank/pg").unwrap(), 17);
+        std::fs::remove_file(b.snap.join("PG_VERSION")).unwrap();
+        let e = check_running_dir(&b.snap, "tank/pg").unwrap_err();
+        assert!(e.message.contains("no PG_VERSION"), "{}", e.message);
+    }
+
+    #[test]
+    fn symlinked_pg_wal_is_refused() {
+        let (tmp, b) = running_fixture();
+        std::fs::remove_dir(b.snap.join("pg_wal")).unwrap();
+        std::os::unix::fs::symlink("/elsewhere/pg_wal", b.snap.join("pg_wal")).unwrap();
+        let dst = tmp.path().join("build");
+        let e = copy_running(&b, "tank/pg", &dst).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(e.message.contains("pg_wal must be on the same dataset"), "{}", e.message);
+        assert!(!dst.exists());
+        // Destroyed on the error path too.
+        assert_eq!(b.destroyed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn standby_signal_is_refused() {
+        for signal in ["standby.signal", "recovery.signal"] {
+            let (tmp, b) = running_fixture();
+            std::fs::write(b.snap.join(signal), "").unwrap();
+            let e = copy_running(&b, "tank/pg", &tmp.path().join("build")).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidRequest);
+            assert!(e.message.contains("replica sources come in 1.2"), "{}", e.message);
+            assert_eq!(b.destroyed.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn postmaster_pid_is_removed_before_start() {
+        let (tmp, b) = running_fixture();
+        let dst = tmp.path().join("build");
+        copy_running(&b, "tank/pg", &dst).unwrap();
+        assert!(!dst.join("postmaster.pid").exists());
+        assert_eq!(std::fs::read_to_string(dst.join("base/1/1259")).unwrap(), "rows");
+        assert_eq!(read_pg_version(&dst).unwrap(), 17);
+        // The source is never written.
+        assert!(b.snap.join("postmaster.pid").exists());
+        let destroyed = b.destroyed.lock().unwrap();
+        assert_eq!(destroyed.len(), 1);
+        assert!(destroyed[0].starts_with("tank/pg@mitosis-"), "{destroyed:?}");
     }
 
     // The daemon spawns these futures on a multi-thread runtime, so they must be Send.

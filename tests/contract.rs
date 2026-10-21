@@ -449,13 +449,17 @@ fn enum_values() {
         TemplateSource::Promoted {
             clone_id: "a1b2c3d4".into(),
         },
+        TemplateSource::Running {
+            dataset: "tank/pg".into(),
+        },
     ];
     for s in &sources {
         match s {
             TemplateSource::Url { .. }
             | TemplateSource::Basebackup { .. }
             | TemplateSource::Seed { .. }
-            | TemplateSource::Promoted { .. } => {}
+            | TemplateSource::Promoted { .. }
+            | TemplateSource::Running { .. } => {}
         }
     }
     let source_shapes: Map<String, Value> = sources

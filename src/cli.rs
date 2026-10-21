@@ -198,7 +198,8 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum TemplateCmd {
-    /// Build a template from a database URL, a physical copy of a server, or a seed command.
+    /// Build a template from a database URL, a physical copy of a server, a ZFS snapshot of a
+    /// running server, or a seed command.
     Init {
         #[arg(default_value = "main")]
         name: String,
@@ -206,9 +207,16 @@ enum TemplateCmd {
         #[arg(
             long,
             conflicts_with_all = ["seed", "basebackup"],
-            required_unless_present_any = ["seed", "basebackup"]
+            required_unless_present_any = ["seed", "basebackup", "from_running"]
         )]
         from_url: Option<String>,
+        /// Snapshot the ZFS dataset whose root is a live Postgres data directory (zfs back end).
+        #[arg(
+            long,
+            value_name = "DATASET",
+            conflicts_with_all = ["from_url", "basebackup", "seed"]
+        )]
+        from_running: Option<String>,
         /// Copy a running server physically with pg_basebackup (needs a role with REPLICATION).
         #[arg(long, conflicts_with = "seed")]
         basebackup: Option<String>,
@@ -957,6 +965,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         TemplateCmd::Init {
             name,
             from_url,
+            from_running,
             basebackup,
             seed,
             database,
@@ -976,17 +985,18 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                     })
                 })
                 .transpose()?;
-            let source = match (from_url, basebackup, seed) {
-                (Some(url), _, _) => TemplateSource::Url { url },
-                (None, Some(url), _) => TemplateSource::Basebackup { url },
+            let source = match (from_running, from_url, basebackup, seed) {
+                (Some(dataset), _, _, _) => TemplateSource::Running { dataset },
+                (None, Some(url), _, _) => TemplateSource::Url { url },
+                (None, None, Some(url), _) => TemplateSource::Basebackup { url },
                 // The seed runs where and with the PATH it would in this shell.
-                (None, None, Some(command)) => TemplateSource::Seed {
+                (None, None, None, Some(command)) => TemplateSource::Seed {
                     command,
                     cwd: Some(std::env::current_dir()?),
                     path: std::env::var("PATH").ok(),
                 },
-                (None, None, None) => {
-                    unreachable!("clap requires --from-url, --basebackup or --seed")
+                (None, None, None, None) => {
+                    unreachable!("clap requires --from-url, --from-running, --basebackup or --seed")
                 }
             };
             let args = TemplateInitArgs {
@@ -1200,6 +1210,7 @@ fn source_cell(source: &TemplateSource) -> String {
             )
         }
         TemplateSource::Promoted { clone_id } => format!("promoted from {clone_id}"),
+        TemplateSource::Running { dataset } => format!("running: {dataset}"),
     };
     if text.chars().count() <= MAX {
         return text;
@@ -1568,6 +1579,16 @@ mod tests {
         assert!(basebackup(&["--database", "shop"]).is_ok());
         assert!(basebackup(&["--seed", "x"]).is_err());
         assert!(basebackup(&["--from-url", "y"]).is_err());
+        let running = |extra: &[&str]| {
+            let mut args = vec!["mitosis", "template", "init", "--from-running", "tank/pg"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(running(&[]).is_ok());
+        assert!(running(&["--database", "shop"]).is_ok());
+        for other in ["--seed", "--from-url", "--basebackup"] {
+            assert!(running(&[other, "x"]).is_err(), "{other}");
+        }
     }
 
     #[test]
