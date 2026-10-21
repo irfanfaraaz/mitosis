@@ -30,6 +30,8 @@ struct Cli {
     command: Cmd,
 }
 
+// Parsed once per run, so the size gap between variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Build, refresh and list templates.
@@ -178,6 +180,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Set up a ZFS dataset for the zfs back end (Linux).
+    Zfs {
+        #[command(subcommand)]
+        command: ZfsCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -193,7 +200,8 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum TemplateCmd {
-    /// Build a template from a database URL, a physical copy of a server, or a seed command.
+    /// Build a template from a database URL, a physical copy of a server, a ZFS snapshot of a
+    /// running server, or a seed command.
     Init {
         #[arg(default_value = "main")]
         name: String,
@@ -201,9 +209,16 @@ enum TemplateCmd {
         #[arg(
             long,
             conflicts_with_all = ["seed", "basebackup"],
-            required_unless_present_any = ["seed", "basebackup"]
+            required_unless_present_any = ["seed", "basebackup", "from_running"]
         )]
         from_url: Option<String>,
+        /// Snapshot the ZFS dataset whose root is a live Postgres data directory (zfs back end).
+        #[arg(
+            long,
+            value_name = "DATASET",
+            conflicts_with_all = ["from_url", "basebackup", "seed"]
+        )]
+        from_running: Option<String>,
         /// Copy a running server physically with pg_basebackup (needs a role with REPLICATION).
         #[arg(long, conflicts_with = "seed")]
         basebackup: Option<String>,
@@ -404,6 +419,12 @@ enum ServiceCmd {
 }
 
 #[derive(Subcommand)]
+enum ZfsCmd {
+    /// Print the `zfs allow` and sudoers lines an admin runs once, then check them.
+    Setup { dataset: String },
+}
+
+#[derive(Subcommand)]
 enum DaemonCmd {
     /// Show whether the daemon is running.
     Status,
@@ -488,6 +509,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     if let Some(b) = &s.binary {
                         let gone = if s.binary_exists { "" } else { "  (missing)" };
                         println!("binary    {}{gone}", b.display());
+                    }
+                    if s.installed {
+                        if let Some(hint) = service::linger_hint() {
+                            println!("{hint}");
+                        }
                     }
                 }
             }
@@ -688,6 +714,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 other => return Err(unexpected(other)),
             }
         }
+        Cmd::Zfs {
+            command: ZfsCmd::Setup { dataset },
+        } => return zfs_setup(&dataset),
         Cmd::Doctor { fix, json } => {
             let checks = doctor::run(&home, fix).await;
             if json {
@@ -832,6 +861,44 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `mitosis zfs setup <dataset>`: prints what an admin installs once, then the ZFS doctor checks.
+/// It never runs sudo or changes anything itself.
+#[cfg(target_os = "linux")]
+fn zfs_setup(dataset: &str) -> Result<ExitCode> {
+    use crate::clone_backend::zfs;
+    zfs::check_dataset_name(dataset)?;
+    let bin = zfs::which_zfs().unwrap_or_else(|| "/usr/sbin/zfs".into());
+    let mount_root = match zfs::ZfsBackend::new(dataset) {
+        Ok(b) => b.mount_root().to_path_buf(),
+        Err(e) => {
+            // ZFS's default mountpoint for a dataset.
+            let guess = std::path::PathBuf::from(format!("/{dataset}"));
+            eprintln!(
+                "note: could not read the mountpoint of {dataset} ({}); assuming {}",
+                e.message,
+                guess.display()
+            );
+            guess
+        }
+    };
+    let user = zfs::current_user();
+    print!("{}", zfs::setup_text(&user, dataset, &mount_root, &bin));
+    println!();
+    println!("Checks (run this again once the admin is done):");
+    let checks = doctor::zfs_checks(dataset);
+    print!("{}", doctor::render(&checks));
+    Ok(ExitCode::from(doctor::exit_code(&checks)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn zfs_setup(_dataset: &str) -> Result<ExitCode> {
+    Err(MitosisError::new(
+        ErrorCode::BackendUnsupported,
+        "the zfs back end only works on Linux",
+    )
+    .with_hint("set backend = \"auto\""))
+}
+
 fn print_config(entries: &[ConfigEntry]) {
     let width = entries.iter().map(|e| e.key.len()).max().unwrap_or(0);
     let vwidth = entries.iter().map(|e| e.value.len()).max().unwrap_or(0);
@@ -900,6 +967,7 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
         TemplateCmd::Init {
             name,
             from_url,
+            from_running,
             basebackup,
             seed,
             database,
@@ -919,17 +987,18 @@ async fn template(home: &Home, cmd: TemplateCmd) -> Result<()> {
                     })
                 })
                 .transpose()?;
-            let source = match (from_url, basebackup, seed) {
-                (Some(url), _, _) => TemplateSource::Url { url },
-                (None, Some(url), _) => TemplateSource::Basebackup { url },
+            let source = match (from_running, from_url, basebackup, seed) {
+                (Some(dataset), _, _, _) => TemplateSource::Running { dataset },
+                (None, Some(url), _, _) => TemplateSource::Url { url },
+                (None, None, Some(url), _) => TemplateSource::Basebackup { url },
                 // The seed runs where and with the PATH it would in this shell.
-                (None, None, Some(command)) => TemplateSource::Seed {
+                (None, None, None, Some(command)) => TemplateSource::Seed {
                     command,
                     cwd: Some(std::env::current_dir()?),
                     path: std::env::var("PATH").ok(),
                 },
-                (None, None, None) => {
-                    unreachable!("clap requires --from-url, --basebackup or --seed")
+                (None, None, None, None) => {
+                    unreachable!("clap requires --from-url, --from-running, --basebackup or --seed")
                 }
             };
             let args = TemplateInitArgs {
@@ -1143,6 +1212,7 @@ fn source_cell(source: &TemplateSource) -> String {
             )
         }
         TemplateSource::Promoted { clone_id } => format!("promoted from {clone_id}"),
+        TemplateSource::Running { dataset } => format!("running: {dataset}"),
     };
     if text.chars().count() <= MAX {
         return text;
@@ -1511,6 +1581,16 @@ mod tests {
         assert!(basebackup(&["--database", "shop"]).is_ok());
         assert!(basebackup(&["--seed", "x"]).is_err());
         assert!(basebackup(&["--from-url", "y"]).is_err());
+        let running = |extra: &[&str]| {
+            let mut args = vec!["mitosis", "template", "init", "--from-running", "tank/pg"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(running(&[]).is_ok());
+        assert!(running(&["--database", "shop"]).is_ok());
+        for other in ["--seed", "--from-url", "--basebackup"] {
+            assert!(running(&[other, "x"]).is_err(), "{other}");
+        }
     }
 
     #[test]

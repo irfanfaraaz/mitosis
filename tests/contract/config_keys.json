@@ -1,4 +1,7 @@
 {
+  "backend": {
+    "env": "MITOSIS_BACKEND"
+  },
   "clone_disk_warn": {
     "env": "MITOSIS_CLONE_DISK_WARN"
   },
@@ -31,5 +34,8 @@
   },
   "router_port": {
     "env": "MITOSIS_ROUTER_PORT"
+  },
+  "zfs_dataset": {
+    "env": "MITOSIS_ZFS_DATASET"
   }
 }

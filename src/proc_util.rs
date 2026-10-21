@@ -2,6 +2,7 @@ use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -31,6 +32,7 @@ pub fn has_exited(pid: i32) -> bool {
 }
 
 /// Process start time in seconds since the Unix epoch (macOS `proc_pidinfo`).
+#[cfg(target_os = "macos")]
 pub fn process_start_time(pid: i32) -> Option<u64> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -46,6 +48,7 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
     (n == size).then_some(info.pbi_start_tvsec)
 }
 
+#[cfg(target_os = "macos")]
 /// The current directory of `pid` as (device, inode, path), from `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
 /// Fails with ESRCH when the process is gone and EPERM when it belongs to another user.
 pub fn process_cwd(pid: i32) -> std::io::Result<(u64, u64, PathBuf)> {
@@ -85,6 +88,45 @@ pub fn process_cwd(pid: i32) -> std::io::Result<(u64, u64, PathBuf)> {
         st.vst_ino,
         PathBuf::from(std::ffi::OsString::from_vec(raw)),
     ))
+}
+
+/// Process start time in seconds since the Unix epoch (Linux: `/proc/<pid>/stat` field 22 plus the
+/// boot time from `/proc/stat`). None for a zombie, as on macOS: an exited server is not running.
+#[cfg(not(target_os = "macos"))]
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name (field 2) may contain spaces and parentheses: split after the last ')'.
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    if rest.split_whitespace().next()? == "Z" {
+        return None; // field 3, the state
+    }
+    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?; // field 22 = index 19 after field 2
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let btime: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(btime + ticks / hz as u64)
+}
+
+/// The current directory of `pid` as (device, inode, path), from `/proc/<pid>/cwd`.
+/// Fails with ESRCH when the process is gone and EPERM when it belongs to another user.
+#[cfg(not(target_os = "macos"))]
+pub fn process_cwd(pid: i32) -> std::io::Result<(u64, u64, PathBuf)> {
+    use std::os::unix::fs::MetadataExt;
+    if pid <= 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    let link = format!("/proc/{pid}/cwd");
+    let path = std::fs::read_link(&link)?;
+    let md = std::fs::metadata(&link)?;
+    Ok((md.dev(), md.ino(), path))
 }
 
 /// Resident memory in bytes of `pid` plus its direct children. Postgres backends call
@@ -187,5 +229,30 @@ mod tests {
         }
         assert!(exited);
         assert!(!is_alive(pid)); // reaped, no zombie left
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[allow(clippy::zombie_processes)] // the zombie is the point; has_exited reaps it
+    fn zombie_has_no_start_time() {
+        let child = Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let stat = || std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // Not waited on, so it stays a zombie once it exits.
+        for _ in 0..100 {
+            if stat()
+                .rsplit(')')
+                .next()
+                .unwrap()
+                .trim_start()
+                .starts_with('Z')
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(is_alive(pid), "a zombie still counts as alive");
+        assert_eq!(process_start_time(pid), None);
+        assert!(has_exited(pid));
     }
 }

@@ -92,7 +92,7 @@ async fn doctor_reports_missing_major() {
     let c = find(&checks, "template_installs");
     assert_eq!(c.level, Level::Fail);
     assert!(c.detail.contains("99"), "{}", c.detail);
-    assert_eq!(c.fix.as_deref(), Some("brew install postgresql@99"));
+    assert_eq!(c.fix, Some(mitosis::pg::binaries::install_hint(99)));
     assert!(!home.daemon_sock().exists());
 }
 
@@ -159,12 +159,11 @@ async fn doctor_fix_finishes_pending_restore() {
 
 /// A free port this test holds, outside the default `port_range`, where `router_port` is refused.
 fn held_port() -> std::net::TcpListener {
-    loop {
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        if !(54_320..=54_999).contains(&l.local_addr().unwrap().port()) {
-            return l;
-        }
-    }
+    // Above the router_port() range and outside CI's ephemeral range, so once dropped no
+    // outgoing connection takes it before the test checks it is free again.
+    (61_450..=61_999)
+        .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())
+        .expect("a free port in 61450-61999")
 }
 
 #[tokio::test]
@@ -360,4 +359,24 @@ fn router_state_lines() {
         line.starts_with("not listening:") && line.contains("Address already in use"),
         "{line}"
     );
+}
+
+/// Store schema 3 and the home layout are unchanged since 1.0, so a home made by the current code
+/// is a 1.0 home: it must open on the apfs back end and keep its clones.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn one_dot_oh_home_opens_unchanged() {
+    use mitosis::ctx::{Config, Ctx};
+    let (_tmp, home) = fresh_home();
+    let ctx = Ctx::open(home.clone(), Config::default()).unwrap();
+    assert_eq!(ctx.backend.name(), "apfs");
+    let before = mitosis::clones::list(&ctx).unwrap().len();
+    drop(ctx);
+    let ctx = Ctx::open(home.clone(), Config::default()).unwrap();
+    assert_eq!(ctx.backend.name(), "apfs");
+    assert_eq!(mitosis::clones::list(&ctx).unwrap().len(), before);
+    let checks = run(&home, false).await;
+    let c = find(&checks, "home");
+    assert_eq!(c.level, Level::Ok);
+    assert!(c.detail.contains("apfs"), "{}", c.detail);
 }

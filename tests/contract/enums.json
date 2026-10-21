@@ -54,7 +54,8 @@
     "router.started",
     "router.failed",
     "gc",
-    "recovery"
+    "recovery",
+    "template.generation_kept"
   ],
   "generation.kind": [
     "full",
@@ -77,6 +78,10 @@
     },
     "promoted": {
       "clone_id": "string",
+      "kind": "string"
+    },
+    "running": {
+      "dataset": "string",
       "kind": "string"
     },
     "seed": {

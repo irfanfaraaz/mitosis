@@ -43,3 +43,96 @@ jobs:
             echo "::warning::no managed Postgres 17 for this runner; the cross-major tests will skip"
           fi
       - run: cargo test
+
+  linux:
+    name: linux (${{ matrix.fs }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { fs: btrfs, runner: ubuntu-22.04 }
+          - { fs: xfs, runner: ubuntu-22.04 }
+          - { fs: zfs, runner: ubuntu-22.04 }
+          - { fs: copy, runner: ubuntu-22.04 }
+          - { fs: btrfs, runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.fs }}-${{ matrix.runner }}
+      - name: Install Postgres 18 (PGDG) and file system tools
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          pkgs="postgresql-18 btrfs-progs xfsprogs"
+          if [ "${{ matrix.fs }}" = zfs ]; then pkgs="$pkgs zfsutils-linux"; fi
+          sudo apt-get install -y --no-install-recommends $pkgs
+          echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: Prepare the test file system
+        env:
+          FS: ${{ matrix.fs }}
+        run: |
+          sudo mkdir -p /mnt/mitosis
+          case "$FS" in
+            btrfs | xfs)
+              sudo truncate -s 4G /var/mitosis.img
+              dev=$(sudo losetup -f --show /var/mitosis.img)
+              if [ "$FS" = btrfs ]; then sudo mkfs.btrfs -q -f "$dev"; else sudo mkfs.xfs -q -f -m reflink=1 "$dev"; fi
+              sudo mount "$dev" /mnt/mitosis
+              ;;
+            zfs)
+              sudo truncate -s 16G /var/mitosis-zfs.img
+              sudo zpool create tank /var/mitosis-zfs.img
+              sudo zfs create -o mountpoint=/mnt/mitosis tank/mitosis
+              sudo zfs create -o mountpoint=/mnt/src tank/src
+              sudo chown runner /mnt/mitosis /mnt/src
+              # Apply exactly what "mitosis zfs setup" prints: the zfs lines and the sudoers rule.
+              # Its checks fail until the admin is done, so it exits non-zero here; only an empty output is an error.
+              cargo run --quiet -- zfs setup tank/mitosis > "$RUNNER_TEMP/zfs-setup.txt" || [ -s "$RUNNER_TEMP/zfs-setup.txt" ]
+              cat "$RUNNER_TEMP/zfs-setup.txt"
+              grep -E '^zfs ' "$RUNNER_TEMP/zfs-setup.txt" | while IFS= read -r line; do
+                sudo sh -c "$line"
+              done
+              grep -E '^[^#[:space:]][^[:space:]]* ALL=' "$RUNNER_TEMP/zfs-setup.txt" > "$RUNNER_TEMP/mitosis.sudoers"
+              sudo visudo -cf "$RUNNER_TEMP/mitosis.sudoers"
+              sudo tee /etc/sudoers.d/mitosis < "$RUNNER_TEMP/mitosis.sudoers" > /dev/null
+              sudo chmod 0440 /etc/sudoers.d/mitosis
+              sudo visudo -cf /etc/sudoers.d/mitosis
+              # The running-source test snapshots tank/src as the normal user.
+              sudo zfs allow -u runner snapshot,destroy,mount tank/src
+              ;;
+          esac
+          sudo chown runner /mnt/mitosis
+          # The tests use fixed ports 55000-60249; keep outgoing ports below them.
+          sudo sysctl -q -w net.ipv4.ip_local_port_range="32768 54999"
+          # Unit tests make homes in TMPDIR with the auto back end, so TMPDIR must clone.
+          if [ "$FS" = btrfs ] || [ "$FS" = xfs ]; then
+            echo "TMPDIR=/mnt/mitosis" >> "$GITHUB_ENV"
+          else
+            sudo truncate -s 4G /var/mitosis-tmp.img
+            dev=$(sudo losetup -f --show /var/mitosis-tmp.img)
+            sudo mkfs.btrfs -q -f "$dev"
+            sudo mkdir -p /mnt/tmp
+            sudo mount "$dev" /mnt/tmp
+            sudo chown runner /mnt/tmp
+            echo "TMPDIR=/mnt/tmp" >> "$GITHUB_ENV"
+          fi
+      - name: Test
+        env:
+          MITOSIS_TEST_ROOT: /mnt/mitosis
+          FS: ${{ matrix.fs }}
+        run: |
+          case "$FS" in
+            zfs) export MITOSIS_BACKEND=zfs MITOSIS_ZFS_DATASET=tank/mitosis ;;
+            copy) export MITOSIS_BACKEND=copy ;;
+            *) export MITOSIS_BACKEND=reflink ;;
+          esac
+          cargo test --no-fail-fast

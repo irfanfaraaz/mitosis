@@ -1,13 +1,16 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
+use mitosis::clone_backend::{select_backend, CloneBackend};
 use mitosis::ctx::{Config, Ctx};
+use mitosis::error::Result;
 use mitosis::names::random_hex;
 use mitosis::paths::Home;
 use mitosis::pg::{discover, newest, stop};
 use mitosis::protocol::{TemplateInfo, TemplateInitArgs, TemplateSource};
 use mitosis::templates;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -16,16 +19,116 @@ pub struct TestEnv {
     pub tmp: TempDir,
 }
 
-/// A fresh home under /tmp: short enough for the ~103-byte Unix socket path limit, and on APFS.
+/// A fresh home under /tmp (or `MITOSIS_TEST_ROOT`, the mounted test file system on Linux): short
+/// enough for the ~103-byte Unix socket path limit, and on APFS on macOS.
 pub fn tmp_home() -> TempDir {
+    let root = std::env::var("MITOSIS_TEST_ROOT").unwrap_or_else(|_| "/tmp".into());
     tempfile::Builder::new()
         .prefix("mt")
-        .tempdir_in("/tmp")
+        .tempdir_in(root)
         .expect("create temp home")
+}
+
+/// The defaults with the back end this run asks for: `MITOSIS_BACKEND` and `MITOSIS_ZFS_DATASET`,
+/// which the Linux suites set (unset on macOS, where auto picks APFS).
+pub fn test_config() -> Config {
+    let mut c = Config::default();
+    if let Ok(b) = std::env::var("MITOSIS_BACKEND") {
+        c.backend = b.parse().expect("MITOSIS_BACKEND");
+    }
+    c.zfs_dataset = std::env::var("MITOSIS_ZFS_DATASET").ok();
+    c
+}
+
+/// `warnings` without the copy back end's standing "full copies" note.
+pub fn real_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| *w != mitosis::clone_backend::SLOW_WARNING)
+        .collect()
+}
+
+/// The selected back end, wrapped: every call is recorded (method and first path) and passed on.
+pub struct RecordingBackend {
+    inner: Arc<dyn CloneBackend>,
+    calls: Mutex<Vec<(&'static str, PathBuf)>>,
+}
+
+impl RecordingBackend {
+    fn hit(&self, method: &'static str, path: &Path) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method, path.to_path_buf()));
+    }
+
+    /// The first path of every recorded call of `method`, in call order.
+    pub fn calls(&self, method: &str) -> Vec<PathBuf> {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .iter()
+            .filter(|(m, _)| *m == method)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+}
+
+impl CloneBackend for RecordingBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn check_supported(&self, path: &Path) -> Result<()> {
+        self.hit("check_supported", path);
+        self.inner.check_supported(path)
+    }
+
+    fn clone_dir(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.hit("clone_dir", src);
+        self.inner.clone_dir(src, dst)
+    }
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        self.hit("create_dir", path);
+        self.inner.create_dir(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        self.hit("remove_dir", path);
+        self.inner.remove_dir(path)
+    }
+
+    fn rename_dir(&self, from: &Path, to: &Path) -> Result<()> {
+        self.hit("rename_dir", from);
+        self.inner.rename_dir(from, to)
+    }
+
+    fn private_size(&self, path: &Path) -> Option<u64> {
+        self.hit("private_size", path);
+        self.inner.private_size(path)
+    }
 }
 
 impl TestEnv {
     pub fn new() -> Option<TestEnv> {
+        Self::open(|backend| backend)
+    }
+
+    /// Like `new`, with the back end wrapped in a `RecordingBackend`.
+    pub fn recording() -> Option<(TestEnv, Arc<RecordingBackend>)> {
+        let mut rec = None;
+        let env = Self::open(|inner| {
+            let r = Arc::new(RecordingBackend {
+                inner,
+                calls: Mutex::new(Vec::new()),
+            });
+            rec = Some(r.clone());
+            r as Arc<dyn CloneBackend>
+        })?;
+        Some((env, rec.expect("recording back end")))
+    }
+
+    fn open(wrap: impl FnOnce(Arc<dyn CloneBackend>) -> Arc<dyn CloneBackend>) -> Option<TestEnv> {
         if discover().is_empty() {
             println!("skipping: no Postgres installed");
             return None;
@@ -45,9 +148,11 @@ impl TestEnv {
             port_range: lo..=lo + 19,
             router: false,
             router_port: 60_000 + slice,
-            ..Config::default()
+            ..test_config()
         };
-        let ctx = Ctx::open(Home::at(tmp.path().to_path_buf()), config).expect("open ctx");
+        let home = Home::at(tmp.path().to_path_buf());
+        let backend = select_backend(&home, &config).expect("select back end");
+        let ctx = Ctx::open_with_backend(home, config, wrap(backend)).expect("open ctx");
         Some(TestEnv {
             ctx: Arc::new(ctx),
             tmp,

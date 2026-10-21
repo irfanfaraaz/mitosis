@@ -1,5 +1,6 @@
 [
   "already_running",
+  "backend_unsupported",
   "budget_full",
   "cap_reached",
   "clone_not_found",

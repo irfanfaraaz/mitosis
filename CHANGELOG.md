@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - Unreleased
+
+Mitosis now runs on Linux. No Linux speed numbers have been measured yet.
+
+### Added
+
+- Linux support (glibc 2.35 or newer, `x86_64` and `aarch64`). Mitosis picks a clone back end from the file system under `MITOSIS_HOME`.
+- New config keys `backend` (`auto`, `apfs`, `reflink`, `zfs` or `copy`; default `auto`) and `zfs_dataset`, with the environment variables `MITOSIS_BACKEND` and `MITOSIS_ZFS_DATASET`. `auto` keeps choosing APFS on macOS, so 1.0 homes open unchanged.
+- New error code `backend_unsupported`: no clone back end works for the file system or the `backend` setting. Its hint says how to fix it (Btrfs, XFS made with `mkfs.xfs -m reflink=1`, ZFS, or `backend = "copy"`).
+- Reflink back end (Linux, Btrfs and XFS): each file is cloned with the `FICLONE` ioctl, so a clone shares every block with its template until one side writes. `auto` picks it when a probe on `MITOSIS_HOME` succeeds. A file system the probe refuses (XFS made without `reflink=1`) fails with `backend_unsupported`.
+- Copy back end (any file system, `backend = "copy"`): a full copy per clone. `auto` never picks it. It is slow and uses the template's full size per clone, so `mitosis clone` warns each time it is used.
+- ZFS back end (Linux): each template generation is a dataset under `zfs_dataset` and each clone a `zfs clone` of the generation's one `@mitosis` snapshot, mounted at the same paths as before. `auto` picks it when `zfs_dataset` is set and its mountpoint holds `MITOSIS_HOME`. Datasets mount again at boot (`canmount=on`). Generations made from a generation or a clone (layered builds, promote, upgrade) are full copies in their own dataset, so they never pin their source. Mount, unmount, mountpoint, canmount and rename run as `sudo -n zfs ...`; Mitosis never waits for a password and never runs `zfs promote` or `zfs destroy -R`.
+- New command `mitosis zfs setup <dataset>`: prints the `zfs allow` and `zfs set setuid=off devices=off` lines and the `/etc/sudoers.d/mitosis` rule (mountpoints limited to the dataset's own mountpoint) an admin installs once, then checks them. It never runs sudo itself.
+- `template init --from-running <dataset>` (ZFS back end only, else `backend_unsupported`): builds a template from a live Postgres whose data directory is the root of `<dataset>`, with no access to the server. Mitosis takes `<dataset>@mitosis-<id>`, copies it through `.zfs/snapshot/`, destroys the snapshot right after the copy, then runs crash recovery on the copy (`archive_mode` off) before masking and subsets as usual. The source is never stopped or written. It needs `zfs allow -u <user> snapshot,destroy <dataset>`, a data directory owned by Mitosis's user, `pg_wal` on the same dataset, and no `standby.signal`/`recovery.signal` (replica sources come in 1.2). `template refresh` repeats the same steps. New `template.source.kind` `running` (`dataset`).
+- New event kind `template.generation_kept` (`detail.reason`: `clones_depend`): gc left a folder in place because clones of it still exist, and tries again on its next run.
+- New `mitosis doctor` checks: `backend_speed` (a warning while the `copy` back end is used), and `zfs_tool`, `zfs_dataset` (warns when `setuid` or `devices` is on), `zfs_permissions` and `zfs_sudo` when the settings use ZFS.
+- Login service on Linux: `mitosis service install`, `uninstall` and `status` manage a systemd user unit, `~/.config/systemd/user/mitosis.service` (`Restart=on-failure`). `service status` and `doctor` warn while lingering is off and print `loginctl enable-linger $USER`; Mitosis never runs it. `service status --json` keeps its fields.
+- Postgres discovery on Linux: `/usr/lib/postgresql/<N>/bin` (apt, PGDG), `/usr/pgsql-<N>/bin` (dnf, PGDG) and the `pg_config` on `PATH`, next to Homebrew, asdf and pgenv.
+- `mitosis pg install` downloads the Linux builds (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) from the same `theseus-rs/postgresql-binaries` releases, with the same SHA-256 check.
+- README: a Linux section (file systems, Btrfs loop-file recipe, `mkfs.xfs -m reflink=1`, ZFS setup, the copy back end, running as a service), `--from-running`, Docker on Linux, and `brew install irfanfaraaz/mitosis/mitosis`. The Homebrew tap comes with this release.
+
+### Changed
+
+- `mitosis doctor`'s `home` check names the active back end instead of saying APFS.
+- Messages that said "APFS" name the active back end. The error code `not_apfs` is unchanged and still applies to the APFS back end on macOS.
+- On Linux, containers reach the router with `--add-host=host.docker.internal:host-gateway` and `router_listen = 0.0.0.0`. No new `router_listen` value.
+- `Cargo.toml`: version 1.1.0, and a description that names macOS (APFS) and Linux (Btrfs, XFS, ZFS).
+- The daemon protocol (v3) and the state store schema are unchanged. A 1.0 store opens as is; stores do not move between machines.
+
 ## [1.0.0] - 2026-10-20
 
 ### Added
@@ -146,7 +175,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Configurable limits through `MITOSIS_MAX_CLONES` and `MITOSIS_MIN_FREE_DISK`.
 - Benchmark script, `scripts/bench.sh`.
 
-[Unreleased]: https://github.com/irfanfaraaz/mitosis/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/irfanfaraaz/mitosis/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/irfanfaraaz/mitosis/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/irfanfaraaz/mitosis/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/irfanfaraaz/mitosis/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/irfanfaraaz/mitosis/releases/tag/v0.1.0

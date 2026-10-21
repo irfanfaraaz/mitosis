@@ -180,7 +180,7 @@ async fn version_mismatch() {
     set_current_gen(&env, |g| g.pg_major = 99);
     let e = create(&env.ctx, args("main")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
-    assert_eq!(e.hint.as_deref(), Some("brew install postgresql@99"));
+    assert_eq!(e.hint, Some(mitosis::pg::binaries::install_hint(99)));
 }
 
 #[tokio::test]
@@ -204,7 +204,7 @@ async fn missing_extension() {
 async fn unknown_template() {
     // Fails before any Postgres work, so it runs without Postgres installed.
     let tmp = tmp_home();
-    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(Home::at(tmp.path().to_path_buf()), test_config()).unwrap());
     let e = create(&ctx, args("nope")).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::TemplateNotFound);
     assert_eq!(

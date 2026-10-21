@@ -120,6 +120,36 @@ postgres://postgres:<password>@127.0.0.1:<router_port>/<clone name or id>
 `url` always holds this form while `router = on`, even when `router_listen` is `0.0.0.0`
 or `::`. `direct_url` keeps the v0.2 form (the clone's own port) and is also stable.
 
+## Added in 1.1
+
+1.1 adds the following. Each is covered by the promise above from 1.1.0 on.
+
+- **Config keys:** `backend` and `zfs_dataset`, with the environment variables `MITOSIS_BACKEND`
+  and `MITOSIS_ZFS_DATASET`.
+  - `backend` accepts `auto` (default), `apfs`, `reflink`, `zfs` and `copy`.
+  - `zfs_dataset` accepts a ZFS dataset name, or an empty value for none.
+  - `auto` keeps choosing APFS on macOS, so a 1.0 home opens unchanged.
+
+- **Error code:** `backend_unsupported`, for a file system or a `backend` setting that no clone
+  back end can work with.
+
+- **Command:** `mitosis zfs setup <dataset>`.
+
+- **Flag:** `mitosis template init --from-running <dataset>`.
+
+- **`template list --json`:** the template `source.kind` value `running` (with a `dataset`
+  field).
+
+- **Event kind:** `template.generation_kept` (`detail.reason` is `clones_depend`).
+
+- **`doctor` check names:** `backend_speed`, `zfs_tool`, `zfs_dataset`, `zfs_permissions` and
+  `zfs_sudo`. The `home` check now names the active back end.
+
+- **Platforms:** Linux (x86_64 and aarch64) joins macOS. The `service` commands manage a systemd
+  user unit there. `service status --json` keeps its fields.
+
+The daemon protocol stays at version 3 and the state store schema does not change.
+
 ## What is not covered
 
 - Human-readable output: tables, notes, warnings, progress lines and their wording. Use `--json`

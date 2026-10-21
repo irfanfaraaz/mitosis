@@ -28,6 +28,10 @@ pub enum TemplateSource {
     Promoted {
         clone_id: String,
     },
+    /// A ZFS snapshot of a live Postgres data directory: the root of `dataset` (ZFS back end only).
+    Running {
+        dataset: String,
+    },
 }
 
 /// How a template generation was made.

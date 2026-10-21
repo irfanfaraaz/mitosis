@@ -44,7 +44,7 @@ async fn named_clone_keeps_url_across_recreate() {
     destroy(&env.ctx, "x").await.unwrap();
     let b = create(&env.ctx, named("x")).await.unwrap();
     assert_eq!(a.url, b.url);
-    assert!(b.warnings.is_empty());
+    assert!(real_warnings(&b.warnings).is_empty(), "{:?}", b.warnings);
 }
 
 #[tokio::test]
@@ -310,7 +310,7 @@ async fn fresh_without_name_is_refused() {
     let ctx = std::sync::Arc::new(
         mitosis::ctx::Ctx::open(
             mitosis::paths::Home::at(tmp.path().to_path_buf()),
-            mitosis::ctx::Config::default(),
+            test_config(),
         )
         .unwrap(),
     );
@@ -369,7 +369,7 @@ async fn new_name_whose_port_moves_has_no_warning() {
         .await
         .unwrap();
     // No URL existed before this create, so nothing changed for anyone.
-    assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+    assert!(real_warnings(&a.warnings).is_empty(), "{:?}", a.warnings);
     assert_eq!(
         env.ctx
             .store()

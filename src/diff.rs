@@ -1,8 +1,9 @@
 //! `mitosis diff`: what a clone changed against the template generation it was made from.
 //!
-//! The base side is a private, socket-only Postgres on a `clonefile` of the generation folder; a
+//! The base side is a private, socket-only Postgres on a copy-on-write clone of the generation folder; a
 //! guard stops it and deletes the folder on every path. Both sides are read with `psql`.
 
+use crate::clone_backend::CloneBackend;
 use crate::clones;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
@@ -65,6 +66,7 @@ pub fn check_session(ctx: &Ctx, id_or_name: &str, parent_pid: i32) -> Result<()>
 /// stops the server and removes everything it made; a failure is written to `daemon.log` with the
 /// leaked folder, and `Drop` tries once more.
 struct BaseServer {
+    backend: Arc<dyn CloneBackend>,
     install: PgInstall,
     dir: PathBuf,
     socket_dir: PathBuf,
@@ -80,7 +82,7 @@ impl BaseServer {
     fn cleanup(&mut self) -> Result<()> {
         if self.dir.exists() {
             stop(&self.install, &self.dir, self.pg, self.timeout)?;
-            std::fs::remove_dir_all(&self.dir)?;
+            self.backend.remove_dir(&self.dir)?;
         }
         let _ = std::fs::remove_dir_all(&self.socket_dir);
         let _ = std::fs::remove_file(&self.log);
@@ -175,6 +177,7 @@ pub async fn diff(
 
     let tag = random_hex(4);
     let mut base = BaseServer {
+        backend: ctx.backend.clone(),
         install: install.clone(),
         dir: ctx.home.templates_dir().join(format!(".diff-{tag}")),
         // Short: Unix socket paths are limited to about 100 bytes.

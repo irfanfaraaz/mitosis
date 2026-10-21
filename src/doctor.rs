@@ -5,7 +5,7 @@
 //! the throwaway Postgres
 //! per installed major, which lives under `<home>/logs/doctor-*` and is always cleaned up.
 use crate::client;
-use crate::clone_backend::{free_space, same_volume, ApfsBackend, CloneBackend};
+use crate::clone_backend::{free_space, same_volume, select_backend};
 use crate::config::Config;
 use crate::envfile;
 use crate::mask::MaskFile;
@@ -519,18 +519,36 @@ fn mode(path: &Path) -> Option<u32> {
         .map(|m| m.permissions().mode() & 0o777)
 }
 
-fn check_fs(home: &Home) -> Check {
+/// The `home` check, with the back end it selected (none when that failed).
+fn check_fs(home: &Home, cfg: &Config) -> (Check, Option<&'static str>) {
     if !home.root.is_dir() {
-        return Check::new(
+        let c = Check::new(
             "home",
             Level::Fail,
             format!("{} does not exist", home.root.display()),
         )
         .fix("run any mitosis command to create it, or set MITOSIS_HOME");
+        return (c, None);
     }
-    if let Err(e) = ApfsBackend.check_supported(&home.root) {
-        return Check::new("home", Level::Fail, e.message)
-            .fix(e.hint.unwrap_or_else(|| "use an APFS volume".into()));
+    let backend = match select_backend(home, cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            let fix = e
+                .hint
+                .unwrap_or_else(|| "set backend in config.toml".into());
+            return (Check::new("home", Level::Fail, e.message).fix(fix), None);
+        }
+    };
+    (check_volume(home, &*backend), Some(backend.name()))
+}
+
+/// The rest of the `home` check, on the selected back end.
+fn check_volume(home: &Home, backend: &dyn crate::clone_backend::CloneBackend) -> Check {
+    if let Err(e) = backend.check_supported(&home.root) {
+        return Check::new("home", Level::Fail, e.message).fix(
+            e.hint
+                .unwrap_or_else(|| "use a supported file system".into()),
+        );
     }
     let (t, c) = (home.templates_dir(), home.clones_dir());
     if t.is_dir() && c.is_dir() {
@@ -542,7 +560,7 @@ fn check_fs(home: &Home) -> Check {
                     Level::Fail,
                     "templates/ and clones/ are on different volumes",
                 )
-                .fix("keep the whole home on one APFS volume");
+                .fix("keep the whole home on one volume");
             }
             Err(e) => return Check::new("home", Level::Fail, e.message),
         }
@@ -550,8 +568,63 @@ fn check_fs(home: &Home) -> Check {
     Check::new(
         "home",
         Level::Ok,
-        format!("{} on APFS, one volume", home.root.display()),
+        format!(
+            "{} on the {} back end, one volume",
+            home.root.display(),
+            backend.name()
+        ),
     )
+}
+
+/// `backend`: the name of the back end the `home` check selected.
+fn check_backend_speed(backend: Option<&str>) -> Check {
+    match backend {
+        Some("copy") => Check::new(
+            "backend_speed",
+            Level::Warn,
+            crate::clone_backend::SLOW_WARNING,
+        )
+        .fix("put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS and set backend = \"auto\""),
+        Some(b) => Check::new("backend_speed", Level::Ok, format!("{b} clones share data")),
+        // `home` already reports an unusable back end.
+        None => Check::new("backend_speed", Level::Ok, "skipped: no usable back end"),
+    }
+}
+
+/// The ZFS checks of `mitosis zfs setup` for `dataset`: `zfs_tool`, `zfs_dataset`,
+/// `zfs_permissions` and `zfs_sudo`; each failure carries its fix.
+#[cfg(target_os = "linux")]
+pub fn zfs_checks(dataset: &str) -> Vec<Check> {
+    crate::clone_backend::zfs::probes(dataset)
+        .into_iter()
+        .map(|p| {
+            let level = match (p.ok, p.warn) {
+                (true, _) => Level::Ok,
+                (false, true) => Level::Warn,
+                (false, false) => Level::Fail,
+            };
+            let c = Check::new(p.name, level, p.detail);
+            match p.fix {
+                Some(f) => c.fix(f),
+                None => c,
+            }
+        })
+        .collect()
+}
+
+/// `zfs_checks` when the settings use ZFS (`backend = "zfs"`, or a `zfs_dataset` is set).
+#[cfg(target_os = "linux")]
+fn check_zfs(cfg: &Config) -> Vec<Check> {
+    match &cfg.zfs_dataset {
+        Some(ds) => zfs_checks(ds),
+        None if cfg.backend == crate::clone_backend::BackendKind::Zfs => vec![Check::new(
+            "zfs_dataset",
+            Level::Fail,
+            "backend = \"zfs\" needs zfs_dataset",
+        )
+        .fix("mitosis config set zfs_dataset <dataset>, for example tank/mitosis")],
+        None => Vec::new(),
+    }
 }
 
 fn check_permissions(home: &Home) -> Check {
@@ -657,7 +730,7 @@ async fn service_status() -> Option<service::ServiceStatus> {
 
 fn check_service(st: &Option<service::ServiceStatus>) -> Check {
     match st {
-        None => Check::new("service", Level::Warn, "could not ask launchd"),
+        None => Check::new("service", Level::Warn, "could not ask the service manager"),
         Some(s) if !s.installed => Check::new("service", Level::Ok, "not installed (optional)"),
         Some(s) if !s.binary_exists => {
             Check::new("service", Level::Warn, "its binary no longer exists")
@@ -665,7 +738,15 @@ fn check_service(st: &Option<service::ServiceStatus>) -> Check {
         }
         Some(s) if !s.loaded => Check::new("service", Level::Warn, "installed but not loaded")
             .fix("mitosis service install"),
-        Some(_) => Check::new("service", Level::Ok, "installed and loaded"),
+        Some(_) => match service::linger_hint() {
+            Some(hint) => Check::new(
+                "service",
+                Level::Warn,
+                "installed and loaded, but it stops when you log out",
+            )
+            .fix(hint),
+            None => Check::new("service", Level::Ok, "installed and loaded"),
+        },
     }
 }
 
@@ -988,10 +1069,9 @@ fn check_events(snap: &Snapshot) -> Check {
 
 fn check_postgres(installs: &[PgInstall]) -> Check {
     match installs.first() {
-        None => Check::new("postgres", Level::Fail, "no Postgres found").fix(format!(
-            "brew install postgresql@{}",
-            crate::pg::binaries::LATEST_PG_MAJOR
-        )),
+        None => Check::new("postgres", Level::Fail, "no Postgres found").fix(
+            crate::pg::binaries::install_hint(crate::pg::binaries::LATEST_PG_MAJOR),
+        ),
         Some(_) => Check::new(
             "postgres",
             Level::Ok,
@@ -1331,10 +1411,15 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     if fix {
         out.push(apply_fix(home).await);
     }
-    out.push(check_fs(home));
+    let loaded = Config::load(home);
+    let (home_check, backend) = check_fs(home, &loaded.clone().unwrap_or_default());
+    out.push(home_check);
+    out.push(check_backend_speed(backend));
+    #[cfg(target_os = "linux")]
+    out.extend(check_zfs(&loaded.clone().unwrap_or_default()));
     out.push(check_permissions(home));
 
-    let cfg = match Config::load(home) {
+    let cfg = match loaded {
         Ok(c) => {
             out.push(Check::new(
                 "config",

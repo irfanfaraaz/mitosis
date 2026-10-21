@@ -449,13 +449,17 @@ fn enum_values() {
         TemplateSource::Promoted {
             clone_id: "a1b2c3d4".into(),
         },
+        TemplateSource::Running {
+            dataset: "tank/pg".into(),
+        },
     ];
     for s in &sources {
         match s {
             TemplateSource::Url { .. }
             | TemplateSource::Basebackup { .. }
             | TemplateSource::Seed { .. }
-            | TemplateSource::Promoted { .. } => {}
+            | TemplateSource::Promoted { .. }
+            | TemplateSource::Running { .. } => {}
         }
     }
     let source_shapes: Map<String, Value> = sources
@@ -497,6 +501,7 @@ fn enum_values() {
                 events::ROUTER_FAILED,
                 events::GC,
                 events::RECOVERY,
+                events::GENERATION_KEPT,
             ],
             "event.detail.reason": [
                 events::reason::USER,
@@ -573,6 +578,7 @@ fn error_codes() {
     use ErrorCode::*;
     let all = [
         NotApfs,
+        BackendUnsupported,
         CrossVolume,
         ForeignHome,
         NoMatchingPostgres,
@@ -595,10 +601,11 @@ fn error_codes() {
     // Fails to compile when a code is added: add it to the list above.
     for c in all {
         match c {
-            NotApfs | CrossVolume | ForeignHome | NoMatchingPostgres | MissingExtension
-            | TemplateNotFound | TemplateBuildFailed | CloneNotFound | CapReached | BudgetFull
-            | LowDisk | PortsExhausted | PortInUse | PostgresStartFailed | AlreadyRunning
-            | DaemonUnavailable | ProtocolMismatch | InvalidRequest | Internal => {}
+            NotApfs | BackendUnsupported | CrossVolume | ForeignHome | NoMatchingPostgres
+            | MissingExtension | TemplateNotFound | TemplateBuildFailed | CloneNotFound
+            | CapReached | BudgetFull | LowDisk | PortsExhausted | PortInUse
+            | PostgresStartFailed | AlreadyRunning | DaemonUnavailable | ProtocolMismatch
+            | InvalidRequest | Internal => {}
         }
     }
     let mut codes: Vec<String> = all

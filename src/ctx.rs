@@ -1,4 +1,4 @@
-use crate::clone_backend::{same_volume, ApfsBackend, CloneBackend};
+use crate::clone_backend::{same_volume, select_backend, CloneBackend};
 pub use crate::config::Config;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::paths::Home;
@@ -37,7 +37,7 @@ pub struct Ctx {
     pub(crate) watching: Mutex<HashSet<String>>,
     /// Clone creation reads a template folder under the read guard; a template swap renames and
     /// removes folders under the write guard, so no clone copies a half-moved template. One lock
-    /// for all templates: the guarded work is a clonefile or a swap.
+    /// for all templates: the guarded work is a copy-on-write clone or a swap.
     pub(crate) template_swap: tokio::sync::RwLock<()>,
     /// Process groups of running seed commands and dump/restore pipes; killed on daemon shutdown.
     pub(crate) build_groups: Arc<Mutex<HashSet<i32>>>,
@@ -63,7 +63,18 @@ pub struct Ctx {
 impl Ctx {
     pub fn open(home: Home, config: Config) -> Result<Ctx> {
         home.ensure_dirs()?;
-        let backend: Arc<dyn CloneBackend> = Arc::new(ApfsBackend);
+        let backend: Arc<dyn CloneBackend> = select_backend(&home, &config)?;
+        Ctx::open_with_backend(home, config, backend)
+    }
+
+    /// `open` with a given back end instead of the one the settings pick (tests wrap it).
+    #[doc(hidden)]
+    pub fn open_with_backend(
+        home: Home,
+        config: Config,
+        backend: Arc<dyn CloneBackend>,
+    ) -> Result<Ctx> {
+        home.ensure_dirs()?;
         backend.check_supported(&home.root)?;
         if !same_volume(&home.templates_dir(), &home.clones_dir())? {
             return Err(MitosisError::new(
@@ -75,7 +86,7 @@ impl Ctx {
                 ),
             )
             .with_hint(
-                "keep templates/ and clones/ on the same APFS volume (no symlinks to other disks)",
+                "keep templates/ and clones/ on the same volume (no symlinks to other disks)",
             ));
         }
         let store = Store::open(&home.state_db())?;

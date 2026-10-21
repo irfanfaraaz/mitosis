@@ -1,3 +1,4 @@
+use crate::clone_backend::BackendKind;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::names::parse_duration;
 use crate::paths::Home;
@@ -35,6 +36,10 @@ pub struct Config {
     pub idle_sleep: Option<Duration>,
     /// An unnamed, unprotected clone idle for this long is destroyed; `None` (off) never.
     pub idle_reap: Option<Duration>,
+    /// Which clone back end to use; `auto` detects it from the file system. Chosen once at start.
+    pub backend: BackendKind,
+    /// The ZFS dataset Mitosis owns (for example `tank/mitosis`); `None` when not set.
+    pub zfs_dataset: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +61,8 @@ impl Default for Config {
             router_listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
             idle_sleep: Some(Duration::from_secs(600)),
             idle_reap: None,
+            backend: BackendKind::Auto,
+            zfs_dataset: None,
         }
     }
 }
@@ -98,7 +105,7 @@ struct KeySpec {
     example: &'static str,
 }
 
-const KEYS: [KeySpec; 11] = [
+const KEYS: [KeySpec; 13] = [
     KeySpec {
         key: "max_clones",
         env: "MITOSIS_MAX_CLONES",
@@ -164,6 +171,18 @@ const KEYS: [KeySpec; 11] = [
         env: "MITOSIS_IDLE_REAP",
         want: "a duration like 2h or 1d, or off",
         example: "1d",
+    },
+    KeySpec {
+        key: "backend",
+        env: "MITOSIS_BACKEND",
+        want: "auto, apfs, reflink, zfs or copy",
+        example: "auto",
+    },
+    KeySpec {
+        key: "zfs_dataset",
+        env: "MITOSIS_ZFS_DATASET",
+        want: "a ZFS dataset name like tank/mitosis, or empty for none",
+        example: "tank/mitosis",
     },
 ];
 
@@ -310,6 +329,9 @@ impl Config {
                 router: self.router,
                 router_port: self.router_port,
                 router_listen: self.router_listen,
+                // The back end is chosen once, when the daemon opens its context.
+                backend: self.backend,
+                zfs_dataset: self.zfs_dataset.clone(),
                 ..c
             })
     }
@@ -408,6 +430,13 @@ impl Config {
             "router_listen" => self.router_listen = parse_listen(v)?,
             "idle_sleep" => self.idle_sleep = parse_idle(v)?,
             "idle_reap" => self.idle_reap = parse_idle(v)?,
+            "backend" => self.backend = v.parse().ok()?,
+            "zfs_dataset" => {
+                if v.contains(char::is_whitespace) {
+                    return None;
+                }
+                self.zfs_dataset = (!v.is_empty()).then(|| v.to_string());
+            }
             _ => return None,
         }
         Some(())
@@ -429,6 +458,8 @@ impl Config {
                 .idle_sleep
                 .map_or("off".into(), format_setting_duration),
             "idle_reap" => self.idle_reap.map_or("off".into(), format_setting_duration),
+            "backend" => self.backend.as_str().to_string(),
+            "zfs_dataset" => self.zfs_dataset.clone().unwrap_or_default(),
             _ => String::new(),
         }
     }
@@ -550,6 +581,41 @@ mod tests {
         assert_eq!(c.router_listen.to_string(), "127.0.0.1");
         assert_eq!(c.idle_sleep, Some(Duration::from_secs(600)));
         assert_eq!(c.idle_reap, None);
+    }
+
+    #[test]
+    fn backend_key_parses_all_values_and_rejects_others() {
+        let (_tmp, home) = home();
+        for v in ["auto", "apfs", "reflink", "zfs", "copy"] {
+            let env = |k: &str| (k == "MITOSIS_BACKEND").then(|| v.to_string());
+            assert_eq!(entry(&home, &env, "backend").0, v);
+        }
+        let env = |k: &str| (k == "MITOSIS_BACKEND").then(|| "btrfs".to_string());
+        let e = Config::default().layered(&home, &env).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(e.message.starts_with("MITOSIS_BACKEND"), "{e}");
+        assert!(
+            e.message.contains("auto, apfs, reflink, zfs or copy"),
+            "{e}"
+        );
+        assert!(Config::set_in_file(&home, "backend", "btrfs").is_err());
+        Config::set_in_file(&home, "backend", "copy").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(c.backend, BackendKind::Copy);
+    }
+
+    #[test]
+    fn zfs_dataset_defaults_empty() {
+        let (_tmp, home) = home();
+        assert_eq!(Config::default().zfs_dataset, None);
+        assert_eq!(entry(&home, &no_env, "zfs_dataset").0, "");
+        Config::set_in_file(&home, "zfs_dataset", "tank/mitosis").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(c.zfs_dataset.as_deref(), Some("tank/mitosis"));
+        assert!(Config::set_in_file(&home, "zfs_dataset", "tank mitosis").is_err());
+        Config::set_in_file(&home, "zfs_dataset", "").unwrap();
+        let (c, _) = Config::default().layered(&home, &no_env).unwrap();
+        assert_eq!(c.zfs_dataset, None);
     }
 
     #[test]

@@ -12,7 +12,9 @@ use crate::state::{CloneRow, CloneStatus};
 use crate::templates::{
     folder_stem, is_build_socket_name, now, parse_gen_dir, parse_leftover, Leftover,
 };
+#[cfg(target_os = "macos")]
 use nix::errno::Errno;
+#[cfg(target_os = "macos")]
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -27,6 +29,7 @@ const START_SLACK: u64 = 1;
 const STARTING_WAIT: Duration = Duration::from_secs(60);
 const DESTROY_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often a parent watcher wakes to check that its clone still exists.
+#[cfg(target_os = "macos")]
 const WATCH_RECHECK: Duration = Duration::from_secs(30);
 /// gc drops a branch template no clone uses after this long without a `clone --branch` for it.
 const BRANCH_UNUSED_SECS: i64 = 14 * 86_400;
@@ -282,6 +285,7 @@ fn still_watched(ctx: &Ctx, id: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Registers a NOTE_EXIT watch on `pid`; `None` when the pid is already gone.
 fn register_exit(pid: i32) -> nix::Result<Option<Kqueue>> {
     let kq = Kqueue::new()?;
@@ -302,7 +306,23 @@ fn register_exit(pid: i32) -> nix::Result<Option<Kqueue>> {
 }
 
 /// Blocks until the parent exits (true), or until the clone no longer needs watching (false).
+/// Linux has no kqueue: this polls once a second.
+#[cfg(not(target_os = "macos"))]
+fn wait_for_parent_exit(watch: &Watch, pid: i32, start_time: Option<u64>) -> bool {
+    loop {
+        if !parent_alive(pid, start_time) {
+            return true;
+        }
+        if !still_watched(&watch.ctx, &watch.id) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Blocks until the parent exits (true), or until the clone no longer needs watching (false).
 /// Uses kqueue, waking every `WATCH_RECHECK`; polls once a second if kqueue is unavailable.
+#[cfg(target_os = "macos")]
 fn wait_for_parent_exit(watch: &Watch, pid: i32, start_time: Option<u64>) -> bool {
     let mut kq = match register_exit(pid) {
         Ok(None) => return true,
@@ -421,6 +441,7 @@ pub async fn reconcile_deferred(ctx: Arc<Ctx>, now: i64) -> Result<(GcReport, Ve
     // Before the orphan pass, which then removes the dropped templates' generation folders.
     drop_branch_templates(&ctx, now, &mut report).await;
     remove_orphans(&ctx, &mut report).await;
+    emit_kept(&ctx);
     drop_unused_reservations(&ctx, now);
     events::emit(
         &ctx,
@@ -891,6 +912,7 @@ fn remove_path(path: &Path) -> Result<()> {
 async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     let install = install_for(ctx, &dir);
     let timeout = ctx.config().stop_timeout;
+    let backend = ctx.backend.clone();
     tokio::task::spawn_blocking(move || {
         // No row, so the server (if any) is the process whose cwd is this folder.
         if running_server(&dir, None)?.is_some() {
@@ -902,10 +924,33 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
             })?;
             stop(&install, &dir, None, timeout)?;
         }
-        remove_path(&dir)
+        // A stray file under a clone or generation name is not the back end's.
+        if dir.is_dir() {
+            backend.remove_dir(&dir)
+        } else {
+            remove_path(&dir)
+        }
     })
     .await
     .map_err(|e| internal(format!("background task failed: {e}")))?
+}
+
+/// One `template.generation_kept` event per folder the back end left in place because clones of it
+/// still exist (ZFS snapshots with clones); gc tries each again on its next run.
+pub(crate) fn emit_kept(ctx: &Ctx) {
+    for dir in ctx.backend.take_kept() {
+        log(
+            ctx,
+            &format!("gc: kept {}: clones still depend on it", dir.display()),
+        );
+        events::emit(
+            ctx,
+            events::GENERATION_KEPT,
+            None,
+            None,
+            serde_json::json!({ "reason": "clones_depend", "dir": dir.display().to_string() }),
+        );
+    }
 }
 
 /// Leaves an entry gc does not recognise alone, with one log line.
@@ -1047,9 +1092,12 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
                 Ok(dirs) if file.as_ref().is_some_and(|f| dirs.contains(f)) => continue,
                 Ok(_) => {
                     let trash = templates_dir.join(format!("{GC_TRASH}{}", random_hex(4)));
-                    std::fs::rename(&path, &trash)
+                    ctx.backend
+                        .rename_dir(&path, &trash)
                         .map(|()| trash)
-                        .map_err(|e| internal(format!("move {} aside: {e}", path.display())))
+                        .map_err(|e| {
+                            internal(format!("move {} aside: {}", path.display(), e.message))
+                        })
                 }
                 Err(e) => Err(e),
             }
@@ -1178,7 +1226,7 @@ fn restore_old_templates(
             continue;
         }
         let old = &leftovers[i].1;
-        match std::fs::rename(old, &final_dir) {
+        match ctx.backend.rename_dir(old, &final_dir) {
             Ok(()) => {
                 drop(building);
                 log(
@@ -1213,10 +1261,10 @@ mod tests {
     use crate::paths::Home;
 
     fn tmp_ctx() -> (tempfile::TempDir, Arc<Ctx>) {
-        // Under /tmp: short paths, on APFS.
+        // Under /tmp: short paths, on the default back end.
         let tmp = tempfile::Builder::new()
             .prefix("mt")
-            .tempdir_in("/tmp")
+            .tempdir_in(crate::paths::test_tmp())
             .unwrap();
         let ctx = Ctx::open(
             Home::at(tmp.path().to_path_buf()),

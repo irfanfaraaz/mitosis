@@ -1,9 +1,9 @@
 [package]
 name = "mitosis-db"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Copy-on-write Postgres clones for AI agent tasks on macOS APFS"
+description = "Copy-on-write Postgres clones for AI agent tasks on macOS (APFS) and Linux (Btrfs, XFS, ZFS)"
 repository = "https://github.com/irfanfaraaz/mitosis"
 homepage = "https://github.com/irfanfaraaz/mitosis"
 readme = "README.md"

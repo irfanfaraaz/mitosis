@@ -1,5 +1,5 @@
 //! Promote: turn a running clone into a new generation of a template. The clone's Postgres is
-//! stopped cleanly, its folder is copied with clonefile, and the clone is started again on the same
+//! stopped cleanly, its folder is copied with a copy-on-write clone, and the clone is started again on the same
 //! port, socket and password, so its URL keeps working (open connections are dropped).
 
 use crate::clones::{mark, stop_and_remove};
@@ -233,7 +233,7 @@ async fn run(
         .join(build_dir_name(name, built_at));
     let (b, src, dst) = (ctx.backend.clone(), clone.dir.clone(), side.clone());
     let copied = blocking(move || {
-        b.clone_dir(&src, &dst)?;
+        b.copy_dir(&src, &dst)?;
         for file in ["postmaster.pid", "postmaster.opts"] {
             match std::fs::remove_file(dst.join(file)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
@@ -244,8 +244,8 @@ async fn run(
     })
     .await;
     if copied.is_err() {
-        let s = side.clone();
-        let _ = blocking(move || Ok(std::fs::remove_dir_all(&s)?)).await;
+        let (b, s) = (ctx.backend.clone(), side.clone());
+        let _ = blocking(move || b.remove_dir(&s)).await;
     }
 
     // Committed before the clone restarts: a kill after this point cannot lose the promoted data,

@@ -278,7 +278,7 @@ async fn failed_background_build_sets_last_error_and_keeps_current() {
 async fn crashed_build_leaves_no_generation() {
     let tmp = tmp_home();
     let home = || Home::at(tmp.path().to_path_buf());
-    let ctx = Arc::new(Ctx::open(home(), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(home(), test_config()).unwrap());
     let gen1 = ctx.home.templates_dir().join("main@1");
     std::fs::create_dir(&gen1).unwrap();
     {
@@ -324,7 +324,7 @@ async fn crashed_build_leaves_no_generation() {
     std::fs::write(side.join("PG_VERSION"), "16\n").unwrap();
     drop(ctx); // the daemon dies mid-build
 
-    let ctx = Arc::new(Ctx::open(home(), Config::default()).unwrap());
+    let ctx = Arc::new(Ctx::open(home(), test_config()).unwrap());
     let report = reconcile(ctx.clone(), now()).await.unwrap();
     assert!(report.orphan_folders_removed.contains(&side), "{report:?}");
     assert!(side_folders(&ctx).is_empty());

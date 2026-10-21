@@ -269,6 +269,9 @@
                 "layered"
               ]
             },
+            "--from-running": {
+              "takes_value": true
+            },
             "--from-url": {
               "takes_value": true
             },
@@ -422,6 +425,19 @@
           "index": 1,
           "required": true,
           "takes_value": true
+        }
+      }
+    },
+    "zfs": {
+      "subcommands": {
+        "setup": {
+          "args": {
+            "<dataset>": {
+              "index": 1,
+              "required": true,
+              "takes_value": true
+            }
+          }
         }
       }
     }

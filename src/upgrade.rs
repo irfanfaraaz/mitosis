@@ -1,5 +1,5 @@
 //! Template upgrade: moves a template's current generation to a newer Postgres major with
-//! `pg_upgrade --clone`. The current generation is copied (clonefile) into side folder A, a new
+//! `pg_upgrade --clone`. The current generation is copied (copy-on-write clone) into side folder A, a new
 //! cluster B is made with the target's `initdb` (same encoding, locale and checksums as A), and
 //! `pg_upgrade` fills B from A. B becomes an `Upgraded` generation of the same template, or
 //! generation 1 of a new one (`--as`). The source generation is never touched.
@@ -79,7 +79,11 @@ pub async fn upgrade(
                 target.bin_dir.display()
             ),
         )
-        .with_hint(format!("brew reinstall postgresql@{to}")));
+        .with_hint(if cfg!(target_os = "macos") {
+            format!("brew reinstall postgresql@{to}")
+        } else {
+            format!("sudo apt install --reinstall postgresql-{to}")
+        }));
     }
     let (t, ext) = (target.clone(), cur.extensions.clone());
     blocking(move || check_extensions(&t, &ext)).await?;
@@ -198,10 +202,11 @@ async fn run(
     }
     let cleaned = {
         let (a, tmp, s) = (work.a.clone(), work.tmp.clone(), work.socket_dir.clone());
+        let backend = ctx.backend.clone();
         blocking(move || {
             remove(&tmp)?;
             let _ = std::fs::remove_dir(&s);
-            remove(&a)
+            backend.remove_dir(&a)
         })
         .await
     };
@@ -276,7 +281,7 @@ async fn steps(
         // A commit or prune moves generation folders only under the write guard.
         let _swap = ctx.template_swap.read().await;
         let (b, f, d) = (ctx.backend.clone(), cur.dir.clone(), work.a.clone());
-        blocking(move || b.clone_dir(&f, &d))
+        blocking(move || b.copy_dir(&f, &d))
             .await
             .map_err(at("copy"))?;
     }
@@ -286,8 +291,11 @@ async fn steps(
     std::fs::create_dir_all(&work.tmp).map_err(|e| ("pg_upgrade", e.into()))?;
     for mode in ["--clone", "--copy"] {
         let (t, b, s) = (target.clone(), work.b.clone(), settings.clone());
+        let backend = ctx.backend.clone();
         blocking(move || {
-            remove(&b)?;
+            // The new generation's folder is made by the back end (a dataset on ZFS).
+            backend.remove_dir(&b)?;
+            backend.create_dir(&b)?;
             initdb_like(&t, &b, &s)
         })
         .await
@@ -324,8 +332,7 @@ async fn steps(
                 _ => Ok(()),
             };
         }
-        let lower = out.text.to_lowercase();
-        if mode == "--clone" && lower.contains("clon") && lower.contains("not supported") {
+        if mode == "--clone" && clone_refused(&out.text) {
             append_log(
                 &work.log,
                 "mitosis: file cloning not supported, retrying with --copy",
@@ -335,6 +342,14 @@ async fn steps(
         return Err(("pg_upgrade", internal("pg_upgrade failed")));
     }
     Err(("pg_upgrade", internal("pg_upgrade failed")))
+}
+
+/// True when pg_upgrade `--clone` failed only because the files cannot be cloned: the file system
+/// lacks it, or (ZFS) A and B are separate datasets ("Invalid cross-device link").
+fn clone_refused(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("could not clone file")
+        || (lower.contains("clon") && lower.contains("not supported"))
 }
 
 /// What `initdb` of the new cluster must match for `pg_upgrade` to accept it.
@@ -567,6 +582,7 @@ fn log_tail(log: &Path, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Removes the pg_upgrade work folder in `logs/` (not a clone or generation folder).
 fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -587,6 +603,7 @@ async fn fail(
     append_log(&work.log, &format!("mitosis: {step} failed: {e}"));
     let tail = redact(&log_tail(&work.log, 20));
     let (o, t, timeout) = (old.clone(), target.clone(), ctx.config().stop_timeout);
+    let backend = ctx.backend.clone();
     let (a, b, tmp, sock) = (
         work.a.clone(),
         work.b.clone(),
@@ -596,7 +613,7 @@ async fn fail(
     let cleanup = blocking(move || {
         let mut errors = Vec::new();
         for (install, dir) in [(&o, &a), (&t, &b)] {
-            let res = stop(install, dir, None, timeout).and_then(|()| remove(dir));
+            let res = stop(install, dir, None, timeout).and_then(|()| backend.remove_dir(dir));
             if let Err(e) = res {
                 errors.push(format!("{}: {e}", dir.display()));
             }
@@ -634,6 +651,15 @@ mod tests {
             locale: locale.map(String::from),
             checksums,
         }
+    }
+
+    #[test]
+    fn clone_refusals_fall_back_to_copy() {
+        assert!(clone_refused(
+            "could not clone file between old and new data directories: Invalid cross-device link"
+        ));
+        assert!(clone_refused("file cloning not supported on this platform"));
+        assert!(!clone_refused("old cluster does not use data checksums"));
     }
 
     #[test]

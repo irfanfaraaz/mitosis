@@ -3,10 +3,11 @@
 //!
 //! Source: the `theseus-rs/postgresql-binaries` GitHub releases. Checked by reading the release
 //! list on 2026-10-20 (nothing downloaded):
-//! - Tags are `<pg major>.<pg minor>.<build>`, e.g. `17.9.1`. Majors 14 to 18 are built for macOS;
+//! - Tags are `<pg major>.<pg minor>.<build>`, e.g. `17.9.1`. Majors 14 to 18 are built for macOS and Linux;
 //!   a minor can have several builds (`17.9.0`, `17.9.1`), and the newest is taken.
 //! - Per release and target there is `postgresql-<tag>-<target>.tar.gz` plus `.sha256`, for both
-//!   `aarch64-apple-darwin` and `x86_64-apple-darwin`. Also `.manifest.json`, `.provenance.json`,
+//!   `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu` and
+//!   `x86_64-unknown-linux-gnu` (Linux assets checked 2026-10-21 for majors 14 to 18). Also `.manifest.json`, `.provenance.json`,
 //!   `.sbom-attestation.json` and `.spdx.json`, which are not used here.
 //! - The `.sha256` file is one line, `<64 hex>  <asset file name>` (sha256sum format, ~112 bytes).
 //! - URL shape: `<base>/download/<tag>/<asset>`; GitHub redirects it to a CDN, which ureq follows.
@@ -66,10 +67,11 @@ pub struct ManagedInstall {
 }
 
 pub fn target_triple() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "aarch64-apple-darwin"
-    } else {
-        "x86_64-apple-darwin"
+    match (cfg!(target_os = "linux"), cfg!(target_arch = "aarch64")) {
+        (true, true) => "aarch64-unknown-linux-gnu",
+        (true, false) => "x86_64-unknown-linux-gnu",
+        (false, true) => "aarch64-apple-darwin",
+        (false, false) => "x86_64-apple-darwin",
     }
 }
 
@@ -593,6 +595,22 @@ mod tests {
             "https://x/releases/download/17.9.1/a.tar.gz"
         );
         assert!(asset_name("17.9.1").starts_with("postgresql-17.9.1-"));
+        #[cfg(target_os = "macos")]
         assert!(asset_name("17.9.1").ends_with("-apple-darwin.tar.gz"));
+    }
+
+    #[test]
+    fn target_triple_matches_os() {
+        let t = target_triple();
+        if cfg!(target_os = "linux") {
+            assert!(t.ends_with("-unknown-linux-gnu"));
+        } else {
+            assert!(t.ends_with("-apple-darwin"));
+        }
+        assert!(t.starts_with(if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        }));
     }
 }

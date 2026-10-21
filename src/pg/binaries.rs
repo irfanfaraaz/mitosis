@@ -39,7 +39,7 @@ pub(crate) fn version_key(version: &str) -> Vec<u32> {
 }
 
 /// Expands `<parent>/<prefix>*/<suffix>`; missing parents yield nothing.
-fn glob_dirs(parent: &str, prefix: &str, suffix: &str) -> Vec<PathBuf> {
+fn glob_dirs(parent: impl AsRef<Path>, prefix: &str, suffix: &str) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(parent) else {
         return vec![];
     };
@@ -49,24 +49,46 @@ fn glob_dirs(parent: &str, prefix: &str, suffix: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn candidates() -> Vec<PathBuf> {
+/// The fixed system folders, under `root` (`/` in real use; a temp folder in tests).
+fn candidates_in(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for root in ["/opt/homebrew/opt", "/usr/local/opt"] {
-        out.extend(glob_dirs(root, "postgresql@", "bin"));
-        out.push(Path::new(root).join("postgresql/bin"));
+    for prefix in ["opt/homebrew/opt", "usr/local/opt"] {
+        let dir = root.join(prefix);
+        out.extend(glob_dirs(&dir, "postgresql@", "bin"));
+        out.push(dir.join("postgresql/bin"));
     }
-    out.extend(glob_dirs(
-        "/Applications/Postgres.app/Contents/Versions",
-        "",
-        "bin",
-    ));
-    if let Ok(home) = std::env::var("HOME") {
+    if cfg!(target_os = "macos") {
         out.extend(glob_dirs(
-            &format!("{home}/.asdf/installs/postgres"),
+            root.join("Applications/Postgres.app/Contents/Versions"),
             "",
             "bin",
         ));
-        out.extend(glob_dirs(&format!("{home}/.pgenv"), "pgsql-", "bin"));
+    }
+    if cfg!(target_os = "linux") {
+        // apt/PGDG: /usr/lib/postgresql/<N>/bin; dnf/PGDG: /usr/pgsql-<N>/bin.
+        out.extend(glob_dirs(root.join("usr/lib/postgresql"), "", "bin"));
+        out.extend(glob_dirs(root.join("usr"), "pgsql-", "bin"));
+    }
+    out
+}
+
+fn candidates() -> Vec<PathBuf> {
+    let mut out = candidates_in(Path::new("/"));
+    if let Ok(home) = std::env::var("HOME") {
+        out.extend(glob_dirs(
+            format!("{home}/.asdf/installs/postgres"),
+            "",
+            "bin",
+        ));
+        out.extend(glob_dirs(format!("{home}/.pgenv"), "pgsql-", "bin"));
+    }
+    if cfg!(target_os = "linux") {
+        if let Ok(o) = Command::new("pg_config").arg("--bindir").output() {
+            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if o.status.success() && !dir.is_empty() {
+                out.push(PathBuf::from(dir));
+            }
+        }
     }
     if let Some(path) = std::env::var_os("PATH") {
         out.extend(std::env::split_paths(&path).filter(|d| d.join("postgres").is_file()));
@@ -150,17 +172,28 @@ pub fn find_major(installs: &[PgInstall], major: u32) -> Result<&PgInstall> {
             ErrorCode::NoMatchingPostgres,
             format!("no Postgres {major} found"),
         )
-        .with_hint(format!("brew install postgresql@{major}"))
+        .with_hint(install_hint(major))
     })
 }
 
 /// Newest Postgres major; used only for the install hint when none is found.
 pub const LATEST_PG_MAJOR: u32 = 18;
 
+/// The package-manager command that installs Postgres `major` on this OS.
+pub fn install_hint(major: u32) -> String {
+    if cfg!(target_os = "macos") {
+        format!("brew install postgresql@{major}")
+    } else if Path::new("/usr/bin/dnf").exists() {
+        format!("sudo dnf install postgresql{major}-server")
+    } else {
+        format!("sudo apt install postgresql-{major}")
+    }
+}
+
 pub fn newest(installs: &[PgInstall]) -> Result<&PgInstall> {
     installs.first().ok_or_else(|| {
         MitosisError::new(ErrorCode::NoMatchingPostgres, "no Postgres found")
-            .with_hint(format!("brew install postgresql@{LATEST_PG_MAJOR}"))
+            .with_hint(install_hint(LATEST_PG_MAJOR))
     })
 }
 
@@ -222,6 +255,17 @@ pub fn check_extensions(install: &PgInstall, extensions: &[String]) -> Result<()
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_candidates_include_apt_and_dnf_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib/postgresql/16/bin")).unwrap();
+        std::fs::create_dir_all(root.path().join("usr/pgsql-15/bin")).unwrap();
+        let c = candidates_in(root.path());
+        assert!(c.contains(&root.path().join("usr/lib/postgresql/16/bin")));
+        assert!(c.contains(&root.path().join("usr/pgsql-15/bin")));
+    }
+
     #[test]
     fn parses_versions() {
         assert_eq!(
@@ -249,10 +293,18 @@ mod tests {
         let e = find_major(&[], 16).unwrap_err();
         assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
         assert_eq!(e.message, "no Postgres 16 found");
-        assert_eq!(e.hint.as_deref(), Some("brew install postgresql@16"));
+        assert_eq!(e.hint, Some(install_hint(16)));
         let e = newest(&[]).unwrap_err();
         assert_eq!(e.code, ErrorCode::NoMatchingPostgres);
-        assert_eq!(e.hint.as_deref(), Some("brew install postgresql@18"));
+        assert_eq!(e.hint, Some(install_hint(18)));
+        let want = if cfg!(target_os = "macos") {
+            "brew install postgresql@16"
+        } else if Path::new("/usr/bin/dnf").exists() {
+            "sudo dnf install postgresql16-server"
+        } else {
+            "sudo apt install postgresql-16"
+        };
+        assert_eq!(install_hint(16), want);
     }
 
     #[test]
