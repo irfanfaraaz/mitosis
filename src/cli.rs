@@ -858,7 +858,21 @@ fn zfs_setup(dataset: &str) -> Result<ExitCode> {
     use crate::clone_backend::zfs;
     zfs::check_dataset_name(dataset)?;
     let bin = zfs::which_zfs().unwrap_or_else(|| "/usr/sbin/zfs".into());
-    print!("{}", zfs::setup_text(&zfs::current_user(), dataset, &bin));
+    let mount_root = match zfs::ZfsBackend::new(dataset) {
+        Ok(b) => b.mount_root().to_path_buf(),
+        Err(e) => {
+            // ZFS's default mountpoint for a dataset.
+            let guess = std::path::PathBuf::from(format!("/{dataset}"));
+            eprintln!(
+                "note: could not read the mountpoint of {dataset} ({}); assuming {}",
+                e.message,
+                guess.display()
+            );
+            guess
+        }
+    };
+    let user = zfs::current_user();
+    print!("{}", zfs::setup_text(&user, dataset, &mount_root, &bin));
     println!();
     println!("Checks (run this again once the admin is done):");
     let checks = doctor::zfs_checks(dataset);

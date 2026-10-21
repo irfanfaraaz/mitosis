@@ -277,7 +277,7 @@ async fn steps(
         // A commit or prune moves generation folders only under the write guard.
         let _swap = ctx.template_swap.read().await;
         let (b, f, d) = (ctx.backend.clone(), cur.dir.clone(), work.a.clone());
-        blocking(move || b.clone_dir(&f, &d))
+        blocking(move || b.copy_dir(&f, &d))
             .await
             .map_err(at("copy"))?;
     }

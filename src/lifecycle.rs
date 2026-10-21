@@ -935,7 +935,7 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     .map_err(|e| internal(format!("background task failed: {e}")))?
 }
 
-/// One `generation_kept` event per folder the back end left in place because clones of it
+/// One `template.generation_kept` event per folder the back end left in place because clones of it
 /// still exist (ZFS snapshots with clones); gc tries each again on its next run.
 pub(crate) fn emit_kept(ctx: &Ctx) {
     for dir in ctx.backend.take_kept() {

@@ -13,10 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New config keys `backend` (`auto`, `apfs`, `reflink`, `zfs` or `copy`; default `auto`) and `zfs_dataset`, with the environment variables `MITOSIS_BACKEND` and `MITOSIS_ZFS_DATASET`. `auto` keeps choosing APFS on macOS, so 1.0 homes open unchanged.
 - New error code `backend_unsupported`: no clone back end works for the file system or the `backend` setting.
 - `mitosis doctor`'s `home` check names the active back end.
-- ZFS back end (Linux): each template generation is a dataset under `zfs_dataset` and each clone a `zfs clone` of the generation's one `@mitosis` snapshot, mounted at the same paths as before. `auto` picks it when `zfs_dataset` is set and its mountpoint holds `MITOSIS_HOME`. Mount, unmount, mountpoint, canmount and rename run as `sudo -n zfs ...`; Mitosis never waits for a password and never runs `zfs promote` or `zfs destroy -R`.
-- New command `mitosis zfs setup <dataset>`: prints the `zfs allow` line and the `/etc/sudoers.d/mitosis` rule an admin installs once, then checks them. It never runs sudo itself.
-- `mitosis doctor` checks `zfs_tool`, `zfs_dataset`, `zfs_permissions` and `zfs_sudo` when the settings use ZFS.
-- New event kind `generation_kept` (`detail.reason`: `clones_depend`): gc left a folder in place because clones of it still exist, and tries again on its next run.
+- ZFS back end (Linux): each template generation is a dataset under `zfs_dataset` and each clone a `zfs clone` of the generation's one `@mitosis` snapshot, mounted at the same paths as before. `auto` picks it when `zfs_dataset` is set and its mountpoint holds `MITOSIS_HOME`. Datasets mount again at boot (`canmount=on`). Generations made from a generation or a clone (layered builds, promote, upgrade) are full copies in their own dataset, so they never pin their source. Mount, unmount, mountpoint, canmount and rename run as `sudo -n zfs ...`; Mitosis never waits for a password and never runs `zfs promote` or `zfs destroy -R`.
+- New command `mitosis zfs setup <dataset>`: prints the `zfs allow` and `zfs set setuid=off devices=off` lines and the `/etc/sudoers.d/mitosis` rule (mountpoints limited to the dataset's own mountpoint) an admin installs once, then checks them. It never runs sudo itself.
+- `mitosis doctor` checks `zfs_tool`, `zfs_dataset` (warns when `setuid` or `devices` is on), `zfs_permissions` and `zfs_sudo` when the settings use ZFS.
+- New event kind `template.generation_kept` (`detail.reason`: `clones_depend`): gc left a folder in place because clones of it still exist, and tries again on its next run.
 
 ## [1.0.0] - 2026-10-20
 

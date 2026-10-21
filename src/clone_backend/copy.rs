@@ -46,7 +46,8 @@ impl CloneBackend for CopyBackend {
     }
 }
 
-fn copy_file(src: &Path, dst: &Path, md: &Metadata) -> Result<()> {
+/// Also the file copy of the ZFS back end's `copy_dir`.
+pub(super) fn copy_file(src: &Path, dst: &Path, md: &Metadata) -> Result<()> {
     let mut s = File::open(src).map_err(|e| io_error("open", src, e))?;
     let mut d = create_dst(dst, md)?;
     std::io::copy(&mut s, &mut d).map_err(|e| io_error("copy", src, e))?;

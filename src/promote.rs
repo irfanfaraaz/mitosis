@@ -233,7 +233,7 @@ async fn run(
         .join(build_dir_name(name, built_at));
     let (b, src, dst) = (ctx.backend.clone(), clone.dir.clone(), side.clone());
     let copied = blocking(move || {
-        b.clone_dir(&src, &dst)?;
+        b.copy_dir(&src, &dst)?;
         for file in ["postmaster.pid", "postmaster.opts"] {
             match std::fs::remove_file(dst.join(file)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),

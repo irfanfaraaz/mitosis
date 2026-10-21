@@ -6,7 +6,8 @@
 //! those steps run as `sudo -n zfs ...` under the sudoers rule `mitosis zfs setup` prints. `-n`
 //! means sudo never waits for a password: a refusal is `backend_unsupported` with the fix.
 
-use super::{fs_remove_dir, fs_rename_dir, unsupported, CloneBackend};
+use super::copy::copy_file;
+use super::{fill_tree, fs_remove_dir, fs_rename_dir, unsupported, CloneBackend};
 use crate::error::{ErrorCode, MitosisError, Result};
 use std::collections::HashSet;
 use std::fs::Permissions;
@@ -24,7 +25,7 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT: &str = "mitosis";
 /// What `zfs allow` must give the user. `mount` is listed because zfs-allow(8) requires it for
 /// create, clone and destroy, even though only root can actually mount on Linux.
-pub const DELEGATED: &str = "create,destroy,mount,snapshot,clone,send,receive,canmount,mountpoint";
+pub const DELEGATED: &str = "create,destroy,mount,snapshot,clone,canmount,mountpoint";
 
 pub fn setup_hint(dataset: &str) -> String {
     format!("run \"mitosis zfs setup {dataset}\" and give the printed lines to an admin")
@@ -76,6 +77,28 @@ impl ZfsBackend {
     /// True when `path` is under the dataset's mountpoint.
     pub fn contains(&self, path: &Path) -> bool {
         path.starts_with(&self.mount_root)
+    }
+
+    /// Where `root` is mounted.
+    pub fn mount_root(&self) -> &Path {
+        &self.mount_root
+    }
+
+    /// The `mountpoint=<path>` argument for a root `zfs set`: only an absolute path under
+    /// `mount_root` with no `..` in it, so the sudo rule is never used to mount elsewhere.
+    fn mountpoint_arg(&self, path: &Path) -> Result<String> {
+        let ok = path.is_absolute()
+            && !path.components().any(|c| c == Component::ParentDir)
+            && path.starts_with(&self.mount_root)
+            && path != self.mount_root.as_path();
+        if !ok {
+            return Err(internal(format!(
+                "refusing to mount a dataset at {}: not a folder under {}",
+                path.display(),
+                self.mount_root.display()
+            )));
+        }
+        Ok(format!("mountpoint={}", path.display()))
     }
 
     /// The dataset for `path`: `root` plus the path relative to `mount_root`, `/`-joined. Bytes
@@ -196,15 +219,20 @@ impl ZfsBackend {
     }
 
     /// Mounts `ds` at `path` (both steps need root on Linux).
+    /// Mounts `ds` at `path` (these steps need root on Linux). It is made with `canmount=noauto`
+    /// so nothing mounts it before its mountpoint is set; `canmount=on` afterwards makes it mount
+    /// again at boot.
     fn mount_at(&self, ds: &str, path: &Path) -> Result<()> {
-        let mp = format!("mountpoint={}", path.display());
+        let mp = self.mountpoint_arg(path)?;
         self.run_zfs(&["set", &mp, ds], true)?;
         self.run_zfs(&["mount", ds], true)?;
+        self.run_zfs(&["set", "canmount=on", ds], true)?;
         Ok(())
     }
 
-    /// Destroys a dataset this call just made and could not mount, so a retry starts clean.
+    /// Removes a dataset this call just made and could not finish, so a retry starts clean.
     fn discard(&self, ds: &str) {
+        let _ = self.run_zfs(&["unmount", ds], true);
         let _ = self.run_zfs(&["destroy", ds], false);
     }
 
@@ -251,8 +279,26 @@ impl CloneBackend for ZfsBackend {
         self.mount_at(&dst_ds, dst).inspect_err(|_| self.discard(&dst_ds))
     }
 
+    /// A new dataset with a full copy of the files: a generation made from another generation or
+    /// from a clone must not depend on its source's snapshot, or the source could never be
+    /// destroyed. With ZFS block cloning on, the copy shares blocks anyway.
+    fn copy_dir(&self, src: &Path, dst: &Path) -> Result<()> {
+        if std::fs::symlink_metadata(dst).is_ok() {
+            return Err(internal(format!(
+                "copy {} -> {}: destination exists",
+                src.display(),
+                dst.display()
+            )));
+        }
+        self.create_dir(dst)?;
+        fill_tree(src, dst, &copy_file).inspect_err(|_| {
+            let _ = self.remove_dir(dst);
+        })
+    }
+
     fn create_dir(&self, path: &Path) -> Result<()> {
         let ds = self.dataset(path)?;
+        self.mountpoint_arg(path)?;
         self.ensure_parents(&ds)?;
         self.run_zfs(&["create", "-o", "canmount=noauto", &ds], false)?;
         self.mount_at(&ds, path).inspect_err(|_| self.discard(&ds))?;
@@ -306,9 +352,9 @@ impl CloneBackend for ZfsBackend {
         if !self.exists(&a)? {
             return fs_rename_dir(from, to);
         }
+        let mp = self.mountpoint_arg(to)?;
         self.ensure_parents(&b)?;
         self.run_zfs(&["rename", &a, &b], true)?;
-        let mp = format!("mountpoint={}", to.display());
         self.run_zfs(&["set", &mp, &b], true)?;
         let _ = std::fs::remove_dir(from); // the old, now empty mountpoint folder
         Ok(())
@@ -431,23 +477,25 @@ pub fn current_user() -> String {
         .unwrap_or_else(|| "<user>".into())
 }
 
-/// What `mitosis zfs setup` prints: the `zfs allow` line and the sudoers rule an admin installs
-/// once for `user` and `dataset`, with `zfs` at its real path.
-pub fn setup_text(user: &str, dataset: &str, zfs: &Path) -> String {
-    let z = zfs.display();
-    let d = dataset;
+/// What `mitosis zfs setup` prints: the `zfs allow` and `zfs set` lines and the sudoers rule an
+/// admin installs once for `user` and `dataset` (mounted at `mount_root`), with `zfs` at its
+/// real path.
+pub fn setup_text(user: &str, dataset: &str, mount_root: &Path, zfs: &Path) -> String {
+    let (z, d, m) = (zfs.display(), dataset, mount_root.display());
     [
         "# Run these once as root. Mitosis never runs them itself.".to_string(),
         String::new(),
-        format!("# 1. Delegate the dataset work to {user}:"),
+        format!("# 1. Delegate the dataset work to {user}, with no setuid files or devices:"),
         format!("zfs allow -u {user} {DELEGATED} {d}"),
+        format!("zfs set setuid=off devices=off {d}"),
         String::new(),
         format!("# 2. Let {user} mount, unmount and rename under {d} without a password."),
+        format!("# This rule lets {user} mount Mitosis datasets under {m} as root. Only give it to a user you trust with that."),
         "#    Save this line as /etc/sudoers.d/mitosis (visudo -f /etc/sudoers.d/mitosis):"
             .to_string(),
         format!(
             "{user} ALL=(root) NOPASSWD: {z} mount {d}/*, {z} unmount {d}/*, \
-             {z} set mountpoint=* {d}/*, {z} set canmount=* {d}/*, {z} rename {d}/* {d}/*"
+             {z} set mountpoint={m}/* {d}/*, {z} set canmount=* {d}/*, {z} rename {d}/* {d}/*"
         ),
         String::new(),
     ]
@@ -472,6 +520,8 @@ fn missing_rights(allow_output: &str, user: &str) -> Vec<&'static str> {
 pub struct Probe {
     pub name: &'static str,
     pub ok: bool,
+    /// Not ok, but only worth a warning.
+    pub warn: bool,
     pub detail: String,
     pub fix: Option<String>,
 }
@@ -481,6 +531,7 @@ impl Probe {
         Probe {
             name,
             ok: true,
+            warn: false,
             detail: detail.into(),
             fix: None,
         }
@@ -490,8 +541,16 @@ impl Probe {
         Probe {
             name,
             ok: false,
+            warn: false,
             detail: detail.into(),
             fix: Some(fix.into()),
+        }
+    }
+
+    fn warn(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Probe {
+        Probe {
+            warn: true,
+            ..Probe::fail(name, detail, fix)
         }
     }
 }
@@ -520,7 +579,26 @@ pub fn probes(dataset: &str) -> Vec<Probe> {
         ));
         return out;
     }
-    out.push(Probe::ok("zfs_dataset", format!("{dataset} exists")));
+    // A user who can mount datasets as root must not be able to bring in setuid files or devices.
+    let props = b.run_zfs(&["get", "-H", "-o", "value", "setuid,devices", dataset], false);
+    let risky: Vec<&str> = match props {
+        Ok(text) => ["setuid", "devices"]
+            .into_iter()
+            .zip(text.lines())
+            .filter(|(_, v)| v.trim() != "off")
+            .map(|(p, _)| p)
+            .collect(),
+        Err(_) => vec!["setuid", "devices"],
+    };
+    out.push(if risky.is_empty() {
+        Probe::ok("zfs_dataset", format!("{dataset} exists, setuid and devices off"))
+    } else {
+        Probe::warn(
+            "zfs_dataset",
+            format!("{dataset} exists, but {} is not off", risky.join(" and ")),
+            format!("as root: zfs set setuid=off devices=off {dataset}"),
+        )
+    });
 
     let user = current_user();
     out.push(match b.run_zfs(&["allow", dataset], false) {
@@ -538,12 +616,17 @@ pub fn probes(dataset: &str) -> Vec<Probe> {
         Err(e) => Probe::fail("zfs_permissions", e.message, hint.clone()),
     });
 
+    let mount_root = b
+        .run_zfs(&["get", "-H", "-o", "value", "mountpoint", dataset], false)
+        .map(|m| m.trim().to_string())
+        .unwrap_or_else(|_| format!("/{dataset}"));
     let (x, y) = (format!("{dataset}/mitosis-check"), format!("{dataset}/mitosis-check-2"));
-    let (x, y) = (x.as_str(), y.as_str());
+    let mp = format!("mountpoint={mount_root}/mitosis-check");
+    let (x, y, mp) = (x.as_str(), y.as_str(), mp.as_str());
     let forms: [Vec<&str>; 5] = [
         vec!["mount", x],
         vec!["unmount", x],
-        vec!["set", "mountpoint=/mitosis-check", x],
+        vec!["set", mp, x],
         vec!["set", "canmount=noauto", x],
         vec!["rename", x, y],
     ];
@@ -583,6 +666,7 @@ case "$1" in
   list) if [ -e "$f" ]; then echo "$last"; exit 0; fi
         echo "cannot open '$last': dataset does not exist" >&2; exit 1 ;;
   snapshot|create) touch "$f" ;;
+  set) case "$2" in mountpoint=*) mkdir -p "${2#mountpoint=}" ;; esac ;;
   clone) touch "$f"; touch "@STATE@/$(printf %s "$4" | tr '/@' '%+').deps" ;;
   destroy) if [ -e "$f.deps" ]; then
              echo "cannot destroy '$last': snapshot has dependent clones" >&2; exit 1
@@ -681,10 +765,12 @@ exit 1
             dst.display()
         ));
         let mount = f.pos("zfs mount tank/m/clones/c0ffee1");
-        assert!(snap < parent && parent < clone && clone < mp && mp < mount);
-        // Only the mountpoint and mount steps went through sudo.
+        // Mounts again at boot, set only once it is mounted where it belongs.
+        let boot = f.pos("zfs set canmount=on tank/m/clones/c0ffee1");
+        assert!(snap < parent && parent < clone && clone < mp && mp < mount && mount < boot);
+        // Only the mountpoint, mount and canmount steps went through sudo.
         let sudo: Vec<_> = f.log().into_iter().filter(|l| l.starts_with("sudo ")).collect();
-        assert_eq!(sudo.len(), 2, "{sudo:?}");
+        assert_eq!(sudo.len(), 3, "{sudo:?}");
         assert!(sudo.iter().all(|l| l.starts_with("sudo -n ")), "{sudo:?}");
     }
 
@@ -767,28 +853,83 @@ exit 1
     }
 
     #[test]
+    fn copy_dir_makes_a_dataset_and_never_a_zfs_clone() {
+        let f = Fake::new(FAKE_SUDO);
+        f.has("tank/m/templates");
+        f.has("tank/m/templates/main:403");
+        let src = f.mount.join("templates/main@3");
+        std::fs::create_dir_all(src.join("base")).unwrap();
+        std::fs::write(src.join("PG_VERSION"), "18\n").unwrap();
+        std::fs::write(src.join("base/1"), "data").unwrap();
+        let dst = f.mount.join("templates/.main.building-1700000000");
+
+        f.backend.copy_dir(&src, &dst).unwrap();
+        f.pos("zfs create -o canmount=noauto tank/m/templates/.main.building-1700000000");
+        f.pos("zfs set canmount=on tank/m/templates/.main.building-1700000000");
+        let log = f.log();
+        assert!(!log.iter().any(|l| l.starts_with("zfs clone ")), "{log:#?}");
+        assert!(!log.iter().any(|l| l.starts_with("zfs snapshot ")), "{log:#?}");
+        assert_eq!(std::fs::read_to_string(dst.join("PG_VERSION")).unwrap(), "18\n");
+        assert_eq!(std::fs::read_to_string(dst.join("base/1")).unwrap(), "data");
+        assert!(f.backend.copy_dir(&src, &dst).is_err(), "destination exists");
+    }
+
+    #[test]
+    fn mountpoint_outside_the_dataset_is_refused() {
+        let f = Fake::new(FAKE_SUDO);
+        let m = &f.mount;
+        for bad in [
+            m.join("clones/../../etc"),
+            PathBuf::from("/etc"),
+            PathBuf::from("clones/c0ffee1"),
+            m.clone(),
+        ] {
+            let e = f.backend.mountpoint_arg(&bad).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Internal, "{}", bad.display());
+        }
+        assert_eq!(
+            f.backend.mountpoint_arg(&m.join("clones/c0ffee1")).unwrap(),
+            format!("mountpoint={}", m.join("clones/c0ffee1").display())
+        );
+        // Refused before any zfs or sudo run.
+        assert!(f.backend.create_dir(&m.join("clones/../../etc")).is_err());
+        assert!(f.backend.rename_dir(&m.join("clones/x"), &m.join("../etc")).is_err());
+        assert!(f.log().iter().all(|l| !l.contains("mountpoint=")), "{:#?}", f.log());
+    }
+
+    #[test]
     fn setup_prints_allow_and_sudoers_lines() {
-        let text = setup_text("ci", "tank/mitosis", Path::new("/usr/sbin/zfs"));
+        let text = setup_text(
+            "ci",
+            "tank/mitosis",
+            Path::new("/tank/mitosis"),
+            Path::new("/usr/sbin/zfs"),
+        );
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines.contains(
-            &"zfs allow -u ci create,destroy,mount,snapshot,clone,send,receive,canmount,mountpoint tank/mitosis"
+            &"zfs allow -u ci create,destroy,mount,snapshot,clone,canmount,mountpoint tank/mitosis"
+        ), "{text}");
+        assert!(lines.contains(&"zfs set setuid=off devices=off tank/mitosis"), "{text}");
+        assert!(lines.contains(
+            &"ci ALL=(root) NOPASSWD: /usr/sbin/zfs mount tank/mitosis/*, /usr/sbin/zfs unmount tank/mitosis/*, /usr/sbin/zfs set mountpoint=/tank/mitosis/* tank/mitosis/*, /usr/sbin/zfs set canmount=* tank/mitosis/*, /usr/sbin/zfs rename tank/mitosis/* tank/mitosis/*"
         ), "{text}");
         assert!(lines.contains(
-            &"ci ALL=(root) NOPASSWD: /usr/sbin/zfs mount tank/mitosis/*, /usr/sbin/zfs unmount tank/mitosis/*, /usr/sbin/zfs set mountpoint=* tank/mitosis/*, /usr/sbin/zfs set canmount=* tank/mitosis/*, /usr/sbin/zfs rename tank/mitosis/* tank/mitosis/*"
+            &"# This rule lets ci mount Mitosis datasets under /tank/mitosis as root. Only give it to a user you trust with that."
         ), "{text}");
         assert!(text.contains("/etc/sudoers.d/mitosis"));
+        assert!(!text.contains("send") && !text.contains("receive"), "{text}");
         // Every non-comment line is one an admin runs or saves.
         let commands = lines.iter().filter(|l| !l.is_empty() && !l.starts_with('#')).count();
-        assert_eq!(commands, 2, "{text}");
+        assert_eq!(commands, 3, "{text}");
     }
 
     #[test]
     fn allow_output_and_dataset_names() {
         let out = "---- Permissions on tank/mitosis ----\nLocal+Descendent permissions:\n\
-                   \tuser ci canmount,clone,create,destroy,mount,mountpoint,snapshot\n\
-                   \tuser other send,receive\n";
-        assert_eq!(missing_rights(out, "ci"), vec!["send", "receive"]);
-        assert_eq!(missing_rights(out, "nobody").len(), 9);
+                   \tuser ci canmount,clone,create,destroy,mount\n\
+                   \tuser other snapshot,mountpoint\n";
+        assert_eq!(missing_rights(out, "ci"), vec!["snapshot", "mountpoint"]);
+        assert_eq!(missing_rights(out, "nobody").len(), 7);
         assert!(check_dataset_name("tank/mitosis").is_ok());
         for bad in ["", "/tank", "tank/", "tank//m", "tank m", "tank/m@s", "t,ank"] {
             assert!(check_dataset_name(bad).is_err(), "{bad:?}");

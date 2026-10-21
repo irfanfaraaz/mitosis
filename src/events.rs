@@ -24,7 +24,7 @@ pub const TEMPLATE_PRUNED: &str = "template.pruned";
 pub const TEMPLATE_SKIPPED: &str = "template.skipped";
 /// A generation (or clone) folder gc could not remove because clones of it still exist (ZFS);
 /// `detail.reason` is `clones_depend`. gc tries again on its next run.
-pub const GENERATION_KEPT: &str = "generation_kept";
+pub const GENERATION_KEPT: &str = "template.generation_kept";
 pub const QUEUE_WAITED: &str = "queue.waited";
 pub const QUEUE_TIMEOUT: &str = "queue.timeout";
 pub const ROUTER_STARTED: &str = "router.started";

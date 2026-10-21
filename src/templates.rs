@@ -2027,7 +2027,7 @@ async fn layered_steps(
         // A commit or prune moves generation folders only under the write guard.
         let _swap = ctx.template_swap.read().await;
         let (b, f, d) = (ctx.backend.clone(), from.to_path_buf(), dir.to_path_buf());
-        blocking(move || b.clone_dir(&f, &d))
+        blocking(move || b.copy_dir(&f, &d))
             .await
             .map_err(at("copy"))?;
     }

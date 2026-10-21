@@ -29,6 +29,11 @@ pub trait CloneBackend: Send + Sync {
     fn check_supported(&self, path: &Path) -> Result<()>;
     /// Makes `dst` a clone of `src`; `dst` must not exist.
     fn clone_dir(&self, src: &Path, dst: &Path) -> Result<()>;
+    /// Makes `dst` (which must not exist) a template generation copied from `src`, a generation
+    /// or a clone. Unlike `clone_dir`, the result must not depend on `src` staying around.
+    fn copy_dir(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.clone_dir(src, dst)
+    }
     /// Makes an empty directory a build writes into and later clones are made from.
     fn create_dir(&self, path: &Path) -> Result<()>;
     /// Removes a clone or generation directory and everything in it; a missing path is `Ok(())`.
@@ -361,6 +366,25 @@ fn clone_tree(
     clone_entry(src, dst, file).inspect_err(|_| {
         let _ = std::fs::remove_dir_all(dst).or_else(|_| std::fs::remove_file(dst));
     })
+}
+
+/// `clone_tree` into `dst`, an empty folder that already exists (a fresh ZFS dataset): the
+/// entries of `src` are recreated in it, and it takes `src`'s owner, mode and times.
+#[cfg(target_os = "linux")]
+fn fill_tree(
+    src: &Path,
+    dst: &Path,
+    file: &dyn Fn(&Path, &Path, &Metadata) -> Result<()>,
+) -> Result<()> {
+    let md = std::fs::symlink_metadata(src).map_err(|e| io_error("lstat", src, e))?;
+    for entry in std::fs::read_dir(src).map_err(|e| io_error("read_dir", src, e))? {
+        let entry = entry.map_err(|e| io_error("read_dir", src, e))?;
+        clone_entry(&entry.path(), &dst.join(entry.file_name()), file)?;
+    }
+    keep_owner(dst, &md)?;
+    std::fs::set_permissions(dst, Permissions::from_mode(md.mode() & 0o7777))
+        .map_err(|e| io_error("chmod", dst, e))?;
+    keep_times(dst, &md)
 }
 
 /// Creates `dst` for a regular file with the source's permission bits (O_CREAT | O_EXCL).

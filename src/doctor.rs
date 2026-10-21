@@ -582,7 +582,11 @@ pub fn zfs_checks(dataset: &str) -> Vec<Check> {
     crate::clone_backend::zfs::probes(dataset)
         .into_iter()
         .map(|p| {
-            let level = if p.ok { Level::Ok } else { Level::Fail };
+            let level = match (p.ok, p.warn) {
+                (true, _) => Level::Ok,
+                (false, true) => Level::Warn,
+                (false, false) => Level::Fail,
+            };
             let c = Check::new(p.name, level, p.detail);
             match p.fix {
                 Some(f) => c.fix(f),
