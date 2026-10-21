@@ -39,7 +39,7 @@ pub(crate) fn version_key(version: &str) -> Vec<u32> {
 }
 
 /// Expands `<parent>/<prefix>*/<suffix>`; missing parents yield nothing.
-fn glob_dirs(parent: &str, prefix: &str, suffix: &str) -> Vec<PathBuf> {
+fn glob_dirs(parent: impl AsRef<Path>, prefix: &str, suffix: &str) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(parent) else {
         return vec![];
     };
@@ -49,24 +49,46 @@ fn glob_dirs(parent: &str, prefix: &str, suffix: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn candidates() -> Vec<PathBuf> {
+/// The fixed system folders, under `root` (`/` in real use; a temp folder in tests).
+fn candidates_in(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for root in ["/opt/homebrew/opt", "/usr/local/opt"] {
-        out.extend(glob_dirs(root, "postgresql@", "bin"));
-        out.push(Path::new(root).join("postgresql/bin"));
+    for prefix in ["opt/homebrew/opt", "usr/local/opt"] {
+        let dir = root.join(prefix);
+        out.extend(glob_dirs(&dir, "postgresql@", "bin"));
+        out.push(dir.join("postgresql/bin"));
     }
-    out.extend(glob_dirs(
-        "/Applications/Postgres.app/Contents/Versions",
-        "",
-        "bin",
-    ));
-    if let Ok(home) = std::env::var("HOME") {
+    if cfg!(target_os = "macos") {
         out.extend(glob_dirs(
-            &format!("{home}/.asdf/installs/postgres"),
+            root.join("Applications/Postgres.app/Contents/Versions"),
             "",
             "bin",
         ));
-        out.extend(glob_dirs(&format!("{home}/.pgenv"), "pgsql-", "bin"));
+    }
+    if cfg!(target_os = "linux") {
+        // apt/PGDG: /usr/lib/postgresql/<N>/bin; dnf/PGDG: /usr/pgsql-<N>/bin.
+        out.extend(glob_dirs(root.join("usr/lib/postgresql"), "", "bin"));
+        out.extend(glob_dirs(root.join("usr"), "pgsql-", "bin"));
+    }
+    out
+}
+
+fn candidates() -> Vec<PathBuf> {
+    let mut out = candidates_in(Path::new("/"));
+    if let Ok(home) = std::env::var("HOME") {
+        out.extend(glob_dirs(
+            format!("{home}/.asdf/installs/postgres"),
+            "",
+            "bin",
+        ));
+        out.extend(glob_dirs(format!("{home}/.pgenv"), "pgsql-", "bin"));
+    }
+    if cfg!(target_os = "linux") {
+        if let Ok(o) = Command::new("pg_config").arg("--bindir").output() {
+            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if o.status.success() && !dir.is_empty() {
+                out.push(PathBuf::from(dir));
+            }
+        }
     }
     if let Some(path) = std::env::var_os("PATH") {
         out.extend(std::env::split_paths(&path).filter(|d| d.join("postgres").is_file()));
@@ -221,6 +243,17 @@ pub fn check_extensions(install: &PgInstall, extensions: &[String]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_candidates_include_apt_and_dnf_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib/postgresql/16/bin")).unwrap();
+        std::fs::create_dir_all(root.path().join("usr/pgsql-15/bin")).unwrap();
+        let c = candidates_in(root.path());
+        assert!(c.contains(&root.path().join("usr/lib/postgresql/16/bin")));
+        assert!(c.contains(&root.path().join("usr/pgsql-15/bin")));
+    }
 
     #[test]
     fn parses_versions() {

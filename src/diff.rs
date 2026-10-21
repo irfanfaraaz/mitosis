@@ -1,6 +1,6 @@
 //! `mitosis diff`: what a clone changed against the template generation it was made from.
 //!
-//! The base side is a private, socket-only Postgres on a `clonefile` of the generation folder; a
+//! The base side is a private, socket-only Postgres on a copy-on-write clone of the generation folder; a
 //! guard stops it and deletes the folder on every path. Both sides are read with `psql`.
 
 use crate::clone_backend::CloneBackend;

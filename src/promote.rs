@@ -1,5 +1,5 @@
 //! Promote: turn a running clone into a new generation of a template. The clone's Postgres is
-//! stopped cleanly, its folder is copied with clonefile, and the clone is started again on the same
+//! stopped cleanly, its folder is copied with a copy-on-write clone, and the clone is started again on the same
 //! port, socket and password, so its URL keeps working (open connections are dropped).
 
 use crate::clones::{mark, stop_and_remove};

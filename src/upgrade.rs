@@ -1,5 +1,5 @@
 //! Template upgrade: moves a template's current generation to a newer Postgres major with
-//! `pg_upgrade --clone`. The current generation is copied (clonefile) into side folder A, a new
+//! `pg_upgrade --clone`. The current generation is copied (copy-on-write clone) into side folder A, a new
 //! cluster B is made with the target's `initdb` (same encoding, locale and checksums as A), and
 //! `pg_upgrade` fills B from A. B becomes an `Upgraded` generation of the same template, or
 //! generation 1 of a new one (`--as`). The source generation is never touched.

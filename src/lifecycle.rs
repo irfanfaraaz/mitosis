@@ -1239,7 +1239,7 @@ mod tests {
     use crate::paths::Home;
 
     fn tmp_ctx() -> (tempfile::TempDir, Arc<Ctx>) {
-        // Under /tmp: short paths, on APFS.
+        // Under /tmp: short paths, on the default back end.
         let tmp = tempfile::Builder::new()
             .prefix("mt")
             .tempdir_in("/tmp")

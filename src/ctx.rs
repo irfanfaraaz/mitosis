@@ -37,7 +37,7 @@ pub struct Ctx {
     pub(crate) watching: Mutex<HashSet<String>>,
     /// Clone creation reads a template folder under the read guard; a template swap renames and
     /// removes folders under the write guard, so no clone copies a half-moved template. One lock
-    /// for all templates: the guarded work is a clonefile or a swap.
+    /// for all templates: the guarded work is a copy-on-write clone or a swap.
     pub(crate) template_swap: tokio::sync::RwLock<()>,
     /// Process groups of running seed commands and dump/restore pipes; killed on daemon shutdown.
     pub(crate) build_groups: Arc<Mutex<HashSet<i32>>>,

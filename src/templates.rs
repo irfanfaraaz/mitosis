@@ -2805,7 +2805,7 @@ pub async fn commit_generation(
 }
 
 /// Removes generations beyond the newest `keep`, never the current one: rows first, then the
-/// folders, renamed aside under the write guard (no clonefile reads them meanwhile) and deleted
+/// folders, renamed aside under the write guard (no clone reads them meanwhile) and deleted
 /// outside it. Failures are logged; gc removes what is left.
 pub(crate) async fn prune(ctx: &Ctx, name: &str) {
     let (gens, doomed): (Vec<u32>, Vec<PathBuf>) = match prune_rows(ctx, name) {
