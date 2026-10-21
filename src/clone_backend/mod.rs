@@ -8,6 +8,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+mod reflink;
+#[cfg(target_os = "linux")]
+pub use reflink::ReflinkBackend;
+
 // Not exported by libc; value from <sys/clonefile.h>.
 #[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
@@ -29,14 +34,12 @@ pub trait CloneBackend: Send + Sync {
 }
 
 /// `create_dir`, `remove_dir` and `rename_dir` as plain file system calls (APFS, reflink, copy).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no Linux back end uses them yet
 fn fs_create_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|e| {
         MitosisError::new(ErrorCode::Internal, format!("create {}: {e}", path.display()))
     })
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no Linux back end uses them yet
 fn fs_remove_dir(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(MitosisError::new(
@@ -48,7 +51,6 @@ fn fs_remove_dir(path: &Path) -> Result<()> {
 }
 
 /// The error message is the bare OS error, so callers add which move failed.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no Linux back end uses them yet
 fn fs_rename_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(std::fs::rename(from, to)?)
 }
@@ -125,8 +127,8 @@ fn fs_type_name(path: &Path) -> String {
     }
 }
 
-/// Picks the clone back end for `home` from the `backend` setting. The Reflink and Zfs back ends
-/// do not exist yet (tickets 04 and 08), so choosing them is `backend_unsupported` for now.
+/// Picks the clone back end for `home` from the `backend` setting. The Zfs and Copy back ends do
+/// not exist yet (tickets 08 and later), so choosing them is `backend_unsupported` for now.
 pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>> {
     match cfg.backend {
         #[cfg(target_os = "macos")]
@@ -138,14 +140,38 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
         )),
         #[cfg(not(target_os = "macos"))]
         BackendKind::Auto => {
-            // Order: a configured ZFS dataset (ticket 08), then a FICLONE probe (ticket 04).
+            // Order: a configured ZFS dataset (ticket 08), then a FICLONE probe.
             let fs = fs_type_name(&home.root);
-            Err(unsupported(
-                format!("no clone back end works on the '{fs}' file system at {}", home.root.display()),
-                "put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS, or set backend = \"copy\"",
-            ))
+            let no_backend = || {
+                unsupported(
+                    format!(
+                        "no clone back end works on the '{fs}' file system at {}",
+                        home.root.display()
+                    ),
+                    "put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS, or set backend = \"copy\"",
+                )
+            };
+            // shortcut: "home inside the dataset's mountpoint" is told by the file system type,
+            // not `zfs get mountpoint`; ticket 08 replaces this arm with the real ZFS back end.
+            if cfg.zfs_dataset.is_some() && fs == "zfs" {
+                return Err(no_backend());
+            }
+            #[cfg(target_os = "linux")]
+            match ReflinkBackend.check_supported(&home.root) {
+                Ok(()) => return Ok(Arc::new(ReflinkBackend)),
+                Err(e) if e.code != ErrorCode::BackendUnsupported => return Err(e),
+                Err(_) => {}
+            }
+            Err(no_backend())
         }
-        BackendKind::Reflink | BackendKind::Zfs | BackendKind::Copy => {
+        #[cfg(target_os = "linux")]
+        BackendKind::Reflink => Ok(Arc::new(ReflinkBackend)),
+        #[cfg(not(target_os = "linux"))]
+        BackendKind::Reflink => Err(unsupported(
+            "the reflink back end only works on Linux",
+            "set backend = \"auto\"",
+        )),
+        BackendKind::Zfs | BackendKind::Copy => {
             let _ = home;
             Err(unsupported(
                 format!("the {} back end is not available in this build", cfg.backend.as_str()),
