@@ -1,4 +1,4 @@
-use crate::clone_backend::apparent_size;
+use crate::clone_backend::{apparent_size, CloneBackend};
 use crate::clones::START_TRIES;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
@@ -1632,9 +1632,18 @@ async fn extensions_and_stop(
 }
 
 /// Stops any server in `dir` and deletes the folder. A server that would not stop keeps its
-/// folder; gc deals with it later.
-fn stop_and_remove(install: &PgInstall, dir: &Path, timeout: Duration) -> Result<()> {
+/// folder; gc deals with it later. The build folder (a generation to be) is removed by `backend`;
+/// a staging folder (`None`) is plain scratch.
+fn stop_and_remove(
+    install: &PgInstall,
+    dir: &Path,
+    timeout: Duration,
+    backend: Option<&dyn CloneBackend>,
+) -> Result<()> {
     stop(install, dir, None, timeout)?;
+    if let Some(b) = backend {
+        return b.remove_dir(dir);
+    }
     match std::fs::remove_dir_all(dir) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
@@ -1657,12 +1666,13 @@ async fn fail(
     );
     // Read the tail before stopping, so shutdown lines cannot push the cause out of it.
     let tail = scrub(&log_tail(log, 20), secrets);
-    let (i, d, t) = (
+    let (i, d, t, b) = (
         install.clone(),
         build_dir.to_path_buf(),
         ctx.config().stop_timeout,
+        ctx.backend.clone(),
     );
-    let cleanup = blocking(move || stop_and_remove(&i, &d, t)).await;
+    let cleanup = blocking(move || stop_and_remove(&i, &d, t, Some(&*b))).await;
     if let Err(ce) = cleanup {
         append_log(
             log,
@@ -2670,7 +2680,7 @@ impl Staging {
     async fn remove(mut self, log: &Path) {
         self.removed = true;
         let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
-        if let Err(e) = blocking(move || stop_and_remove(&i, &d, t)).await {
+        if let Err(e) = blocking(move || stop_and_remove(&i, &d, t, None)).await {
             append_log(
                 log,
                 &format!(
@@ -2686,7 +2696,7 @@ impl Drop for Staging {
     fn drop(&mut self) {
         if !self.removed {
             let (i, d, t) = (self.install.clone(), self.dir.clone(), self.timeout);
-            std::thread::spawn(move || stop_and_remove(&i, &d, t));
+            std::thread::spawn(move || stop_and_remove(&i, &d, t, None));
         }
     }
 }
@@ -2750,13 +2760,13 @@ pub async fn commit_generation(
     let current = {
         // Under the write guard, gc and clone creation never see the folder without its row.
         let _swap = ctx.template_swap.write().await;
-        let (s, f) = (side.clone(), final_dir.clone());
-        blocking(move || Ok(std::fs::rename(&s, &f)?)).await?;
+        let (b, s, f) = (ctx.backend.clone(), side.clone(), final_dir.clone());
+        blocking(move || b.rename_dir(&s, &f)).await?;
         gen.dir = final_dir;
         let store = ctx.store();
         if let Err(e) = store.insert_generation(&gen) {
             // Back to the side folder, which the failed build then removes.
-            let _ = std::fs::rename(&gen.dir, &side);
+            let _ = ctx.backend.rename_dir(&gen.dir, &side);
             return Err(e);
         }
         store.set_current(&gen.template, gen.gen, expected_current)?
@@ -2826,18 +2836,19 @@ pub(crate) async fn prune(ctx: &Ctx, name: &str) {
                 }
                 ts += 1;
             };
-            match std::fs::rename(&dir, &to) {
+            match ctx.backend.rename_dir(&dir, &to) {
                 Ok(()) => old.push(to),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) if !dir.exists() => {}
                 Err(e) => {
                     crate::lifecycle::log(ctx, &format!("prune: move {} aside: {e}", dir.display()))
                 }
             }
         }
     }
+    let backend = ctx.backend.clone();
     let _ = blocking(move || {
         for dir in old {
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = backend.remove_dir(&dir);
         }
         Ok(())
     })

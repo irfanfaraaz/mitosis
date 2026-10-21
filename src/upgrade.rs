@@ -198,10 +198,11 @@ async fn run(
     }
     let cleaned = {
         let (a, tmp, s) = (work.a.clone(), work.tmp.clone(), work.socket_dir.clone());
+        let backend = ctx.backend.clone();
         blocking(move || {
             remove(&tmp)?;
             let _ = std::fs::remove_dir(&s);
-            remove(&a)
+            backend.remove_dir(&a)
         })
         .await
     };
@@ -286,8 +287,9 @@ async fn steps(
     std::fs::create_dir_all(&work.tmp).map_err(|e| ("pg_upgrade", e.into()))?;
     for mode in ["--clone", "--copy"] {
         let (t, b, s) = (target.clone(), work.b.clone(), settings.clone());
+        let backend = ctx.backend.clone();
         blocking(move || {
-            remove(&b)?;
+            backend.remove_dir(&b)?;
             initdb_like(&t, &b, &s)
         })
         .await
@@ -567,6 +569,7 @@ fn log_tail(log: &Path, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Removes the pg_upgrade work folder in `logs/` (not a clone or generation folder).
 fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -587,6 +590,7 @@ async fn fail(
     append_log(&work.log, &format!("mitosis: {step} failed: {e}"));
     let tail = redact(&log_tail(&work.log, 20));
     let (o, t, timeout) = (old.clone(), target.clone(), ctx.config().stop_timeout);
+    let backend = ctx.backend.clone();
     let (a, b, tmp, sock) = (
         work.a.clone(),
         work.b.clone(),
@@ -596,7 +600,7 @@ async fn fail(
     let cleanup = blocking(move || {
         let mut errors = Vec::new();
         for (install, dir) in [(&o, &a), (&t, &b)] {
-            let res = stop(install, dir, None, timeout).and_then(|()| remove(dir));
+            let res = stop(install, dir, None, timeout).and_then(|()| backend.remove_dir(dir));
             if let Err(e) = res {
                 errors.push(format!("{}: {e}", dir.display()));
             }

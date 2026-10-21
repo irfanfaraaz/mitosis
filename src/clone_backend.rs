@@ -16,7 +16,41 @@ pub trait CloneBackend: Send + Sync {
     /// `"apfs"`, `"reflink"`, `"zfs"` or `"copy"`.
     fn name(&self) -> &'static str;
     fn check_supported(&self, path: &Path) -> Result<()>;
+    /// Makes `dst` a clone of `src`; `dst` must not exist.
     fn clone_dir(&self, src: &Path, dst: &Path) -> Result<()>;
+    /// Makes an empty directory a build writes into and later clones are made from.
+    fn create_dir(&self, path: &Path) -> Result<()>;
+    /// Removes a clone or generation directory and everything in it; a missing path is `Ok(())`.
+    fn remove_dir(&self, path: &Path) -> Result<()>;
+    /// Renames a clone or generation directory within the same parent tree.
+    fn rename_dir(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Bytes under `path` not shared with any clone, or `None` when it cannot be told.
+    fn private_size(&self, path: &Path) -> Option<u64>;
+}
+
+/// `create_dir`, `remove_dir` and `rename_dir` as plain file system calls (APFS, reflink, copy).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no Linux back end uses them yet
+fn fs_create_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).map_err(|e| {
+        MitosisError::new(ErrorCode::Internal, format!("create {}: {e}", path.display()))
+    })
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no Linux back end uses them yet
+fn fs_remove_dir(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(MitosisError::new(
+            ErrorCode::Internal,
+            format!("remove {}: {e}", path.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The error message is the bare OS error, so callers add which move failed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // no Linux back end uses them yet
+fn fs_rename_dir(from: &Path, to: &Path) -> Result<()> {
+    Ok(std::fs::rename(from, to)?)
 }
 
 #[cfg(target_os = "macos")]
@@ -170,6 +204,22 @@ impl CloneBackend for ApfsBackend {
             _ => MitosisError::new(ErrorCode::Internal, msg),
         })
     }
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        fs_create_dir(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        fs_remove_dir(path)
+    }
+
+    fn rename_dir(&self, from: &Path, to: &Path) -> Result<()> {
+        fs_rename_dir(from, to)
+    }
+
+    fn private_size(&self, path: &Path) -> Option<u64> {
+        apfs_private_size(path)
+    }
 }
 
 fn stat(path: &Path) -> Result<Metadata> {
@@ -268,18 +318,13 @@ fn file_private_size(path: &Path) -> Option<u64> {
 // shortcut: any failure on any file makes the whole sum None rather than a partial number;
 // upgrade if callers need a best-effort partial total.
 #[cfg(target_os = "macos")]
-pub fn private_size(path: &Path) -> Option<u64> {
+fn apfs_private_size(path: &Path) -> Option<u64> {
     let mut total = 0u64;
     let done = walk_files(path, &mut |p, _| {
         total += file_private_size(p)?;
         Some(())
     });
     matches!(done, Ok(Some(()))).then_some(total)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn private_size(_path: &Path) -> Option<u64> {
-    None
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -329,7 +374,7 @@ mod tests {
         assert!(free_space(tmp.path()).unwrap() > 0);
         assert!(ApfsBackend.clone_dir(&src, &dst).is_err());
         assert_eq!(apparent_size(&src).unwrap(), 1_000_005);
-        if let Some(p) = private_size(&dst) {
+        if let Some(p) = ApfsBackend.private_size(&dst) {
             assert!(p < 1_000_000);
         }
     }

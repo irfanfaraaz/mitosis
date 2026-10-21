@@ -911,6 +911,7 @@ fn remove_path(path: &Path) -> Result<()> {
 async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     let install = install_for(ctx, &dir);
     let timeout = ctx.config().stop_timeout;
+    let backend = ctx.backend.clone();
     tokio::task::spawn_blocking(move || {
         // No row, so the server (if any) is the process whose cwd is this folder.
         if running_server(&dir, None)?.is_some() {
@@ -922,7 +923,12 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
             })?;
             stop(&install, &dir, None, timeout)?;
         }
-        remove_path(&dir)
+        // A stray file under a clone or generation name is not the back end's.
+        if dir.is_dir() {
+            backend.remove_dir(&dir)
+        } else {
+            remove_path(&dir)
+        }
     })
     .await
     .map_err(|e| internal(format!("background task failed: {e}")))?
@@ -1067,9 +1073,9 @@ async fn remove_orphans(ctx: &Ctx, report: &mut GcReport) {
                 Ok(dirs) if file.as_ref().is_some_and(|f| dirs.contains(f)) => continue,
                 Ok(_) => {
                     let trash = templates_dir.join(format!("{GC_TRASH}{}", random_hex(4)));
-                    std::fs::rename(&path, &trash)
-                        .map(|()| trash)
-                        .map_err(|e| internal(format!("move {} aside: {e}", path.display())))
+                    ctx.backend.rename_dir(&path, &trash).map(|()| trash).map_err(|e| {
+                        internal(format!("move {} aside: {}", path.display(), e.message))
+                    })
                 }
                 Err(e) => Err(e),
             }
@@ -1198,7 +1204,7 @@ fn restore_old_templates(
             continue;
         }
         let old = &leftovers[i].1;
-        match std::fs::rename(old, &final_dir) {
+        match ctx.backend.rename_dir(old, &final_dir) {
             Ok(()) => {
                 drop(building);
                 log(

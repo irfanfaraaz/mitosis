@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use mitosis::clones::{create, list};
+use mitosis::clones::{create, destroy, list};
 use mitosis::ctx::{Config, Ctx};
 use mitosis::lifecycle::{parent_alive, reap_expired, reconcile, watch_parent};
 use mitosis::paths::Home;
@@ -9,6 +9,7 @@ use mitosis::pg::{newest, stop};
 use mitosis::proc_util::process_start_time;
 use mitosis::protocol::{CloneCreateArgs, GenKind, TemplateSource};
 use mitosis::state::{CloneRow, CloneStatus, GenerationRow, TemplateRow};
+use mitosis::templates;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -339,4 +340,51 @@ fn parent_alive_checks_pid_and_start_time() {
     let pid = child.id() as i32;
     child.wait().unwrap();
     assert!(!parent_alive(pid, None));
+}
+
+/// A clone destroy, a template prune and an orphan sweep all go through the back end, not
+/// straight to the file system.
+#[tokio::test]
+async fn gc_and_destroy_use_the_backend() {
+    let Some((env, rec)) = TestEnv::recording() else { return };
+    template(&env, "main", SEED).await;
+
+    let a = create(&env.ctx, args("main")).await.unwrap();
+    let a_dir = env.ctx.home.clones_dir().join(&a.id);
+    destroy(&env.ctx, &a.id).await.unwrap();
+    assert!(rec.calls("remove_dir").contains(&a_dir), "destroy");
+    assert!(!a_dir.exists());
+
+    // keep = 1: the refresh prunes generation 1, moved aside and then removed.
+    let gen1 = {
+        let store = env.ctx.store();
+        let mut t = store.get_template("main").unwrap().unwrap();
+        t.keep = 1;
+        store.update_template_settings(&t).unwrap();
+        store.list_generations("main").unwrap()[0].dir.clone()
+    };
+    templates::refresh(&env.ctx, "main", None).await.unwrap();
+    assert!(rec.calls("rename_dir").contains(&gen1), "prune move");
+    assert!(
+        rec.calls("remove_dir").iter().any(|p| p
+            .file_name()
+            .is_some_and(|f| f.to_string_lossy().starts_with(".main.old-"))),
+        "prune remove"
+    );
+    assert!(!gen1.exists());
+
+    // An orphan clone folder and a generation folder with no row.
+    let orphan = env.ctx.home.clones_dir().join("cdead01");
+    let rowless = env.ctx.home.templates_dir().join("main@9");
+    for d in [&orphan, &rowless] {
+        std::fs::create_dir(d).unwrap();
+        std::fs::write(d.join("file"), "x").unwrap();
+    }
+    let report = reconcile(env.ctx.clone(), now()).await.unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(rec.calls("remove_dir").contains(&orphan), "orphan clone");
+    assert!(rec.calls("rename_dir").contains(&rowless), "rowless generation");
+    for d in [&orphan, &rowless] {
+        assert!(!d.exists(), "{} still exists", d.display());
+    }
 }

@@ -64,6 +64,17 @@ impl Ctx {
     pub fn open(home: Home, config: Config) -> Result<Ctx> {
         home.ensure_dirs()?;
         let backend: Arc<dyn CloneBackend> = select_backend(&home, &config)?;
+        Ctx::open_with_backend(home, config, backend)
+    }
+
+    /// `open` with a given back end instead of the one the settings pick (tests wrap it).
+    #[doc(hidden)]
+    pub fn open_with_backend(
+        home: Home,
+        config: Config,
+        backend: Arc<dyn CloneBackend>,
+    ) -> Result<Ctx> {
+        home.ensure_dirs()?;
         backend.check_supported(&home.root)?;
         if !same_volume(&home.templates_dir(), &home.clones_dir())? {
             return Err(MitosisError::new(

@@ -1,5 +1,5 @@
 use crate::budget::admit;
-use crate::clone_backend::{free_space, private_size};
+use crate::clone_backend::free_space;
 use crate::ctx::{Ctx, InFlightOp};
 use crate::envfile;
 use crate::error::{ErrorCode, MitosisError, Result};
@@ -1262,6 +1262,7 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Res
     let log = ctx.home.logs_dir().join(format!("{}.log", row.id));
     let install = install_for(ctx, &dir);
     let timeout = ctx.config().stop_timeout;
+    let backend = ctx.backend.clone();
     let expected = row
         .pg_pid
         .zip(row.pg_start_time)
@@ -1276,7 +1277,7 @@ pub(crate) async fn stop_and_remove(ctx: &Ctx, row: &CloneRow, why: &str) -> Res
             })?;
             stop(&install, &dir, expected, timeout)?;
         }
-        remove_if_present(&dir, true)?;
+        backend.remove_dir(&dir)?;
         remove_if_present(&sock, true)?;
         remove_if_present(&log, false)
     })
@@ -1370,7 +1371,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<CloneInfo>> {
                 .pg_pid
                 .filter(|pid| process_start_time(*pid) == r.pg_start_time)
                 .and_then(rss_bytes);
-            ci.own_disk_bytes = private_size(&r.dir);
+            ci.own_disk_bytes = ctx.backend.private_size(&r.dir);
             ci.disk_warn = ci.own_disk_bytes.is_some_and(|b| b > warn_at);
             // A restart that keeps failing leaves the row Ready; say so instead of looking fine.
             if r.status == CloneStatus::Ready && ci.rss_bytes.is_none() && !server_up(r) {

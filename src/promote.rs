@@ -244,8 +244,8 @@ async fn run(
     })
     .await;
     if copied.is_err() {
-        let s = side.clone();
-        let _ = blocking(move || Ok(std::fs::remove_dir_all(&s)?)).await;
+        let (b, s) = (ctx.backend.clone(), side.clone());
+        let _ = blocking(move || b.remove_dir(&s)).await;
     }
 
     // Committed before the clone restarts: a kill after this point cannot lose the promoted data,

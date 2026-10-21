@@ -1,6 +1,6 @@
 //! RAM and disk budgets, the clone cap and the FIFO queue that creates wait in.
 
-use crate::clone_backend::{free_space, private_size};
+use crate::clone_backend::free_space;
 use crate::ctx::Ctx;
 use crate::error::{ErrorCode, MitosisError, Result};
 use crate::events;
@@ -127,7 +127,7 @@ fn collect(ctx: &Ctx, want_ram: bool, want_disk: bool) -> Result<(Usage, u64)> {
             .filter(|_| want_ram && (r.status == CloneStatus::Ready || waking(r)))
             .filter(|pid| process_start_time(*pid) == r.pg_start_time)
             .and_then(rss_bytes);
-        let own = want_disk.then(|| private_size(&r.dir)).flatten();
+        let own = want_disk.then(|| ctx.backend.private_size(&r.dir)).flatten();
         clones.push(CloneUsage {
             id: r.id.clone(),
             name: r.name.clone(),
