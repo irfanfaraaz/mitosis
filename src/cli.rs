@@ -489,6 +489,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         let gone = if s.binary_exists { "" } else { "  (missing)" };
                         println!("binary    {}{gone}", b.display());
                     }
+                    if s.installed {
+                        if let Some(hint) = service::linger_hint() {
+                            println!("{hint}");
+                        }
+                    }
                 }
             }
         },

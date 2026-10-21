@@ -664,7 +664,7 @@ async fn service_status() -> Option<service::ServiceStatus> {
 
 fn check_service(st: &Option<service::ServiceStatus>) -> Check {
     match st {
-        None => Check::new("service", Level::Warn, "could not ask launchd"),
+        None => Check::new("service", Level::Warn, "could not ask the service manager"),
         Some(s) if !s.installed => Check::new("service", Level::Ok, "not installed (optional)"),
         Some(s) if !s.binary_exists => {
             Check::new("service", Level::Warn, "its binary no longer exists")
@@ -672,7 +672,15 @@ fn check_service(st: &Option<service::ServiceStatus>) -> Check {
         }
         Some(s) if !s.loaded => Check::new("service", Level::Warn, "installed but not loaded")
             .fix("mitosis service install"),
-        Some(_) => Check::new("service", Level::Ok, "installed and loaded"),
+        Some(_) => match service::linger_hint() {
+            Some(hint) => Check::new(
+                "service",
+                Level::Warn,
+                "installed and loaded, but it stops when you log out",
+            )
+            .fix(hint),
+            None => Check::new("service", Level::Ok, "installed and loaded"),
+        },
     }
 }
 

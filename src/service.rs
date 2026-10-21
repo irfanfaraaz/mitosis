@@ -1,5 +1,8 @@
-//! Login service: a launchd user agent that keeps `mitosis daemon` running.
+//! Login service: a launchd user agent (macOS) or systemd user unit (Linux) that keeps
+//! `mitosis daemon` running.
+#[cfg(target_os = "macos")]
 use crate::error::{ErrorCode, MitosisError, Result};
+#[cfg(target_os = "macos")]
 use crate::paths::Home;
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -12,6 +15,12 @@ use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+mod systemd;
+#[cfg(target_os = "linux")]
+pub use systemd::{install, kickstart, linger_hint, manages, status, uninstall};
+
+#[cfg(target_os = "macos")]
 pub const SERVICE_LABEL: &str = "io.github.irfanfaraaz.mitosis";
 
 #[derive(Serialize, Clone, Debug)]
@@ -144,7 +153,7 @@ fn wait_until(tries: u32, pause: Duration, mut cond: impl FnMut() -> bool) -> bo
 }
 
 /// True when `a` and `b` are the same folder, also through symlinks (`/tmp` and `/private/tmp`).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn same_folder(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     a == b || canon(a) == canon(b)
@@ -233,34 +242,43 @@ pub fn kickstart() -> bool {
     launchctl(&["kickstart", &target()]).is_ok_and(|o| o.status.success())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn not_built() -> MitosisError {
-    MitosisError::new(ErrorCode::Internal, "not built yet")
-}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod other {
+    use super::ServiceStatus;
+    use crate::error::{ErrorCode, MitosisError, Result};
+    use crate::paths::Home;
 
-#[cfg(not(target_os = "macos"))]
-pub fn install() -> Result<()> {
-    Err(not_built())
-}
+    fn not_built() -> MitosisError {
+        MitosisError::new(ErrorCode::Internal, "no login service on this platform")
+    }
 
-#[cfg(not(target_os = "macos"))]
-pub fn uninstall() -> Result<()> {
-    Err(not_built())
-}
+    pub fn install() -> Result<()> {
+        Err(not_built())
+    }
 
-#[cfg(not(target_os = "macos"))]
-pub fn status() -> Result<ServiceStatus> {
-    Err(not_built())
-}
+    pub fn uninstall() -> Result<()> {
+        Err(not_built())
+    }
 
-#[cfg(not(target_os = "macos"))]
-pub fn manages(_home: &Home) -> bool {
-    false
-}
+    pub fn status() -> Result<ServiceStatus> {
+        Err(not_built())
+    }
 
-#[cfg(not(target_os = "macos"))]
-pub fn kickstart() -> bool {
-    false
+    pub fn manages(_home: &Home) -> bool {
+        false
+    }
+
+    pub fn kickstart() -> bool {
+        false
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub use other::{install, kickstart, manages, status, uninstall};
+
+/// A warning to show when the daemon would stop at logout (Linux without lingering); none elsewhere.
+#[cfg(not(target_os = "linux"))]
+pub fn linger_hint() -> Option<String> {
+    None
 }
 
 #[cfg(all(test, target_os = "macos"))]
