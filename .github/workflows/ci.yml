@@ -95,7 +95,8 @@ jobs:
               sudo zfs create -o mountpoint=/mnt/src tank/src
               sudo chown runner /mnt/mitosis /mnt/src
               # Apply exactly what "mitosis zfs setup" prints: the zfs lines and the sudoers rule.
-              cargo run --quiet -- zfs setup tank/mitosis > "$RUNNER_TEMP/zfs-setup.txt"
+              # Its checks fail until the admin is done, so it exits non-zero here; only an empty output is an error.
+              cargo run --quiet -- zfs setup tank/mitosis > "$RUNNER_TEMP/zfs-setup.txt" || [ -s "$RUNNER_TEMP/zfs-setup.txt" ]
               cat "$RUNNER_TEMP/zfs-setup.txt"
               grep -E '^zfs ' "$RUNNER_TEMP/zfs-setup.txt" | while IFS= read -r line; do
                 sudo sh -c "$line"
