@@ -135,4 +135,4 @@ jobs:
             copy) export MITOSIS_BACKEND=copy ;;
             *) export MITOSIS_BACKEND=reflink ;;
           esac
-          cargo test
+          cargo test --no-fail-fast

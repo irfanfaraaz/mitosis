@@ -221,8 +221,11 @@ async fn prune_keeps_newest_and_current() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|f| f.starts_with(".main."))
         .collect();
-    assert!(leftovers.is_empty(), "{leftovers:?}");
-    // A clone is its own copy: pruning its generation does not touch it.
+    // On ZFS the early clone depends on main@1's snapshot, so the back end keeps that folder
+    // (gc retries it once the clone is gone); main@2 has no clones and is destroyed.
+    let kept = usize::from(env.ctx.backend.name() == "zfs");
+    assert_eq!(leftovers.len(), kept, "{leftovers:?}");
+    // Pruning a clone's generation does not touch the clone.
     assert_eq!(psql_url(&env, &early.url, VALUES), "a");
 }
 
@@ -292,6 +295,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS clones_name_uniq ON clones(name) WHERE name IS
 #[tokio::test]
 async fn v01_store_is_migrated() {
     let Some(env) = TestEnv::new() else { return };
+    // v0.1 homes exist only on macOS, and a ZFS generation is a mounted dataset that cannot be
+    // moved into another home with a plain rename.
+    if env.ctx.backend.name() == "zfs" {
+        return;
+    }
     template(
         &env,
         "main",
