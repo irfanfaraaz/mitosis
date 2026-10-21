@@ -159,12 +159,11 @@ async fn doctor_fix_finishes_pending_restore() {
 
 /// A free port this test holds, outside the default `port_range`, where `router_port` is refused.
 fn held_port() -> std::net::TcpListener {
-    loop {
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        if !(54_320..=54_999).contains(&l.local_addr().unwrap().port()) {
-            return l;
-        }
-    }
+    // Above the router_port() range and outside CI's ephemeral range, so once dropped no
+    // outgoing connection takes it before the test checks it is free again.
+    (61_450..=61_999)
+        .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())
+        .expect("a free port in 61450-61999")
 }
 
 #[tokio::test]

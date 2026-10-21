@@ -164,6 +164,11 @@ async fn diff_table_without_pk_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_pruned_generation_errors() {
     let Some(env) = TestEnv::new() else { return };
+    // On ZFS a generation is a mounted dataset its clones depend on, so it cannot be pruned
+    // while a clone lives: the state this test fakes never happens there.
+    if env.ctx.backend.name() == "zfs" {
+        return;
+    }
     template(&env, "main", "create table t(id int)").await;
     let c = clone_of(&env).await;
     let gen = env
