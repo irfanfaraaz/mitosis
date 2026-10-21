@@ -497,6 +497,7 @@ fn enum_values() {
                 events::ROUTER_FAILED,
                 events::GC,
                 events::RECOVERY,
+                events::GENERATION_KEPT,
             ],
             "event.detail.reason": [
                 events::reason::USER,

@@ -1427,7 +1427,8 @@ const REPLICATION_NOTE: &str =
     needs a 'replication' line that allows it (host replication <role> <address> scram-sha-256).";
 
 /// `pg_basebackup -D dir -X stream -c fast` of the server at `url`, stderr to the build log. The
-/// password goes in `PGPASSWORD`, never in argv. The tool creates `dir`, which must not exist.
+/// password goes in `PGPASSWORD`, never in argv. `dir` is missing or empty (a build folder is
+/// made empty by the back end first).
 fn run_basebackup(
     install: &PgInstall,
     url: &str,
@@ -2399,8 +2400,13 @@ async fn build_gen(
     let log = opts.log_file.clone();
     let staging = masking.map(|_| Staging::new(ctx, install, name, &build_dir));
 
-    let result = match (masking, &staging) {
-        (None, _) | (_, None) => {
+    // The build folder is made by the back end (a dataset on ZFS); initdb and pg_basebackup
+    // fill an existing empty folder. A staging folder is plain scratch that initdb makes.
+    let (b, d) = (ctx.backend.clone(), build_dir.clone());
+    let created = blocking(move || b.create_dir(&d)).await.map_err(at("create"));
+    let result = match (created, masking, &staging) {
+        (Err(e), _, _) => Err(e),
+        (Ok(()), None, _) | (Ok(()), _, None) => {
             run_steps(
                 ctx,
                 install,
@@ -2412,7 +2418,7 @@ async fn build_gen(
             )
             .await
         }
-        (Some(m), Some(st)) => {
+        (Ok(()), Some(m), Some(st)) => {
             let source = &args.source;
             masked_steps(ctx, install, st, &build_dir, &mut opts, database, source, m).await
         }
@@ -2853,6 +2859,7 @@ pub(crate) async fn prune(ctx: &Ctx, name: &str) {
         Ok(())
     })
     .await;
+    crate::lifecycle::emit_kept(ctx);
 }
 
 /// Deletes the rows of the generations to prune; returns their numbers and folders.

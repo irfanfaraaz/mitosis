@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::fs::{Metadata, OpenOptions, Permissions};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod copy;
@@ -14,6 +14,10 @@ pub use copy::{CopyBackend, SLOW_WARNING};
 mod reflink;
 #[cfg(target_os = "linux")]
 pub use reflink::ReflinkBackend;
+#[cfg(target_os = "linux")]
+pub mod zfs;
+#[cfg(target_os = "linux")]
+pub use zfs::ZfsBackend;
 
 // Not exported by libc; value from <sys/clonefile.h>.
 #[cfg(target_os = "macos")]
@@ -33,13 +37,24 @@ pub trait CloneBackend: Send + Sync {
     fn rename_dir(&self, from: &Path, to: &Path) -> Result<()>;
     /// Bytes under `path` not shared with any clone, or `None` when it cannot be told.
     fn private_size(&self, path: &Path) -> Option<u64>;
+    /// Folders `remove_dir` left in place (and returned `Ok`) because clones still depend on
+    /// them, since the last call; only ZFS keeps any. gc reports them and tries again later.
+    fn take_kept(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// `create_dir`, `remove_dir` and `rename_dir` as plain file system calls (APFS, reflink, copy).
+/// Mode 0700: Postgres refuses a data folder others can read, and `pg_basebackup` keeps the
+/// mode of a folder that already exists (`initdb` sets 0700 itself).
 fn fs_create_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path).map_err(|e| {
-        MitosisError::new(ErrorCode::Internal, format!("create {}: {e}", path.display()))
-    })
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|e| {
+            MitosisError::new(ErrorCode::Internal, format!("create {}: {e}", path.display()))
+        })
 }
 
 fn fs_remove_dir(path: &Path) -> Result<()> {
@@ -129,9 +144,8 @@ fn fs_type_name(path: &Path) -> String {
     }
 }
 
-/// Picks the clone back end for `home` from the `backend` setting. The Zfs back end does not
-/// exist yet (ticket 08), so choosing it is `backend_unsupported` for now. `Copy` is never
-/// picked by `Auto`.
+/// Picks the clone back end for `home` from the `backend` setting. `Copy` is never picked by
+/// `Auto`; ZFS is Linux only.
 pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>> {
     match cfg.backend {
         #[cfg(target_os = "macos")]
@@ -143,7 +157,15 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
         )),
         #[cfg(not(target_os = "macos"))]
         BackendKind::Auto => {
-            // Order: a configured ZFS dataset (ticket 08), then a FICLONE probe.
+            // Order: a configured ZFS dataset whose mountpoint holds the home, then a FICLONE
+            // probe (OpenZFS block cloning answers it too).
+            #[cfg(target_os = "linux")]
+            if let Some(ds) = &cfg.zfs_dataset {
+                let zfs = ZfsBackend::new(ds)?;
+                if zfs.contains(&home.root) {
+                    return Ok(Arc::new(zfs));
+                }
+            }
             let fs = fs_type_name(&home.root);
             let no_backend = || {
                 unsupported(
@@ -154,16 +176,20 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
                     "put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS, or set backend = \"copy\"",
                 )
             };
-            // shortcut: "home inside the dataset's mountpoint" is told by the file system type,
-            // not `zfs get mountpoint`; ticket 08 replaces this arm with the real ZFS back end.
-            if cfg.zfs_dataset.is_some() && fs == "zfs" {
-                return Err(no_backend());
-            }
             #[cfg(target_os = "linux")]
             match ReflinkBackend.check_supported(&home.root) {
                 Ok(()) => return Ok(Arc::new(ReflinkBackend)),
                 Err(e) if e.code != ErrorCode::BackendUnsupported => return Err(e),
                 Err(_) => {}
+            }
+            if fs == "zfs" {
+                return Err(unsupported(
+                    format!(
+                        "{} is on ZFS without block cloning, and no zfs_dataset holds it",
+                        home.root.display()
+                    ),
+                    "set zfs_dataset to the dataset whose mountpoint holds MITOSIS_HOME, for example: mitosis config set zfs_dataset tank/mitosis",
+                ));
             }
             Err(no_backend())
         }
@@ -175,12 +201,20 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
             "set backend = \"auto\"",
         )),
         BackendKind::Copy => Ok(Arc::new(CopyBackend)),
+        #[cfg(target_os = "linux")]
+        BackendKind::Zfs => {
+            let ds = cfg.zfs_dataset.as_deref().ok_or_else(|| {
+                unsupported(
+                    "backend = \"zfs\" needs zfs_dataset",
+                    "set zfs_dataset to the dataset Mitosis owns, for example: mitosis config set zfs_dataset tank/mitosis",
+                )
+            })?;
+            Ok(Arc::new(ZfsBackend::new(ds)?))
+        }
+        #[cfg(not(target_os = "linux"))]
         BackendKind::Zfs => {
             let _ = home;
-            Err(unsupported(
-                format!("the {} back end is not available in this build", cfg.backend.as_str()),
-                "set backend = \"auto\"",
-            ))
+            Err(unsupported("the zfs back end only works on Linux", "set backend = \"auto\""))
         }
     }
 }

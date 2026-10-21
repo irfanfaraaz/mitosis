@@ -178,6 +178,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Set up a ZFS dataset for the zfs back end (Linux).
+    Zfs {
+        #[command(subcommand)]
+        command: ZfsCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -401,6 +406,12 @@ enum ServiceCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ZfsCmd {
+    /// Print the `zfs allow` and sudoers lines an admin runs once, then check them.
+    Setup { dataset: String },
 }
 
 #[derive(Subcommand)]
@@ -693,6 +704,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 other => return Err(unexpected(other)),
             }
         }
+        Cmd::Zfs {
+            command: ZfsCmd::Setup { dataset },
+        } => return zfs_setup(&dataset),
         Cmd::Doctor { fix, json } => {
             let checks = doctor::run(&home, fix).await;
             if json {
@@ -835,6 +849,30 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `mitosis zfs setup <dataset>`: prints what an admin installs once, then the ZFS doctor checks.
+/// It never runs sudo or changes anything itself.
+#[cfg(target_os = "linux")]
+fn zfs_setup(dataset: &str) -> Result<ExitCode> {
+    use crate::clone_backend::zfs;
+    zfs::check_dataset_name(dataset)?;
+    let bin = zfs::which_zfs().unwrap_or_else(|| "/usr/sbin/zfs".into());
+    print!("{}", zfs::setup_text(&zfs::current_user(), dataset, &bin));
+    println!();
+    println!("Checks (run this again once the admin is done):");
+    let checks = doctor::zfs_checks(dataset);
+    print!("{}", doctor::render(&checks));
+    Ok(ExitCode::from(doctor::exit_code(&checks)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn zfs_setup(_dataset: &str) -> Result<ExitCode> {
+    Err(MitosisError::new(
+        ErrorCode::BackendUnsupported,
+        "the zfs back end only works on Linux",
+    )
+    .with_hint("set backend = \"auto\""))
 }
 
 fn print_config(entries: &[ConfigEntry]) {

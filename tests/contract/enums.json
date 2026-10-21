@@ -54,7 +54,8 @@
     "router.started",
     "router.failed",
     "gc",
-    "recovery"
+    "recovery",
+    "generation_kept"
   ],
   "generation.kind": [
     "full",

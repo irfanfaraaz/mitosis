@@ -424,6 +424,19 @@
           "takes_value": true
         }
       }
+    },
+    "zfs": {
+      "subcommands": {
+        "setup": {
+          "args": {
+            "<dataset>": {
+              "index": 1,
+              "required": true,
+              "takes_value": true
+            }
+          }
+        }
+      }
     }
   }
 }

@@ -289,7 +289,9 @@ async fn steps(
         let (t, b, s) = (target.clone(), work.b.clone(), settings.clone());
         let backend = ctx.backend.clone();
         blocking(move || {
+            // The new generation's folder is made by the back end (a dataset on ZFS).
             backend.remove_dir(&b)?;
+            backend.create_dir(&b)?;
             initdb_like(&t, &b, &s)
         })
         .await

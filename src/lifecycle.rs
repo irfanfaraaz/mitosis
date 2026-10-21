@@ -441,6 +441,7 @@ pub async fn reconcile_deferred(ctx: Arc<Ctx>, now: i64) -> Result<(GcReport, Ve
     // Before the orphan pass, which then removes the dropped templates' generation folders.
     drop_branch_templates(&ctx, now, &mut report).await;
     remove_orphans(&ctx, &mut report).await;
+    emit_kept(&ctx);
     drop_unused_reservations(&ctx, now);
     events::emit(
         &ctx,
@@ -932,6 +933,21 @@ async fn remove_data_dir(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     })
     .await
     .map_err(|e| internal(format!("background task failed: {e}")))?
+}
+
+/// One `generation_kept` event per folder the back end left in place because clones of it
+/// still exist (ZFS snapshots with clones); gc tries each again on its next run.
+pub(crate) fn emit_kept(ctx: &Ctx) {
+    for dir in ctx.backend.take_kept() {
+        log(ctx, &format!("gc: kept {}: clones still depend on it", dir.display()));
+        events::emit(
+            ctx,
+            events::GENERATION_KEPT,
+            None,
+            None,
+            serde_json::json!({ "reason": "clones_depend", "dir": dir.display().to_string() }),
+        );
+    }
 }
 
 /// Leaves an entry gc does not recognise alone, with one log line.

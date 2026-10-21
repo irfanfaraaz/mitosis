@@ -575,6 +575,38 @@ fn check_backend_speed(home: &Home, cfg: &Config) -> Check {
     }
 }
 
+/// The ZFS checks of `mitosis zfs setup` for `dataset`: `zfs_tool`, `zfs_dataset`,
+/// `zfs_permissions` and `zfs_sudo`; each failure carries its fix.
+#[cfg(target_os = "linux")]
+pub fn zfs_checks(dataset: &str) -> Vec<Check> {
+    crate::clone_backend::zfs::probes(dataset)
+        .into_iter()
+        .map(|p| {
+            let level = if p.ok { Level::Ok } else { Level::Fail };
+            let c = Check::new(p.name, level, p.detail);
+            match p.fix {
+                Some(f) => c.fix(f),
+                None => c,
+            }
+        })
+        .collect()
+}
+
+/// `zfs_checks` when the settings use ZFS (`backend = "zfs"`, or a `zfs_dataset` is set).
+#[cfg(target_os = "linux")]
+fn check_zfs(cfg: &Config) -> Vec<Check> {
+    match &cfg.zfs_dataset {
+        Some(ds) => zfs_checks(ds),
+        None if cfg.backend == crate::clone_backend::BackendKind::Zfs => vec![Check::new(
+            "zfs_dataset",
+            Level::Fail,
+            "backend = \"zfs\" needs zfs_dataset",
+        )
+        .fix("mitosis config set zfs_dataset <dataset>, for example tank/mitosis")],
+        None => Vec::new(),
+    }
+}
+
 fn check_permissions(home: &Home) -> Check {
     if !home.root.is_dir() {
         return Check::new("permissions", Level::Ok, "skipped: no home folder");
@@ -1363,6 +1395,8 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
     let loaded = Config::load(home);
     out.push(check_fs(home, &loaded.clone().unwrap_or_default()));
     out.push(check_backend_speed(home, &loaded.clone().unwrap_or_default()));
+    #[cfg(target_os = "linux")]
+    out.extend(check_zfs(&loaded.clone().unwrap_or_default()));
     out.push(check_permissions(home));
 
     let cfg = match loaded {
