@@ -225,7 +225,6 @@ impl ZfsBackend {
         Ok(())
     }
 
-    /// Mounts `ds` at `path` (both steps need root on Linux).
     /// Mounts `ds` at `path` (these steps need root on Linux). It is made with `canmount=noauto`
     /// so nothing mounts it before its mountpoint is set; `canmount=on` afterwards makes it mount
     /// again at boot.
@@ -364,7 +363,11 @@ impl CloneBackend for ZfsBackend {
         let mp = self.mountpoint_arg(to)?;
         self.ensure_parents(&b)?;
         self.run_zfs(&["rename", &a, &b], true)?;
-        self.run_zfs(&["set", &mp, &b], true)?;
+        // Still mounted at `from`: rename back so a retry finds the dataset where it was.
+        if let Err(e) = self.run_zfs(&["set", &mp, &b], true) {
+            let _ = self.run_zfs(&["rename", &b, &a], true);
+            return Err(e);
+        }
         let _ = std::fs::remove_dir(from); // the old, now empty mountpoint folder
         Ok(())
     }

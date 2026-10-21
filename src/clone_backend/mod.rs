@@ -192,13 +192,13 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
         BackendKind::Auto => {
             // Order: a configured ZFS dataset whose mountpoint holds the home, then a FICLONE
             // probe (OpenZFS block cloning answers it too).
+            // A zfs_dataset that does not work only matters when no other back end does.
             #[cfg(target_os = "linux")]
-            if let Some(ds) = &cfg.zfs_dataset {
-                let zfs = ZfsBackend::new(ds)?;
-                if zfs.contains(&home.root) {
-                    return Ok(Arc::new(zfs));
-                }
-            }
+            let zfs_err = match cfg.zfs_dataset.as_deref().map(ZfsBackend::new) {
+                Some(Ok(zfs)) if zfs.contains(&home.root) => return Ok(Arc::new(zfs)),
+                Some(Err(e)) => Some(e),
+                _ => None,
+            };
             let fs = fs_type_name(&home.root);
             let no_backend = || {
                 unsupported(
@@ -214,6 +214,10 @@ pub fn select_backend(home: &Home, cfg: &Config) -> Result<Arc<dyn CloneBackend>
                 Ok(()) => return Ok(Arc::new(ReflinkBackend)),
                 Err(e) if e.code != ErrorCode::BackendUnsupported => return Err(e),
                 Err(_) => {}
+            }
+            #[cfg(target_os = "linux")]
+            if let (Some(e), "zfs") = (zfs_err, fs.as_str()) {
+                return Err(e);
             }
             if fs == "zfs" {
                 return Err(unsupported(
@@ -416,7 +420,7 @@ fn fill_tree(
         clone_entry(&entry.path(), &dst.join(entry.file_name()), file)?;
     }
     keep_owner(dst, &md)?;
-    std::fs::set_permissions(dst, Permissions::from_mode(md.mode() & 0o7777))
+    std::fs::set_permissions(dst, Permissions::from_mode(md.mode() & 0o1777))
         .map_err(|e| io_error("chmod", dst, e))?;
     keep_times(dst, &md)
 }
@@ -460,8 +464,8 @@ fn clone_entry(
     }
     keep_owner(dst, &md)?;
     if !ft.is_symlink() {
-        // After the chown, which clears setuid/setgid bits.
-        std::fs::set_permissions(dst, Permissions::from_mode(md.mode() & 0o7777))
+        // After the chown; setuid/setgid are dropped, a data folder never needs them.
+        std::fs::set_permissions(dst, Permissions::from_mode(md.mode() & 0o1777))
             .map_err(|e| io_error("chmod", dst, e))?;
     }
     keep_times(dst, &md)

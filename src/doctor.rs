@@ -519,24 +519,31 @@ fn mode(path: &Path) -> Option<u32> {
         .map(|m| m.permissions().mode() & 0o777)
 }
 
-fn check_fs(home: &Home, cfg: &Config) -> Check {
+/// The `home` check, with the back end it selected (none when that failed).
+fn check_fs(home: &Home, cfg: &Config) -> (Check, Option<&'static str>) {
     if !home.root.is_dir() {
-        return Check::new(
+        let c = Check::new(
             "home",
             Level::Fail,
             format!("{} does not exist", home.root.display()),
         )
         .fix("run any mitosis command to create it, or set MITOSIS_HOME");
+        return (c, None);
     }
     let backend = match select_backend(home, cfg) {
         Ok(b) => b,
         Err(e) => {
-            return Check::new("home", Level::Fail, e.message).fix(
-                e.hint
-                    .unwrap_or_else(|| "set backend in config.toml".into()),
-            )
+            let fix = e
+                .hint
+                .unwrap_or_else(|| "set backend in config.toml".into());
+            return (Check::new("home", Level::Fail, e.message).fix(fix), None);
         }
     };
+    (check_volume(home, &*backend), Some(backend.name()))
+}
+
+/// The rest of the `home` check, on the selected back end.
+fn check_volume(home: &Home, backend: &dyn crate::clone_backend::CloneBackend) -> Check {
     if let Err(e) = backend.check_supported(&home.root) {
         return Check::new("home", Level::Fail, e.message).fix(
             e.hint
@@ -569,17 +576,18 @@ fn check_fs(home: &Home, cfg: &Config) -> Check {
     )
 }
 
-fn check_backend_speed(home: &Home, cfg: &Config) -> Check {
-    match select_backend(home, cfg) {
-        Ok(b) if b.name() == "copy" => Check::new(
+/// `backend`: the name of the back end the `home` check selected.
+fn check_backend_speed(backend: Option<&str>) -> Check {
+    match backend {
+        Some("copy") => Check::new(
             "backend_speed",
             Level::Warn,
-            "backend \"copy\" makes full copies; clones are slow and use full disk space",
+            crate::clone_backend::SLOW_WARNING,
         )
         .fix("put MITOSIS_HOME on Btrfs, XFS (mkfs.xfs -m reflink=1) or ZFS and set backend = \"auto\""),
-        Ok(b) => Check::new("backend_speed", Level::Ok, format!("{} clones share data", b.name())),
+        Some(b) => Check::new("backend_speed", Level::Ok, format!("{b} clones share data")),
         // `home` already reports an unusable back end.
-        Err(_) => Check::new("backend_speed", Level::Ok, "skipped: no usable back end"),
+        None => Check::new("backend_speed", Level::Ok, "skipped: no usable back end"),
     }
 }
 
@@ -1404,11 +1412,9 @@ pub async fn run(home: &Home, fix: bool) -> Vec<Check> {
         out.push(apply_fix(home).await);
     }
     let loaded = Config::load(home);
-    out.push(check_fs(home, &loaded.clone().unwrap_or_default()));
-    out.push(check_backend_speed(
-        home,
-        &loaded.clone().unwrap_or_default(),
-    ));
+    let (home_check, backend) = check_fs(home, &loaded.clone().unwrap_or_default());
+    out.push(home_check);
+    out.push(check_backend_speed(backend));
     #[cfg(target_os = "linux")]
     out.extend(check_zfs(&loaded.clone().unwrap_or_default()));
     out.push(check_permissions(home));

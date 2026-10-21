@@ -183,6 +183,8 @@ pub const LATEST_PG_MAJOR: u32 = 18;
 pub fn install_hint(major: u32) -> String {
     if cfg!(target_os = "macos") {
         format!("brew install postgresql@{major}")
+    } else if Path::new("/usr/bin/dnf").exists() {
+        format!("sudo dnf install postgresql{major}-server")
     } else {
         format!("sudo apt install postgresql-{major}")
     }
@@ -297,6 +299,8 @@ mod tests {
         assert_eq!(e.hint, Some(install_hint(18)));
         let want = if cfg!(target_os = "macos") {
             "brew install postgresql@16"
+        } else if Path::new("/usr/bin/dnf").exists() {
+            "sudo dnf install postgresql16-server"
         } else {
             "sudo apt install postgresql-16"
         };

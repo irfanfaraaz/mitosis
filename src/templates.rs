@@ -1565,6 +1565,18 @@ fn check_running_snapshot(snap: &Path, dataset: &str) -> Result<()> {
             "pg_wal of {dataset} is a symlink; pg_wal must be on the same dataset"
         )));
     }
+    // A tablespace is a pg_tblspc symlink to a folder outside the snapshot; a copy of the link
+    // would make every clone write into the source's own tablespace files.
+    if let Ok(entries) = std::fs::read_dir(snap.join("pg_tblspc")) {
+        for e in entries.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_symlink()) {
+                return Err(invalid(format!(
+                    "{dataset} has a tablespace outside its data directory (pg_tblspc/{}); tablespaces must be on the same dataset",
+                    e.file_name().to_string_lossy()
+                )));
+            }
+        }
+    }
     for signal in ["standby.signal", "recovery.signal"] {
         if snap.join(signal).exists() {
             return Err(invalid(format!(
@@ -3422,6 +3434,25 @@ mod tests {
         std::fs::remove_file(b.snap.join("PG_VERSION")).unwrap();
         let e = check_running_dir(&b.snap, "tank/pg").unwrap_err();
         assert!(e.message.contains("no PG_VERSION"), "{}", e.message);
+    }
+
+    #[test]
+    fn outside_tablespace_is_refused() {
+        let (tmp, b) = running_fixture();
+        std::fs::create_dir_all(b.snap.join("pg_tblspc")).unwrap();
+        std::os::unix::fs::symlink("/data/ts1", b.snap.join("pg_tblspc/16385")).unwrap();
+        let dst = tmp.path().join("build");
+        let e = copy_running(&b, "tank/pg", &dst).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidRequest);
+        assert!(
+            e.message.contains("pg_tblspc/16385")
+                && e.message
+                    .contains("tablespaces must be on the same dataset"),
+            "{}",
+            e.message
+        );
+        assert!(!dst.exists());
+        assert_eq!(b.destroyed.lock().unwrap().len(), 1);
     }
 
     #[test]
